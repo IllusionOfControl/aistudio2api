@@ -1,8 +1,8 @@
 ---
 branch: sync/upstream-main
-last_commit: a02d32a
+last_commit: 9220ff6
 status: complete
-last_activity: 01-10-2026
+last_activity: 03-10-2026
 ---
 
 ## Task
@@ -72,3 +72,22 @@ This sync integrates all these changes, resolves 24 conflicted files, and transl
 - Translated 24 files with 72 Chinese comment/log lines into concise technical English.
 - Adapted `internal/app/admin_config_test.go` to test read-only config loading and restart flag detection.
 - Merged into `dev` (`a02d32a`). All tests (`go test ./...`) and lint checks pass cleanly.
+
+---
+
+### Update: Upstream Auth Invalidation Recovery & Account State Sync (2026-10-03)
+
+**Task**: Synchronize `sync/upstream-main` with upstream commit `7c9da1d` ("fix: 修复登录失效恢复与账户状态同步"), resolve merge conflicts preserving English-only documentation and code invariants, and merge into `dev`.
+
+**Upstream Additions**:
+1. **Unified Authentication Recovery**: Unified login redirects, expired signature cookies, HTTP 401, and Live protocol Code 16 into a single recovery pipeline covering worker pre-warming, on-demand startup, standard RPCs, protected RPCs, and Live connections.
+2. **Account Egress Renewal & Dynamic Chrome Matching**: Prioritized renewing cookies on the same egress; added fallback to match the original account email and Gaia ID in current Chrome profiles if saved OAuth credentials are rejected.
+3. **Generation Tracking & Concurrent Commit**: Concurrently invalidating requests reuse a single commit result; login credential replacement advances auth generations so stale responses do not overwrite newer states.
+4. **Account State Synchronization**: Failed recovery marks accounts as `auth_required`, broadcasting status to administrative events and evicting them from subsequent scheduling until restored.
+5. **Protocol Documentation**: Updated protocol specifications for auth recovery, concurrency, and state write-back in `docs/protocol.md`.
+
+**Resolution & Adaptations**:
+- Translated updated protocol documentation in `docs/protocol.md` to English, resolving merge conflicts.
+- Verified all Go code comments, logs, and error strings remain strictly in English.
+- Validated all Go tests (`go test ./...`), vet (`go vet ./...`), and builds (`go build ./...`) pass cleanly.
+- Merged into `dev` (`9220ff6`).
