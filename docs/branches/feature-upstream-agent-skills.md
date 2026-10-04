@@ -1,6 +1,6 @@
 ---
 branch: feature/upstream-agent-skills
-last_commit: f35155c
+last_commit: 8087196
 status: ready
 last_activity: 04-10-2026
 ---
