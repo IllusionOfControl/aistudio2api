@@ -50,7 +50,7 @@
 
 ## 系统要求
 
-- **Windows Release 运行**: Windows 10 或更高版本、`aistudio2api.exe` 和 `start.bat`
+- **Windows Release 运行**: Windows 10 或更高版本和 `aistudio2api.exe`
 - **Linux Release 运行**: 解压 `linux-amd64.tar.gz` 后运行 `./aistudio2api`，Camoufox 需要 Firefox 系运行库，Debian/Ubuntu 执行 `sudo apt install libgtk-3-0 libasound2 libnss3 libdbus-glib-1-2 libxtst6 libxrandr2 libgbm1 libxkbcommon0 libpango-1.0-0 libcairo2 libxcomposite1 libxdamage1 libxfixes3 fonts-liberation`
 - **源码运行**: Go 1.25.0+、Node.js 22.13+ 或 24+，以及配套 npm
 - **操作系统**: Windows、macOS、Linux
@@ -59,9 +59,9 @@
 
 ## 安装步骤
 
-### 方式一：Windows 一键启动（推荐）
+### 方式一：Windows Release 发布包
 
-从 [Releases](https://github.com/Mag1cFall/AIStudio2API/releases) 下载 `windows-amd64.zip` 发布包，解压后运行 `start.bat`。发布包已包含管理界面，可直接运行。
+从 [Releases](https://github.com/Mag1cFall/AIStudio2API/releases) 下载 `windows-amd64.zip` 发布包，解压后运行 `aistudio2api.exe`。发布包已包含管理界面，可直接运行。
 
 从源码启动时：
 
@@ -69,18 +69,15 @@
 git clone https://github.com/Mag1cFall/AIStudio2API.git
 cd AIStudio2API
 copy .env.example .env
+cd web
+npm ci
+npm run build
+cd ..
+go build -o aistudio2api.exe ./cmd/aistudio2api
+.\aistudio2api.exe
 ```
-
-然后双击运行 `start.bat`。Windows PowerShell 也可以直接执行：
-
-```powershell
-.\start.bat
-```
-
-已有 `aistudio2api.exe` 时脚本立即运行；源码目录缺少可执行文件时，脚本自动安装前端依赖并构建前端与 Go 程序。
 
 首次启动会自动下载当前平台的 Camoufox 到 `runtime/camoufox/`。也可以通过环境变量 `CAMOUFOX_PATH` 指定已有可执行文件。
-
 ### 方式二：Linux 与 macOS 源码构建
 
 #### 1. 安装依赖
@@ -119,7 +116,7 @@ Linux 与 macOS 首次运行同样会自动准备对应平台的 Camoufox。
    Windows 可以导入本机 Chrome 账户：
 
    ```powershell
-   start.bat setup
+   .\aistudio2api.exe setup
    ```
 
    Linux 与 macOS 使用隔离 Camoufox 登录：
@@ -131,7 +128,7 @@ Linux 与 macOS 首次运行同样会自动准备对应平台的 Camoufox。
    登录完成后会从 AI Studio 页面读取 Google 邮箱，并为账户授权 Google Drive。账户保存到 `.env` 中 `AISTUDIO_AUTH_STATES` 指向的目录；语言和时区默认读取当前电脑设置，也可以通过 `--locale`、`--timezone` 指定。
 
 2. **启动图形界面**:
-   - Windows 双击 `start.bat`
+   - Windows 运行 `.\aistudio2api.exe`
    - Linux 与 macOS 运行 `./aistudio2api`
    - 浏览器自动打开 `http://127.0.0.1:2048`
    - 页面初始状态为 `STOPPED`，默认显示“日志”页面
@@ -159,7 +156,7 @@ Linux 与 macOS 首次运行同样会自动准备对应平台的 Camoufox。
 
 ### 日常使用（已有认证）
 
-1. Windows 双击 `start.bat`；Linux 与 macOS 运行 `./aistudio2api`
+1. Windows 运行 `.\aistudio2api.exe`；Linux 与 macOS 运行 `./aistudio2api`
 2. 点击“启动服务”启用 API
 3. 点击“停止服务”会取消正在进行的启动或活动请求并关闭 WAA Worker，管理页面与日志保持可用
 4. 再次点击“启动服务”即可恢复 API
@@ -169,12 +166,13 @@ Linux 与 macOS 首次运行同样会自动准备对应平台的 Camoufox。
 在启动窗口按 `Ctrl+C` 或关闭窗口会退出整个管理进程。关闭浏览器标签页不会停止管理进程。
 
 ### 快速启动
+### 命令行快速参考
 
-`start.bat`：启动管理进程并自动打开网页。
+`./aistudio2api`：启动管理进程并自动打开网页。
 
-`start.bat -open-ui=false`：启动管理进程但不自动打开网页。
+`./aistudio2api --open-ui=false`：启动管理进程但不自动打开网页。
 
-`start.bat setup`：扫描本机 Chrome 账户；也可使用 `--email` 或 `--profile` 选择明确的 Chrome 账户。隔离登录使用 `start.bat setup --login`；文件导入使用 `start.bat setup --storage-state <file>`。
+`./aistudio2api setup`：扫描本机 Chrome 账户（Windows）；也可使用 `--email` 或 `--profile` 选择明确的 Chrome 账户。隔离登录使用 `./aistudio2api setup --login`；文件导入使用 `./aistudio2api setup --storage-state <file>`。
 
 ## API 使用
 
@@ -409,7 +407,6 @@ AIStudio2API/
 ├── internal/webui/          # 内嵌前端产物
 ├── web/                     # Vue 3 + TypeScript 管理页面
 ├── docs/                    # 开发文档与协议规范
-└── start.bat                # Windows 一键启动入口
 ```
 
 ## 配置说明

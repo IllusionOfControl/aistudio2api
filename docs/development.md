@@ -12,23 +12,9 @@ The management listener, public APIs, account pool, protocol runtime, and embedd
 | Source execution | Go 1.25.0+, Node.js 22.13+ or 24+, accompanying npm | Node.js is only used to build the Vue management frontend |
 | Windows Chrome import | Windows amd64, stable Chrome release | The Go application directly reads OAuth/DBSC materials from local Chrome profiles |
 
-Windows users can directly run `start.bat` in the repository root. The script prioritizes launching an existing `aistudio2api.exe`; only when the executable is missing will it run `npm ci`, build the frontend, and compile the Go binary. Once started, the program automatically opens the management dashboard while the generation service remains stopped initially; account login, log inspection, and starting/stopping the generation service are all performed in this interface.
+Windows users can directly run `aistudio2api.exe` from a release package or build from source using Go and Node.js. Once started, the program automatically opens the management dashboard while the generation service remains stopped initially; account login, log inspection, and starting/stopping the generation service are all performed in this interface.
 
-Execution order of `start.bat`:
-
-```text
-aistudio2api.exe exists
-  -> Directly run existing binary
-
-aistudio2api.exe does not exist
-  -> Check node, npm, go, and web/package-lock.json
-  -> web/npm ci
-  -> web/npm run build
-  -> go build -o aistudio2api.exe ./cmd/aistudio2api
-  -> Run newly built binary
-```
-
-When frontend or Go source code changes require a rebuild, terminate the current management process and remove the old binary before running `start.bat`. On Windows, replacing an active binary may leave behind `aistudio2api.exe~`, which is a build artifact copy produced while the target file was locked by the old process.
+When frontend or Go source code changes require a rebuild, rebuild the frontend via `npm run build` in `web/` and recompile the binary via `go build -o aistudio2api.exe ./cmd/aistudio2api`.
 
 Initial startup from source:
 
@@ -347,7 +333,7 @@ Run functional acceptance checks, frontend verification, and Go static analysis 
 go vet ./...
 ```
 
-Windows release archives include `aistudio2api.exe` and `start.bat`; other platforms use the same Go binary. Camoufox is prepared automatically on first startup; when `WAA_BACKEND=go`, it is prepared on first browser login. Contributions should focus on single features or protocol updates, using sanitized request and response examples.
+Windows release archives include `aistudio2api.exe`; other platforms use the same Go binary. Camoufox is prepared automatically on first startup; when `WAA_BACKEND=go`, it is prepared on first browser login. Contributions should focus on single features or protocol updates, using sanitized request and response examples.
 
 GitHub Actions runs frontend linting, typechecking, building, and minimum-Go-version checks on `main` commits and Pull Requests. Release packages are compiled with current stable Go across Windows amd64, Linux amd64/arm64, and macOS amd64/arm64. Pushing a `v*` tag triggers automated Release creation with attached binaries, startup scripts, example configs, and documentation; tags containing `-` are published as pre-releases. Regular build artifacts are retained for 7 days in Actions, while Release assets are preserved indefinitely.
 
