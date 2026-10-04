@@ -1,6 +1,6 @@
 ---
 branch: feature/upstream-fix-skill
-last_commit: pending
+last_commit: 3c72e71
 status: ready
 last_activity: 04-10-2026
 ---
