@@ -67,6 +67,7 @@ Every agent and contributor **must** adhere to these architectural invariants:
 ### E. Branch Documentation & Dev Merge Logging
 - **Branch Document**: For any feature, refactoring, or sync branch, create a documentation file in `docs/branches/<branch-name>.md` using `docs/branches/_template.md` as the template.
 - **Merge Logging in `_dev.md`**: Whenever a branch or set of changes is merged into `dev`, **must** add a new entry to `docs/branches/_dev.md` (Date, Commit hash, Author, Source Branch, and bulleted summary of changes) and update `docs/branches/_index.md` status to `Merged into dev`.
+- **Branch Workflow Skill**: Follow the complete lifecycle runbook in [`.agents/skills/branch-workflow/SKILL.md`](.agents/skills/branch-workflow/SKILL.md) for initializing, documenting, and finalizing new branches.
 ---
 
 ## 3. Directory Layout
@@ -103,7 +104,10 @@ AIStudio2API/
 | `sync/*` | Upstream synchronization branches | Used to merge `upstream-main`, resolve conflicts, and adapt code. |
 | `feature/*` / `fix/*` | Feature and bugfix branches | Branch from `dev` and merge back into `dev`. |
 
-*Note: For upstream synchronization procedures, use [`.agents/skills/sync-upstream/SKILL.md`](.agents/skills/sync-upstream/SKILL.md). For developing and submitting bug fixes destined for upstream (isolated from fork-specific refactors), use [`.agents/skills/upstream-fix/SKILL.md`](.agents/skills/upstream-fix/SKILL.md).*
+*Notes for Agents*:
+* New feature, fix, or refactor branches: use [`.agents/skills/branch-workflow/SKILL.md`](.agents/skills/branch-workflow/SKILL.md).
+* Upstream synchronization into `dev`: use [`.agents/skills/sync-upstream/SKILL.md`](.agents/skills/sync-upstream/SKILL.md).
+* Authoring bug fixes for upstream pull requests (isolated from fork refactors): use [`.agents/skills/upstream-fix/SKILL.md`](.agents/skills/upstream-fix/SKILL.md).
 
 ---
 

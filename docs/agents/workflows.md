@@ -2,6 +2,8 @@
 
 This guide provides practical, step-by-step runbooks for common contributor tasks, including upstream synchronization, capability extensions, frontend modifications, and automated verification.
 
+> **Branch Lifecycle Skill**: For creating, implementing, documenting, and verifying any new `feature/*`, `fix/*`, or `refactor/*` branch, refer to [`.agents/skills/branch-workflow/SKILL.md`](../../.agents/skills/branch-workflow/SKILL.md).
+
 ---
 
 ## 1. Upstream Synchronization Workflow
