@@ -103,6 +103,8 @@ AIStudio2API/
 | `sync/*` | Upstream synchronization branches | Used to merge `upstream-main`, resolve conflicts, and adapt code. |
 | `feature/*` / `fix/*` | Feature and bugfix branches | Branch from `dev` and merge back into `dev`. |
 
+*Note: For upstream synchronization procedures, use [`.agents/skills/sync-upstream/SKILL.md`](.agents/skills/sync-upstream/SKILL.md). For developing and submitting bug fixes destined for upstream (isolated from fork-specific refactors), use [`.agents/skills/upstream-fix/SKILL.md`](.agents/skills/upstream-fix/SKILL.md).*
+
 ---
 
 ## 5. Development & Verification Commands
