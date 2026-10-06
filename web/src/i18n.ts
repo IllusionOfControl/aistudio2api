@@ -164,11 +164,11 @@ const zhCN = {
   'settings.autoStartDesc': '应用启动时自动启动 WAA 生成服务',
   'settings.activeValue': '当前生效',
   'settings.pendingService': '已保存值将在下次生成服务启动时生效',
-  'settings.pendingManagement': '监听地址或 API 密钥需重新运行 start.bat 生效',
+  'settings.pendingManagement': '监听地址或 API 密钥需重启应用生效',
   'settings.saved': '配置已保存',
   'settings.savedService': '配置已保存，在左下角停止并重新启动生成服务后生效',
-  'settings.savedManagement': '配置已保存，请重新运行 start.bat',
-  'settings.savedBoth': '配置已保存；重启生成服务后生效；监听地址或 API 密钥需重新运行 start.bat',
+  'settings.savedManagement': '配置已保存，请重启应用',
+  'settings.savedBoth': '配置已保存；重启生成服务后生效；监听地址或 API 密钥需重启应用',
   'settings.reveal': '显示密钥',
   'settings.hide': '隐藏密钥',
   'settings.readOnlyNotice':
@@ -394,13 +394,13 @@ const en: Record<TranslationKey, string> = {
   'settings.pendingService': 'Saved values apply the next time the generation service starts',
   'settings.autoStart': 'WAA Auto-start',
   'settings.autoStartDesc': 'Automatically start WAA generation service on application launch',
-  'settings.pendingManagement': 'Restart with start.bat to apply the listen address or API key',
+  'settings.pendingManagement': 'Restart application to apply the listen address or API key',
   'settings.saved': 'Configuration saved',
   'settings.savedService':
     'Configuration saved. Stop and start the generation service at bottom left.',
-  'settings.savedManagement': 'Configuration saved. Restart with start.bat.',
+  'settings.savedManagement': 'Configuration saved. Restart application.',
   'settings.savedBoth':
-    'Configuration saved. Restart the generation service; use start.bat for the listen address or API key.',
+    'Configuration saved. Restart the generation service; restart application for the listen address or API key.',
   'settings.reveal': 'Reveal key',
   'settings.hide': 'Hide key',
   'settings.readOnlyNotice':

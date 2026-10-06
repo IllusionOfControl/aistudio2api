@@ -60,7 +60,7 @@ jobs:
             directory="dist/$name"
             mkdir -p "$directory"
             binary=aistudio2api
-            if [[ "$GOOS" == windows ]]; then binary+=.exe; cp start.bat "$directory/"; fi
+            if [[ "$GOOS" == windows ]]; then binary+=.exe; fi
             go build -mod=readonly -trimpath -ldflags='-s -w' -o "$directory/$binary" ./cmd/aistudio2api
             cp README.md README_en.md LICENSE .env.example "$directory/"
             cp -r docs "$directory/"

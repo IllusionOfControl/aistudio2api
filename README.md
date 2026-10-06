@@ -51,7 +51,7 @@
 
 ## System Requirements
 
-- **Windows Release Runtime**: Windows 10 or later, `aistudio2api.exe`, and `start.bat`
+- **Windows Release Runtime**: Windows 10 or later and `aistudio2api.exe`
 - **Linux Release Runtime**: Extract `linux-amd64.tar.gz` and run `./aistudio2api`; Camoufox needs the Firefox system libraries, on Debian/Ubuntu run `sudo apt install libgtk-3-0 libasound2 libnss3 libdbus-glib-1-2 libxtst6 libxrandr2 libgbm1 libxkbcommon0 libpango-1.0-0 libcairo2 libxcomposite1 libxdamage1 libxfixes3 fonts-liberation`
 - **Source Build**: Go 1.25.0+, Node.js 22.13+ or 24+, and its bundled npm
 - **Operating System**: Windows, macOS, Linux
@@ -60,28 +60,25 @@
 
 ## Installation
 
-### Method 1: Windows One-Click Start (Recommended)
+### Method 1: Windows Release Package
 
-Download the `windows-amd64.zip` package from [Releases](https://github.com/Mag1cFall/AIStudio2API/releases), extract it, and run `start.bat`. The package includes the management interface and is ready to run.
+Download the `windows-amd64.zip` package from [Releases](https://github.com/Mag1cFall/AIStudio2API/releases), extract it, and run `aistudio2api.exe`. The package includes the management interface and is ready to run.
 
-To start from source:
+To start from source on Windows:
 
 ```powershell
 git clone https://github.com/Mag1cFall/AIStudio2API.git
 cd AIStudio2API
 copy .env.example .env
+cd web
+npm ci
+npm run build
+cd ..
+go build -o aistudio2api.exe ./cmd/aistudio2api
+.\aistudio2api.exe
 ```
-
-Then double-click `start.bat`. You can also run it from PowerShell:
-
-```powershell
-.\start.bat
-```
-
-The script runs an existing `aistudio2api.exe` immediately. In a source checkout without the executable, it installs frontend dependencies and builds the frontend and Go program.
 
 The first launch downloads Camoufox for the current platform to `runtime/camoufox/`. Set `CAMOUFOX_PATH` to use an existing executable instead.
-
 ### Method 2: Linux and macOS Source Build
 
 #### 1. Install Dependencies
@@ -120,7 +117,7 @@ The first Linux or macOS launch also prepares the matching Camoufox build automa
    Windows can import a local Chrome account:
 
    ```powershell
-   start.bat setup
+   .\aistudio2api.exe setup
    ```
 
    Linux and macOS use an isolated Camoufox login:
@@ -132,7 +129,7 @@ The first Linux or macOS launch also prepares the matching Camoufox build automa
    The Google email is read from AI Studio after login, and Google Drive is authorized for the account. The account is saved under the path configured by `AISTUDIO_AUTH_STATES` in `.env`. Locale and timezone default to the current computer and can be set with `--locale` and `--timezone`.
 
 2. **Start the management UI**:
-   - Double-click `start.bat` on Windows
+   - Run `.\aistudio2api.exe` on Windows
    - Run `./aistudio2api` on Linux or macOS
    - The browser opens `http://127.0.0.1:2048`
    - The initial state is `STOPPED`, with Logs open by default
@@ -160,7 +157,7 @@ Account actions depend on state:
 
 ### Daily Use (With Existing Authentication)
 
-1. Double-click `start.bat` on Windows; run `./aistudio2api` on Linux or macOS
+1. Run `.\aistudio2api.exe` on Windows; run `./aistudio2api` on Linux or macOS
 2. Click "Start service" to enable the APIs
 3. "Stop service" cancels an in-progress launch or active requests and closes WAA workers while the management UI and Logs remain available
 4. Click "Start service" again to resume the APIs
@@ -170,12 +167,13 @@ Starting again loads the latest data-plane settings from `.env`. Changes to `LIS
 Press `Ctrl+C` in the launch window or close that window to exit the manager. Closing the browser tab does not stop the manager.
 
 ### Quick Start
+### CLI Quick Reference
 
-`start.bat`: Starts the manager and opens the web UI.
+`./aistudio2api`: Starts the manager and opens the web UI.
 
-`start.bat -open-ui=false`: Starts the manager without opening the web UI.
+`./aistudio2api --open-ui=false`: Starts the manager without opening the web UI.
 
-`start.bat setup`: Scans local Chrome accounts. Use `--email` or `--profile` to select a Chrome account. Run `start.bat setup --login` for an isolated login, or `start.bat setup --storage-state <file>` to import a file.
+`./aistudio2api setup`: Scans local Chrome accounts (Windows). Use `--email` or `--profile` to select a Chrome account. Run `./aistudio2api setup --login` for an isolated login, or `./aistudio2api setup --storage-state <file>` to import a file.
 
 ## API Usage
 
@@ -410,7 +408,6 @@ AIStudio2API/
 ├── internal/webui/          # Embedded frontend build
 ├── web/                     # Vue 3 and TypeScript management UI
 ├── docs/                    # Development guide and protocol specification
-└── start.bat                # Windows one-click launcher
 ```
 
 ## Configuration
