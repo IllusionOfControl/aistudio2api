@@ -1,8 +1,8 @@
 ---
 branch: feature/upstream-agent-skills
-last_commit: 8087196
-status: ready
-last_activity: 04-10-2026
+last_commit: 08cfb3e
+status: complete
+last_activity: 06-10-2026
 ---
 
 ## Task
@@ -45,4 +45,5 @@ These skills conform to cross-agent standards (omp, Claude Code, Cursor/Codex) a
 
 - All three Agent Skills deployed under `.agents/skills/`.
 - Complete coverage of development, sync, and bug fixing workflows.
+- Merged into `dev` (`08cfb3e`).
 - Repository documentation updated and aligned.
