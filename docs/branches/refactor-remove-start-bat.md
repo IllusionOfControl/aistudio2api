@@ -1,8 +1,8 @@
 ---
 branch: refactor/remove-start-bat
-last_commit: bd5f65f
-status: ready
-last_activity: 04-10-2026
+last_commit: 720d307
+status: complete
+last_activity: 06-10-2026
 ---
 
 ## Task
@@ -30,4 +30,5 @@ Complete removal of legacy `start.bat`:
 
 ## Result
 
+- Merged into `dev` (`720d307`).
 Clean cutover with `start.bat` deleted and all callers/documentation updated to direct binary execution.

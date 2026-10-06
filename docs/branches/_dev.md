@@ -8,6 +8,7 @@ Chronological registry of commits and feature integrations merged into the `dev`
 
 | Date | Commit | Author | Source Branch | Document | What Was Done |
 |---|---|---|---|---|---|
+| **2026-10-06** | `720d307` | Sergey Skorokhod | `refactor/remove-start-bat` | [`refactor-remove-start-bat.md`](refactor-remove-start-bat.md) | Removed start.bat and migrated documentation and build workflows to direct binary execution |
 | **2026-10-06** | `08cfb3e` | Sergey Skorokhod | `feature/upstream-agent-skills` | [`feature-upstream-agent-skills.md`](feature-upstream-agent-skills.md) | Added agent skills suite (`branch-workflow`, `sync-upstream`, `upstream-fix`) under `.agents/skills/` and cross-referenced in AGENTS.md |
 | **2026-10-06** | `38e80dd` | Sergey Skorokhod | `sync/upstream-main` | [`sync-upstream-main.md`](sync-upstream-main.md) | Synchronized upstream tool schema compatibility & validation (JSON Schema normalization, strict contracts, GET /v1/models/{model}, quota cooldown calculation, assistant prefill, search options) |
 | **2026-10-03** | `9220ff6` | Sergey Skorokhod | `sync/upstream-main` | [`sync-upstream-main.md`](sync-upstream-main.md) | Synchronized upstream auth recovery and state sync (unified 401/Code 16 handling, Chrome profile fallback, generation tracking, protocol docs) |
