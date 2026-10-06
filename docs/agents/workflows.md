@@ -2,11 +2,17 @@
 
 This guide provides practical, step-by-step runbooks for common contributor tasks, including upstream synchronization, capability extensions, frontend modifications, and automated verification.
 
+> **Branch Lifecycle Skill**: For creating, implementing, documenting, and verifying any new `feature/*`, `fix/*`, or `refactor/*` branch, refer to [`.agents/skills/branch-workflow/SKILL.md`](../../.agents/skills/branch-workflow/SKILL.md).
+
 ---
 
 ## 1. Upstream Synchronization Workflow
 
 Because this repository maintains independent refactors (English codebase, read-only Docker config), upstream updates from `Mag1cFall/AIStudio2API` must be integrated via dedicated sync branches.
+
+> **Agent Skills**:
+> - For synchronizing upstream updates into `dev` while preserving invariants: [`.agents/skills/sync-upstream/SKILL.md`](../../.agents/skills/sync-upstream/SKILL.md).
+> - For authoring, testing, and submitting bug fixes destined for upstream without leaking fork refactors: [`.agents/skills/upstream-fix/SKILL.md`](../../.agents/skills/upstream-fix/SKILL.md).
 
 ### Step-by-Step Procedure
 
