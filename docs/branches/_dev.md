@@ -8,6 +8,7 @@ Chronological registry of commits and feature integrations merged into the `dev`
 
 | Date | Commit | Author | Source Branch | Document | What Was Done |
 |---|---|---|---|---|---|
+| **2026-10-06** | `38e80dd` | Sergey Skorokhod | `sync/upstream-main` | [`sync-upstream-main.md`](sync-upstream-main.md) | Synchronized upstream tool schema compatibility & validation (JSON Schema normalization, strict contracts, GET /v1/models/{model}, quota cooldown calculation, assistant prefill, search options) |
 | **2026-10-03** | `9220ff6` | Sergey Skorokhod | `sync/upstream-main` | [`sync-upstream-main.md`](sync-upstream-main.md) | Synchronized upstream auth recovery and state sync (unified 401/Code 16 handling, Chrome profile fallback, generation tracking, protocol docs) |
 | **2026-10-01** | `a02d32a` | Sergey Skorokhod | `sync/upstream-main` | [`sync-upstream-main.md`](sync-upstream-main.md) | Synchronized upstream v0.2.2 (Interactions API, Build native non-streaming Unary calls, thought signature normalization, admin auth) |
 | **2026-09-29** | `7d3b23f` | Sergey Skorokhod | `feature/waa-auto-start` | [`feature-waa-auto-start.md`](feature-waa-auto-start.md) | Added AUTO_START (.env) and --auto-start CLI flag for WAA generation service auto-start on launch |

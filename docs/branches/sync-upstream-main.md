@@ -1,8 +1,8 @@
 ---
 branch: sync/upstream-main
-last_commit: 9220ff6
+last_commit: 38e80dd
 status: complete
-last_activity: 03-10-2026
+last_activity: 06-10-2026
 ---
 
 ## Task
@@ -91,3 +91,27 @@ This sync integrates all these changes, resolves 24 conflicted files, and transl
 - Verified all Go code comments, logs, and error strings remain strictly in English.
 - Validated all Go tests (`go test ./...`), vet (`go vet ./...`), and builds (`go build ./...`) pass cleanly.
 - Merged into `dev` (`9220ff6`).
+
+---
+
+### Update: Upstream Tool Schema Compatibility & Validation (2026-10-06)
+
+**Task**: Synchronize `sync/upstream-main` with upstream commits up to `51883d8` ("fix: 完善工具 Schema 与四协议调用兼容"), resolve merge conflicts preserving English-only code, documentation, and read-only configuration invariants, and merge into `dev`.
+
+**Upstream Additions**:
+1. **JSON Schema Normalization & Complex Tool Compatibility**: Recursive `null` cleanup in optional schema fields with data `null` value retention (`example: null`, constants, property names). Support for boolean schemas (`true`/`false`), `const` validation, `items: false` (empty array `maxItems=0`), and string `not` constraints. Removed forced Build diversion for standard tools; complex tools with union branches (`anyOf`/`oneOf`) and array definitions now execute directly on Playground channels.
+2. **Strict Tool Contracts & Validation (`internal/aistudio/tool_contract.go`)**: Strict argument schema validation (`jsonschema/v6` with ECMA regex engine via `regexp2`). Support for `tool_choice` modes (`required`, `auto`, `none`, `validated`), required tool enforcement before turn finish, and `parallel_tool_calls: false` single-call constraint.
+3. **Public API Enhancements (`internal/api/`)**:
+   - Implemented `GET /v1/models/{model}` and `GET /v1beta/models/{model}` endpoints for OpenAI and Anthropic formats with canonical ID and alias resolution.
+   - Added `web_search_options` support (`search_context_size`, `user_location`, `allowed_domains` with `site:` filters) across generation pipelines.
+   - Anthropic assistant prefill support (prefix passed to continuation instructions, response returning post-prefix text).
+   - Anthropic thinking `disabled` support (hides thought body while maintaining thought signatures).
+   - Automatic conversation turn truncation (`Truncate`) according to authoritative token count while preserving tool call/result pairs.
+4. **Quota Cooldown Refinement (`internal/aistudio/quota.go`)**: Cooldown cycle evaluation using `quota_unit`, `quota_limit`, `quota_metric`, and error messages. Precise retry delay parsing via `RetryInfo` and `Retry-After`. Scoped vs global cooldown differentiation.
+
+**Resolution & Adaptations**:
+- Resolved merge conflicts in 7 Go files (`internal/aistudio/build.go`, `generate.go`, `quota.go`, `schema.go`, `tools.go`, `internal/api/openai.go`, `responses.go`) and 3 documentation files (`README.md`, `docs/development.md`, `docs/protocol.md`).
+- Translated all newly introduced comments, log messages, and error strings across all packages to standard technical English (zero Chinese characters in Go codebase).
+- Updated English documentation (`README.md`, `docs/development.md`, `docs/protocol.md`) and synchronized Chinese documentation (`README_ch.md`).
+- Validated with `go test ./...` (all passing), `go vet ./...` (0 issues), `npm --prefix web run typecheck` (0 errors), and `go build ./cmd/aistudio2api`.
+- Merged into `dev` (`38e80dd`).
