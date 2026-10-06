@@ -562,6 +562,12 @@ func (c *Client) Generate(ctx context.Context, request GenerateRequest) (<-chan 
 	if err := validateTranscriptionConfig(request.Config.TranscriptionConfig, entry.model); err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrInvalidArgument, err)
 	}
+	if request.Truncate && entry.model.InputTokenLimit > 0 {
+		request, err = c.truncateRequest(ctx, request, entry.model.InputTokenLimit)
+		if err != nil {
+			return nil, err
+		}
+	}
 	if entry.defaults.InteractionStream && !build {
 		return c.generateInteraction(ctx, request, entry)
 	}
@@ -633,6 +639,12 @@ func (c *Client) Generate(ctx context.Context, request GenerateRequest) (<-chan 
 				return nil
 			default:
 				output.observe(event)
+				if request.Config.HideThinking && event.Kind == EventReasoning {
+					if event.ThoughtSignature == "" {
+						return nil
+					}
+					event.Kind, event.Text = EventThoughtSignature, ""
+				}
 				return send(event)
 			}
 		}
@@ -712,6 +724,36 @@ func (c *Client) Generate(ctx context.Context, request GenerateRequest) (<-chan 
 		}
 	}()
 	return events, nil
+}
+
+// truncateRequest drops the earliest complete conversation turns according to authoritative token count
+func (c *Client) truncateRequest(ctx context.Context, request GenerateRequest, limit int64) (GenerateRequest, error) {
+	for {
+		count, err := c.CountTokensForAccount(ctx, request.AccountID, TokenCountRequest{
+			Model: request.Model, System: request.System, Contents: request.Contents, Tools: request.Tools,
+		})
+		if err != nil {
+			return request, err
+		}
+		if count.InputTokens <= limit {
+			return request, nil
+		}
+		start := nextConversationTurn(request.Contents)
+		if start < 0 {
+			return request, fmt.Errorf("%w: latest conversation turn exceeds model context window %d", ErrInvalidArgument, limit)
+		}
+		request.Contents = request.Contents[start:]
+	}
+}
+
+// nextConversationTurn finds the next user turn while preserving tool call and result pairs
+func nextConversationTurn(contents []Content) int {
+	for index := 1; index < len(contents); index++ {
+		if contents[index].Role == RoleUser && !slices.ContainsFunc(contents[index].Parts, func(part Part) bool { return part.FunctionResult != nil }) {
+			return index
+		}
+	}
+	return -1
 }
 
 // sendPlayground encodes and sends Playground GenerateContent, returning response and stream decoder with frame completion check

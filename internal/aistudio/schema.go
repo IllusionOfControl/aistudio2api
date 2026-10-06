@@ -1,6 +1,7 @@
 package aistudio
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"sort"
@@ -18,6 +19,17 @@ var schemaTypeCodes = map[string]int64{
 }
 
 func encodeJSONSchema(raw json.RawMessage) ([]any, error) {
+	var err error
+	raw, err = cleanJSONSchemaInput(raw)
+	if err != nil {
+		return nil, err
+	}
+	if bytes.Equal(raw, []byte("true")) {
+		return []any{int64(0)}, nil
+	}
+	if bytes.Equal(raw, []byte("false")) {
+		return nil, fmt.Errorf("schema false forbids all values")
+	}
 	var schema map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &schema); err != nil || schema == nil {
 		return nil, fmt.Errorf("schema must be a JSON object")
@@ -27,6 +39,21 @@ func encodeJSONSchema(raw json.RawMessage) ([]any, error) {
 	}
 	if err := normalizeNullableVariants(schema); err != nil {
 		return nil, err
+	}
+	if err := normalizeNotSchema(schema); err != nil {
+		return nil, err
+	}
+	if raw, ok := schema["items"]; ok && bytes.Equal(bytes.TrimSpace(raw), []byte("false")) {
+		if schema["prefixItems"] != nil {
+			return nil, &UnverifiedProtocolError{Feature: "positional constraints of prefixItems and items=false"}
+		}
+		if minimum, ok := schema["minItems"]; ok {
+			value, err := schemaInteger(minimum, "minItems")
+			if err != nil || value > 0 {
+				return nil, fmt.Errorf("schema.items=false is incompatible with minItems")
+			}
+		}
+		schema["items"], schema["maxItems"] = json.RawMessage("true"), json.RawMessage("0")
 	}
 	if err := normalizeImplicitType(schema); err != nil {
 		return nil, err
@@ -52,7 +79,7 @@ func encodeJSONSchema(raw json.RawMessage) ([]any, error) {
 	}
 	typeName = strings.ToLower(typeName)
 	typeCode, ok := schemaTypeCodes[typeName]
-	if !ok {
+	if !ok && typeName != "" {
 		return nil, fmt.Errorf("unknown schema.type %q", typeName)
 	}
 	wire := []any{typeCode}
@@ -230,6 +257,7 @@ func normalizeNullableVariants(schema map[string]json.RawMessage) error {
 			}
 			schema["type"] = encodedType
 			if len(nonNull) > 1 {
+				delete(schema, "type")
 				variants := make([]map[string]string, 0, len(nonNull))
 				for _, name := range nonNull {
 					variants = append(variants, map[string]string{"type": name})
@@ -257,6 +285,10 @@ func normalizeNullableVariants(schema map[string]json.RawMessage) error {
 		filtered := variants[:0]
 		nullable := false
 		for _, variant := range variants {
+			if bytes.Equal(bytes.TrimSpace(variant), []byte("true")) || bytes.Equal(bytes.TrimSpace(variant), []byte("false")) {
+				filtered = append(filtered, variant)
+				continue
+			}
 			var value map[string]json.RawMessage
 			if err := json.Unmarshal(variant, &value); err != nil || value == nil {
 				return fmt.Errorf("schema.%s must be an array of JSON objects", name)
@@ -329,6 +361,9 @@ func normalizeConstAndMetadata(schema map[string]json.RawMessage) error {
 			return fmt.Errorf("schema.%s must be an array of JSON objects", name)
 		}
 		for index, variant := range variants {
+			if bytes.Equal(bytes.TrimSpace(variant), []byte("true")) || bytes.Equal(bytes.TrimSpace(variant), []byte("false")) {
+				continue
+			}
 			var subSchema map[string]json.RawMessage
 			if err := json.Unmarshal(variant, &subSchema); err != nil || subSchema == nil {
 				return fmt.Errorf("schema.%s must be an array of JSON objects", name)
@@ -351,16 +386,151 @@ func normalizeConstAndMetadata(schema map[string]json.RawMessage) error {
 	return nil
 }
 
-// normalizeImplicitType fills required AI Studio fields for nodes without declared types and arrays lacking item definitions
+// cleanJSONSchemaInput cleans optional null values in Schema while preserving data values and property names
+func cleanJSONSchemaInput(raw json.RawMessage) (json.RawMessage, error) {
+	return cleanSchemaInput(raw, false)
+}
+
+// cleanSchemaInput cleans optional null values and preserves combination nodes according to tool and output contracts
+func cleanSchemaInput(raw json.RawMessage, preserveCombinations bool) (json.RawMessage, error) {
+	raw = bytes.TrimSpace(raw)
+	if len(raw) == 0 || bytes.Equal(raw, []byte("null")) {
+		return json.RawMessage(`{"type":"object"}`), nil
+	}
+	if bytes.Equal(raw, []byte("true")) || bytes.Equal(raw, []byte("false")) {
+		return raw, nil
+	}
+	var schema map[string]json.RawMessage
+	if json.Unmarshal(raw, &schema) != nil || schema == nil {
+		return nil, fmt.Errorf("schema must be a JSON object or boolean")
+	}
+	for _, name := range []string{"type", "format", "description", "nullable", "enum", "items", "properties", "required", "minItems", "maxItems", "minProperties", "maxProperties", "minimum", "maximum", "minLength", "maxLength", "pattern", "oneOf", "anyOf", "allOf", "not", "propertyOrdering"} {
+		if bytes.Equal(bytes.TrimSpace(schema[name]), []byte("null")) {
+			delete(schema, name)
+		}
+	}
+	for _, name := range []string{"items", "not"} {
+		if nested := bytes.TrimSpace(schema[name]); len(nested) > 0 && nested[0] == '{' {
+			cleaned, err := cleanSchemaInput(nested, preserveCombinations)
+			if err != nil {
+				return nil, fmt.Errorf("schema.%s: %w", name, err)
+			}
+			schema[name] = cleaned
+		}
+	}
+	if value, ok := schema["properties"]; ok {
+		var properties map[string]json.RawMessage
+		if json.Unmarshal(value, &properties) != nil || properties == nil {
+			return nil, fmt.Errorf("schema.properties must be a JSON object")
+		}
+		for name, property := range properties {
+			if bytes.Equal(bytes.TrimSpace(property), []byte("null")) {
+				property = json.RawMessage("true")
+			}
+			cleaned, err := cleanSchemaInput(property, preserveCombinations)
+			if err != nil {
+				return nil, fmt.Errorf("schema.properties.%s: %w", name, err)
+			}
+			properties[name] = cleaned
+		}
+		schema["properties"], _ = json.Marshal(properties)
+	}
+	for _, name := range []string{"anyOf", "oneOf", "allOf", "prefixItems"} {
+		if raw, ok := schema[name]; ok {
+			var variants []json.RawMessage
+			if json.Unmarshal(raw, &variants) != nil {
+				return nil, fmt.Errorf("schema.%s must be an array of Schemas", name)
+			}
+			filtered := make([]json.RawMessage, 0, len(variants))
+			unrestricted := false
+			for index, variant := range variants {
+				cleaned, err := cleanSchemaInput(variant, preserveCombinations)
+				if err != nil {
+					return nil, fmt.Errorf("schema.%s[%d]: %w", name, index, err)
+				}
+				if preserveCombinations {
+					filtered = append(filtered, cleaned)
+					continue
+				}
+				if name == "anyOf" && bytes.Equal(cleaned, []byte("true")) {
+					unrestricted = true
+					break
+				}
+				if name == "allOf" && bytes.Equal(cleaned, []byte("false")) {
+					return nil, fmt.Errorf("schema.allOf forbids all values")
+				}
+				if (name == "anyOf" || name == "oneOf") && bytes.Equal(cleaned, []byte("false")) || name == "allOf" && bytes.Equal(cleaned, []byte("true")) {
+					continue
+				}
+				filtered = append(filtered, cleaned)
+			}
+			if unrestricted || name == "allOf" && len(filtered) == 0 {
+				delete(schema, name)
+			} else if len(filtered) == 0 && (name == "anyOf" || name == "oneOf") {
+				return nil, fmt.Errorf("schema.%s forbids all values", name)
+			} else {
+				schema[name], _ = json.Marshal(filtered)
+			}
+		}
+	}
+	return json.Marshal(schema)
+}
+
+// normalizeNotSchema preserves excluded values and handles constraints that do not accept any values
+func normalizeNotSchema(schema map[string]json.RawMessage) error {
+	raw, ok := schema["not"]
+	if !ok {
+		return nil
+	}
+	raw = bytes.TrimSpace(raw)
+	if bytes.Equal(raw, []byte("false")) {
+		delete(schema, "not")
+		return nil
+	}
+	if bytes.Equal(raw, []byte("true")) || bytes.Equal(raw, []byte("{}")) {
+		return fmt.Errorf("schema.not forbids all values")
+	}
+	var sub map[string]json.RawMessage
+	if json.Unmarshal(raw, &sub) == nil && sub != nil {
+		var typeName string
+		if len(sub) == 1 && json.Unmarshal(sub["type"], &typeName) == nil && strings.EqualFold(typeName, "null") {
+			delete(schema, "not")
+			schema["nullable"] = json.RawMessage("false")
+		}
+		return nil
+	}
+	var values []string
+	if json.Unmarshal(raw, &values) != nil {
+		var value string
+		if json.Unmarshal(raw, &value) != nil {
+			return fmt.Errorf("schema.not must be a Schema or string exclusion value")
+		}
+		values = []string{value}
+	}
+	if len(values) == 0 {
+		delete(schema, "not")
+		return nil
+	}
+	schema["not"], _ = json.Marshal(map[string]any{"type": "string", "enum": values})
+	return nil
+}
+
+// normalizeImplicitType infers types from node constraints and preserves open array elements
 func normalizeImplicitType(schema map[string]json.RawMessage) error {
 	if _, ok := schema["type"]; !ok {
 		var typed map[string]json.RawMessage
+		conflictingType, conflictingItems := false, false
 		for _, name := range []string{"anyOf", "oneOf", "allOf"} {
 			var variants []map[string]json.RawMessage
 			if raw, ok := schema[name]; ok && json.Unmarshal(raw, &variants) == nil {
 				for _, variant := range variants {
-					if _, ok := variant["type"]; ok && typed == nil {
-						typed = variant
+					if value, ok := variant["type"]; ok {
+						if typed == nil {
+							typed = variant
+						} else {
+							conflictingType = conflictingType || !bytes.Equal(bytes.TrimSpace(value), bytes.TrimSpace(typed["type"]))
+							conflictingItems = conflictingItems || !bytes.Equal(bytes.TrimSpace(variant["items"]), bytes.TrimSpace(typed["items"]))
+						}
 					}
 				}
 			}
@@ -371,11 +541,13 @@ func normalizeImplicitType(schema map[string]json.RawMessage) error {
 		case schema["items"] != nil || schema["prefixItems"] != nil:
 			schema["type"] = json.RawMessage(`"array"`)
 		default:
-			schema["type"] = json.RawMessage(`"string"`)
+			if schema["enum"] != nil || schema["pattern"] != nil || schema["format"] != nil || schema["minLength"] != nil || schema["maxLength"] != nil {
+				schema["type"] = json.RawMessage(`"string"`)
+			}
 		}
-		if typed != nil {
+		if typed != nil && !conflictingType {
 			schema["type"] = typed["type"]
-			if items, ok := typed["items"]; ok && schema["items"] == nil {
+			if items, ok := typed["items"]; ok && schema["items"] == nil && !conflictingItems {
 				schema["items"] = items
 			}
 		}
@@ -384,7 +556,7 @@ func normalizeImplicitType(schema map[string]json.RawMessage) error {
 	if json.Unmarshal(schema["type"], &typeName) != nil || !strings.EqualFold(typeName, "array") || schema["items"] != nil {
 		return nil
 	}
-	schema["items"] = json.RawMessage(`{"type":"string"}`)
+	schema["items"] = json.RawMessage(`true`)
 	var prefix []map[string]json.RawMessage
 	if raw, ok := schema["prefixItems"]; ok && json.Unmarshal(raw, &prefix) == nil {
 		typed := make([]map[string]json.RawMessage, 0, len(prefix))
@@ -412,22 +584,7 @@ func schemaType(schema map[string]json.RawMessage) (string, error) {
 		}
 		return typeName, nil
 	}
-	for _, name := range []string{"anyOf", "oneOf", "allOf"} {
-		value, ok := schema[name]
-		if !ok {
-			continue
-		}
-		var variants []map[string]json.RawMessage
-		if err := json.Unmarshal(value, &variants); err != nil {
-			return "", fmt.Errorf("schema.%s must be an array of JSON objects", name)
-		}
-		for _, variant := range variants {
-			if typeValue, exists := variant["type"]; exists {
-				return schemaString(typeValue, "type")
-			}
-		}
-	}
-	return "", fmt.Errorf("schema.type must be a string")
+	return "", nil
 }
 
 func schemaInteger(raw json.RawMessage, name string) (int64, error) {
@@ -484,4 +641,51 @@ func setWireField(wire []any, index int, value any) []any {
 	}
 	wire[index] = value
 	return wire
+}
+
+// normalizeFunctionParameters normalizes empty parameter definitions to object
+func normalizeFunctionParameters(raw json.RawMessage) (json.RawMessage, error) {
+	cleaned, err := cleanSchemaInput(raw, true)
+	if err == nil && (bytes.Equal(cleaned, []byte("{}")) || bytes.Equal(cleaned, []byte("true"))) {
+		cleaned = json.RawMessage(`{"type":"object"}`)
+	}
+	return cleaned, err
+}
+
+// requestNeedsBuildSchema selects native channel for open nodes in structured output
+func requestNeedsBuildSchema(request GenerateRequest) bool {
+	if len(request.Config.ResponseSchema) == 0 {
+		return false
+	}
+	wire, err := encodeJSONSchema(request.Config.ResponseSchema)
+	return err == nil && schemaWireNeedsBuild(wire)
+}
+
+// schemaWireNeedsBuild finds untyped nodes not accepted by Playground
+func schemaWireNeedsBuild(wire []any) bool {
+	if len(wire) > 0 && wire[0] == int64(0) {
+		return true
+	}
+	for _, index := range []int{5, 19} {
+		if len(wire) > index && wire[index] != nil && schemaWireNeedsBuild(wire[index].([]any)) {
+			return true
+		}
+	}
+	if len(wire) > 6 && wire[6] != nil {
+		for _, entry := range wire[6].([]any) {
+			if schemaWireNeedsBuild(entry.([]any)[1].([]any)) {
+				return true
+			}
+		}
+	}
+	for _, index := range []int{16, 17, 18} {
+		if len(wire) > index && wire[index] != nil {
+			for _, variant := range wire[index].([]any) {
+				if schemaWireNeedsBuild(variant.([]any)) {
+					return true
+				}
+			}
+		}
+	}
+	return false
 }

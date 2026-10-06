@@ -172,6 +172,12 @@ func (c *Client) generateInteraction(ctx context.Context, request GenerateReques
 		defer stopClose()
 		committed := false
 		send := func(event Event) error {
+			if request.Config.HideThinking && event.Kind == EventReasoning {
+				if event.ThoughtSignature == "" {
+					return nil
+				}
+				event.Kind, event.Text = EventThoughtSignature, ""
+			}
 			if !committed {
 				committed = true
 				ready <- nil
@@ -260,14 +266,11 @@ func DecodeInteractionStream(source io.Reader, emit func(Event) error) error {
 			return withMethod(err, "CreateInteractionStream")
 		}
 		if code != 0 {
-			rpcError := &RPCError{Method: "CreateInteractionStream", StatusCode: http.StatusBadGateway, Code: code}
+			statusCode := http.StatusBadGateway
 			if status, ok := interactionStatusHTTP[code]; ok {
-				rpcError.StatusCode = status
+				statusCode = status
 			}
-			if len(status) > 1 {
-				rpcError.Message, _ = rawString(status[1], "$[1][1]", trailing[0])
-			}
-			return rpcError
+			return DecodeRPCError("CreateInteractionStream", statusCode, trailing[0])
 		}
 	}
 	if !finished {
