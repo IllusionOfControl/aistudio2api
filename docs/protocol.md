@@ -796,7 +796,7 @@ The key slots of a complete function call Part are:
 
 Where Part index `10` holds the function call, and index `14` holds the thought signature.
 
-Function parameters and structured output schemas use the following protobuf fields:
+Playground function parameter carrier and structured output schemas use the following protobuf fields:
 
 | JSON Schema | Field | JSON Schema | Field |
 | --- | ---: | --- | ---: |
@@ -813,26 +813,36 @@ Function parameters and structured output schemas use the following protobuf fie
 | `maxItems` | 21 | `minItems` | 22 |
 | `propertyOrdering` | 23 | | |
 
-Schema normalization rules:
+Structured output schema normalization rules:
 
 | Input Structure | Encoded Result |
 | --- | --- |
-| `$schema`, `default`, `additionalProperties`, `exclusiveMinimum`, `propertyNames`, `prefixItems` | Omitted from the wire schema |
+| Explicit `null` in optional fields | Remove unset fields; `example: null` preserved as data value, `const` verified per constant rules, property names preserved |
+| Empty definition, `null`, `{}`, or `true` for 0-arg function | Object parameter structure |
+| Open `{}`, `true`, and array without item definition | Open nodes use `TYPE_UNSPECIFIED`, generation routes to Build channel |
+| `items: false` | Empty array constraint `maxItems=0`; returns argument error if set alongside positive `minItems` |
+| `not: false` | Remove empty negation constraint |
+| `not: true`, `not: {}`, root `false`, or `false` on required properties | Returns argument error forbidding all values |
+| `not: {type: "null"}` | Sets `nullable=false` |
+| String or string array in `not` | String enum exclusion constraint |
+| `$schema`, `default`, `additionalProperties`, `exclusiveMinimum`, `propertyNames`, `prefixItems` | Omitted from wire schema |
 | `type: [T, "null"]` | Root type `T` and `nullable=true` |
 | `null` branch in `anyOf` / `oneOf` | Remove `null` branch and set `nullable=true` |
-| Multiple non-null `type` values | First item serves as the root type; the full set of types is written to `anyOf` |
-| Composite Schema missing a root `type` | First typed branch serves as the root type; `items` of this branch are also written to the root node |
-| Other nodes missing `type` | If `properties` is present, type is object; if `items` or `prefixItems` is present, type is array; otherwise, string |
-| Array missing `items` | Typed items in `prefixItems` form `anyOf`; if absent, defaults to string |
+| Multiple non-null `type` values | Open root node and `anyOf` with full type set |
+| Composite Schema missing root `type` | Same-type branches infer root type; mixed types keep open root node, identical `items` written to root node |
+| Other nodes missing `type` | With `properties`: object; with `items` or `prefixItems`: array; string constraints infer string; otherwise open node |
+| Array missing `items` | Typed items in `prefixItems` form `anyOf`; others use open item node |
 | Other Schema fields | Returns `400 invalid_request` / `INVALID_ARGUMENT` |
 
-The AI Studio web protocol uses automatic function calling: `auto` requests carry only function declarations in root field 7, leaving the invocation decision to the model; `none` omits tools. Client tool choice mappings are as follows:
+Function declarations treat the client JSON Schema as the parameter contract. Playground generates sendable parameter carriers for open nodes, mixed unions, references, numeric enums, and constants, embedding the full Schema in tool descriptions; normal expressible declarations retain original encoding, and historic calls and tool results retain original values. Build uses `parametersJsonSchema`, preserving combination branches and constraints. `strict: true` and Gemini `VALIDATED` validate the original parameter contract before returning complete tool events; upstream calls violating the contract return protocol errors.
 
-| Public Protocol | Accepted | Returns 400 |
+`auto` leaves invocation decisions to the model, and `none` omits tools. Named functions restrict declarations to a subset; Playground writes invocation requirements into generation instructions and checks actual returns, while Build uses native `functionCallingConfig`. Client tool choice mappings are as follows:
+
+| Public Protocol | Auto and None | Required Call |
 | --- | --- | --- |
 | OpenAI Chat / Responses | Default, `auto`, `none` | `required`, named function |
 | Anthropic | Default, `auto`, `none` | `any`, named `tool` |
-| Gemini | Default, `AUTO`, `NONE` | `ANY`, `allowedFunctionNames` |
+| Gemini | Default, `AUTO`, `NONE`, `VALIDATED` | `ANY`, `allowedFunctionNames` |
 
 The function call response Part is `[name, Struct, callId?]`; the next turn's function result uses the same shape and carries back the thought signature as-is. When a tool result explicitly provides a function name, that value is preserved; when the name is missing, it is first associated by call ID with pending calls from the current turn that have not yet returned results; if unmatched and only one call remains, its name is used. Each result corresponds to one call; assistant text between calls and results does not affect the association; associations are re-established when a new round of normal conversation begins. When ambiguity exists or call records are missing, an invalid argument error is returned. Function arguments and results use JSON objects; scalar or array results are wrapped as `{"result":<VALUE>}`.
 
@@ -1060,7 +1070,7 @@ server content indices `0/1/2/4/5/6` correspond to model content, turn complete,
 
 | Protocol | Endpoints |
 | --- | --- |
-| OpenAI Chat | `GET /v1/models`, `POST /v1/chat/completions` |
+| OpenAI Chat | `GET /v1/models`, `GET /v1/models/{id}`, `POST /v1/chat/completions` |
 | OpenAI Responses | `POST /v1/responses` |
 | OpenAI Media | `POST /v1/images/generations`, `POST /v1/audio/speech`, `POST /v1/videos`, `GET /v1/videos/{id}`, `GET /v1/videos/{id}/content` |
 | Anthropic | `POST /v1/messages`, `POST /v1/messages/count_tokens` |
@@ -1074,7 +1084,7 @@ Extended endpoints:
 | OpenAI Transcriptions | `POST /v1/audio/transcriptions` |
 | Realtime WebSockets | `GET /v1/live`, `GET /v1/robotics/stream` |
 
-The registration shapes for dynamic routes are `GET /v1/files/{file}`, `GET /v1/files/{file}/content`, `DELETE /v1/files/{file}`, `GET /v1/videos/{video}`, `GET /v1/videos/{video}/content`, `POST /v1beta/models/{action}`, and `GET /v1beta/operations/{operation}`; `{id}` in the endpoint tables denotes the corresponding resource identifier.
+The registration shapes for dynamic routes are `GET /v1/models/{model...}`, `GET /v1beta/models/{model...}`, `GET /v1/files/{file}`, `GET /v1/files/{file}/content`, `DELETE /v1/files/{file}`, `GET /v1/videos/{video}`, `GET /v1/videos/{video}/content`, `POST /v1beta/models/{action}`, and `GET /v1beta/operations/{operation}`; `{id}` in the endpoint tables denotes the corresponding resource identifier.
 
 Public `/v1` and `/v1beta` endpoints accept `Authorization: Bearer`, `X-API-Key`, `X-Goog-API-Key`, or `?key=`, with resolution precedence: `?key=`, `X-Goog-API-Key`, `X-API-Key`, `Authorization: Bearer`. When the configuration is empty, local API key validation is disabled; in this case, HTTP/HTTPS web page requests where `Origin` is `null` or a non-localhost, non-loopback address return 401, while clients without an `Origin` header and other URI schemes remain unrestricted. `/v1*` responses allow any origin, permitting `GET/POST/PUT/DELETE/OPTIONS` and headers: `Authorization`, `Content-Type`, `X-API-Key`, `X-Goog-API-Key`, `Anthropic-Version`, and `Anthropic-Beta`. The maximum `/v1*` request body size is approximately 684 MiB, accommodating Base64-encoded 512 MiB files.
 
@@ -1266,9 +1276,10 @@ Model catalog projections:
 
 | Rule | Result |
 | --- | --- |
-| OpenAI | `GET /v1/models` returns the OpenAI model list |
-| Anthropic | `GET /v1/models` with an `Anthropic-Version` header returns the Anthropic model list |
+| OpenAI | `GET /v1/models` returns model list, `GET /v1/models/{model}` returns single matching model object |
+| Anthropic | Model list and single model lookup with `Anthropic-Version` header return Anthropic format; error responses use corresponding error format |
 | Gemini | Model names use the format `models/<ID>` |
+| Single Model Lookup | Canonical ID takes precedence over aliases; both endpoints accept `models/` prefix and live catalog aliases |
 | Multi-account identical models | Union of generation methods and capability options |
 | Multi-account token limits | Minimum positive value for input and output limits, respectively |
 | Model aliases | Sourced from `ListModels` field 57 |
@@ -1350,7 +1361,7 @@ Primary request formats:
 | `/v1/audio/transcriptions` | multipart `file`; `model` defaults to `gemini-3.5-transcribe` | Text or transcription JSON |
 | `/v1/videos` | `model`, `prompt` | Long-running operation object, followed by polling and content download |
 
-Anthropic assistant prefill is indicated by a trailing `assistant` message. Because AI Studio currently lacks a corresponding generation prefix field, `/v1/messages` rejects this input with `400 invalid_request_error`.
+Anthropic assistant prefill is indicated by a trailing `assistant` text message. The adapter places the prefix into the continuation instruction, and the response body returns only the content following the prefix.
 
 The four generation entry points share a canonical request format, with input parameters mapped as follows:
 
@@ -1384,14 +1395,13 @@ Generation parameter mapping:
 | stop sequence match | Core protocol matches against the content stream and returns the exact matched sequence |
 | structured output | MIME type maps to field 8, Schema maps to field 9 |
 | OpenAI Chat `n` | Accepts only omitted or `1` |
-| OpenAI Chat `parallel_tool_calls` | Accepts only omitted or `true` |
+| OpenAI Chat `parallel_tool_calls` | Omitted/`true` allows parallel; `false` requires at most one function call in this turn |
 | OpenAI Chat `logprobs` / `logit_bias` | Accepts only omitted or `false`, and omitted or empty object, respectively |
 | OpenAI Chat frequency / presence penalty | Accepts only `0` |
-| OpenAI Chat function `strict` | Accepts omitted or `false`; `true` returns `400 invalid_request` |
-| Responses `parallel_tool_calls` | Written to response metadata; function calling defaults to AI Studio auto mode |
-| Responses `parallel_tool_calls` values | Accepts only omitted or `true` |
-| Responses `truncation` | Accepts only omitted or `disabled` |
-| Responses function `strict` | Accepts omitted or `false`; `true` returns `400 invalid_request` |
+| OpenAI Chat function `strict` | `true` validates returned arguments against JSON Schema |
+| Responses `parallel_tool_calls` | Written to response metadata; `false` requires at most one function call in this turn |
+| Responses `truncation` | `auto` removes earliest complete conversation turns according to upstream token count, preserving latest turn and paired tool calls/results; omitted/`disabled` retains full input |
+| Responses function `strict` | `true` validates returned arguments against JSON Schema |
 | Responses `store` | When omitted or `true`, persists the session node in the current process; `false` returns only the immediate result |
 | Gemini frequency / presence penalty | Accepts only `0` |
 | Gemini `candidateCount` | Accepts only omitted or `1` |
@@ -1399,7 +1409,7 @@ Generation parameter mapping:
 | Gemini `googleSearchRetrieval` | Accepts only an empty object; `dynamicRetrievalConfig` returns `400 INVALID_ARGUMENT` |
 | Anthropic `thinking` | `enabled` supplies `budget_tokens`; models supporting thinking budgets map the budget directly, while models supporting only thinking levels map values <= 0, 1024, 8192, and above to minimal, low, medium, and high, respectively; `adaptive` applies default model thinking |
 | Anthropic thinking capability | Returns `invalid_request_error` if the model supports neither thinking budgets nor thinking levels; non-streaming calls return HTTP 400, streaming calls return an Anthropic error event |
-| Anthropic thinking type | `disabled` and unrecognized types return `400 invalid_request_error` |
+| Anthropic thinking type | `disabled` applies minimal thinking configuration and hides thought body while retaining thought signatures; unrecognized types return `400 invalid_request_error` |
 
 ### OpenAI Chat Completions
 
@@ -1412,13 +1422,13 @@ Generation parameter mapping:
 | `stream` | boolean |
 | `stream_options.include_usage` | Send a usage-only chunk after the finish chunk |
 | `tools` | Array of functions or Google server tools |
-| `tool_choice` | Omitted / `auto` / `none` |
-| `web_search_options` | Object; enables Google Search; `search_context_size` and `user_location` return 400 |
+| `tool_choice` | Omitted / `auto` / `none` / `required`, or named function object |
+| `web_search_options` | Object; enables Google Search; search depth and approximate location written to search instructions |
 | `temperature`, `top_p` | Optional sampling parameters |
 | `max_tokens`, `max_completion_tokens` | The latter takes precedence |
 | `frequency_penalty`, `presence_penalty` | Omitted or `0` |
 | `n` | Omitted or `1` |
-| `parallel_tool_calls` | Omitted or `true` |
+| `parallel_tool_calls` | Omitted / `true` / `false` |
 | `logprobs` | Omitted or `false` |
 | `logit_bias` | Omitted, `null`, or empty object |
 | `stop` | string or string array; empty strings are removed from the conditions |
@@ -1450,7 +1460,7 @@ Message fields are `role`, `content`, optional `name`, `tool_call_id`, and `tool
 
 When the OpenAI `image_url` / `input_image` value is a Base64 data URL, it forms inline data; when it is a YouTube URL, it forms external media; other non-data strings are resolved as uploaded file IDs. The adapter does not download standard HTTP image URLs. `video_url` / `input_video` only accepts YouTube URLs. `file_data` accepts a Base64 data URL or an uploaded file ID.
 
-Function tools use `{"type":"function","function":{"name","description","parameters","strict"}}`. `strict` can be omitted or set to `false`. Google tool types are `web_search`, `web_search_preview`, `image_search`, `url_context`, `code_interpreter`, and `google_maps`.
+Function tools use `{"type":"function","function":{"name","description","parameters","strict"}}`. `strict: true` enables parameter contract validation. Google tool types are `web_search`, `web_search_preview`, `image_search`, `url_context`, `code_interpreter`, and `google_maps`.
 
 Non-streaming response:
 
@@ -1505,17 +1515,17 @@ Each standard chunk is `{id,object:"chat.completion.chunk",created,model,choices
 | `input` | string or array of input items |
 | `instructions` | Top-level system instructions |
 | `stream` | boolean |
-| `tools`, `tool_choice` | function, namespace, and Google tools; functions within a namespace are expanded into function declarations, invocation results identify their parent namespace via the `namespace` field, and duplicate function names return 400; choice is `auto`/`none` |
+| `tools`, `tool_choice` | function, namespace, and Google tools; functions within a namespace are encoded with qualified names, outputs recover `namespace` and original function name, and distinct namespaces may declare identical function names; choice supports auto/none/required/named function |
 | `temperature`, `top_p`, `max_output_tokens` | Generation parameters |
 | `reasoning` | `{"effort":"..."}` |
 | `text` | `{"format":{"type":"text|json_object|json_schema","schema":...}}` |
-| `previous_response_id` | Previously saved response ID within the current process |
-| `parallel_tool_calls` | Omitted or `true` |
-| `truncation` | Omitted or `disabled` |
+| `previous_response_id` | Previously saved response ID within current process |
+| `parallel_tool_calls` | Omitted / `true` / `false` |
+| `truncation` | Omitted / `disabled` / `auto` |
 | `metadata` | string-to-string object |
 | `store` | Omitted / `true` to persist the node; `false` to return the current result only |
 
-Input item fields are `type`, `role`, `content`, `call_id`, `name`, `arguments`, `output`, and `encrypted_content`. Supports message, `function_call`, `function_call_output`, and reasoning items. Message content Parts:
+Input item fields are `type`, `role`, `content`, `call_id`, `name`, `namespace`, `arguments`, `output`, and `encrypted_content`. Supports message, `function_call`, `function_call_output`, and reasoning items. Message content Parts:
 
 | type | Fields |
 | --- | --- |
@@ -1532,7 +1542,7 @@ Responses tool fields:
 | tool type | Fields |
 | --- | --- |
 | `function` | `name`, `description`, `parameters`, `strict` |
-| `web_search`, `web_search_2025_08_26`, `web_search_preview`, `web_search_preview_2025_03_11` | Only accepts `type`; `search_context_size`, `user_location`, and `filters` must be omitted |
+| `web_search`, `web_search_2025_08_26`, `web_search_preview`, `web_search_preview_2025_03_11` | `search_context_size`, `user_location`, and `filters.allowed_domains` act as search instructions; domain restrictions use `site:` queries; upstream grounding queries and sources are returned verbatim |
 | `image_search`, `url_context`, `google_maps` | `type` |
 | `code_interpreter` | `container` can be omitted, `"auto"`, or `{"type":"auto","file_ids":[]}`; non-empty `file_ids` returns 400 |
 
@@ -1630,8 +1640,8 @@ When a web search occurs, the search call item precedes the message; if there is
 | `stop_sequences` | string array |
 | `stream` | boolean |
 | `temperature`, `top_p`, `top_k` | Generation parameters |
-| `tools`, `tool_choice` | custom/server tools and auto/none |
-| `thinking` | `{type:"enabled",budget_tokens:<INT>}` or `{type:"adaptive"}` |
+| `tools`, `tool_choice` | custom/server tools and auto/none/any/named tool; custom tool accepts strict, client caching, and loader hints |
+| `thinking` | `{type:"enabled",budget_tokens:<INT>}`, `{type:"adaptive"}` or `{type:"disabled"}` |
 | `output_config` | `{effort:"..."}` |
 
 Message content can be a string or an array of blocks:
@@ -1662,7 +1672,7 @@ A custom tool is defined as `{name,description,input_schema}`, with an optional 
 
 `web_search_20250305` accepts `max_uses`, with the actual invocation count determined upstream.
 
-Server tools accept only their corresponding `type` and `name`. Providing `description`, `input_schema`, or extra options returns `invalid_request_error`. Tool choice accepts an omitted value, `{"type":"auto"}`, or `{"type":"none"}`; `any` and named `tool` return 400.
+Server tools accept only their corresponding `type` and `name`. Providing `description`, `input_schema`, or extra options returns `invalid_request_error`. Tool choice accepts omitted, `{"type":"auto"}`, `{"type":"none"}`, `{"type":"any"}`, and `{"type":"tool","name":"FUNCTION_NAME"}`. Client hints such as `cache_control` on custom tools preserve generation capabilities, and `strict: true` validates complete returned parameters.
 
 Non-streaming response:
 
@@ -1815,7 +1825,7 @@ tool group fields:
 | maps | `googleMaps` |
 | image search | `imageSearch` |
 
-`googleSearch.searchTypes` can contain empty `webSearch` and `imageSearch` objects; defaults to web search if not provided or if neither is enabled. `timeRangeFilter.startTime/endTime` uses RFC 3339 Nano. `googleSearchRetrieval` only accepts an empty object. Tool choice resides in `toolConfig.functionCallingConfig:{mode,allowedFunctionNames}`, accepting `AUTO` and `NONE`; `ANY` or a non-empty `allowedFunctionNames` returns 400.
+`googleSearch.searchTypes` can contain empty `webSearch` and `imageSearch` objects; defaults to web search if not provided or if neither is enabled. `timeRangeFilter.startTime/endTime` uses RFC 3339 Nano. `googleSearchRetrieval` only accepts an empty object. Tool choice resides in `toolConfig.functionCallingConfig:{mode,allowedFunctionNames}`, accepting `AUTO`, `NONE`, `ANY`, and `VALIDATED`; `allowedFunctionNames` uses a subset of declared functions.
 
 `:countTokens` returns:
 

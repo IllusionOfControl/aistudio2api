@@ -219,7 +219,7 @@ func (s *server) handleGeminiModels(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) handleGeminiModel(w http.ResponseWriter, r *http.Request) {
-	modelID := strings.TrimPrefix(r.PathValue("model"), "models/")
+	modelID := r.PathValue("model")
 	models, err := s.service.Models(r.Context())
 	if err != nil {
 		if shouldWriteRequestError(r, err) {
@@ -227,11 +227,9 @@ func (s *server) handleGeminiModel(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	for _, model := range models {
-		if model.ID == modelID {
-			writeJSON(w, http.StatusOK, geminiModelObject(model))
-			return
-		}
+	if model, ok := lookupPublicModel(models, modelID); ok {
+		writeJSON(w, http.StatusOK, geminiModelObject(model))
+		return
 	}
 	writeGeminiError(w, http.StatusNotFound, "NOT_FOUND", fmt.Sprintf("model %q is unavailable", modelID))
 }
@@ -732,21 +730,18 @@ func mapGeminiTools(groups []geminiToolGroup, config geminiToolConfig) (aistudio
 		}
 	}
 	var toolConfig aistudio.ToolConfig
-	if len(config.FunctionCallingConfig.AllowedFunctionNames) > 0 {
-		return aistudio.Tools{}, fmt.Errorf("allowedFunctionNames is not supported by AI Studio Web")
-	}
+	toolConfig.AllowedFunctionNames = config.FunctionCallingConfig.AllowedFunctionNames
 	switch strings.ToUpper(config.FunctionCallingConfig.Mode) {
 	case "", "AUTO":
 		toolConfig.Mode = "auto"
 	case "ANY":
-		return aistudio.Tools{}, fmt.Errorf("functionCallingConfig mode ANY is not supported by AI Studio Web")
+		toolConfig.Mode = "required"
+	case "VALIDATED":
+		toolConfig.Mode = "validated"
 	case "NONE":
 		toolConfig.Mode = "none"
 	default:
 		return aistudio.Tools{}, fmt.Errorf("unsupported functionCallingConfig mode %q", config.FunctionCallingConfig.Mode)
-	}
-	if len(mapped.Functions) == 0 && len(mapped.Google) == 0 && mapped.GoogleSearch == nil {
-		return mapped, nil
 	}
 	mapped.ToolConfig = toolConfig
 	return mapped, nil

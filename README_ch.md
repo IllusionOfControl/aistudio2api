@@ -36,6 +36,7 @@
 ## 特性
 
 - **原生流式响应**: 实时输出正文、思考摘要、函数调用、Google 工具、媒体和 usage
+- **函数工具**: 四协议支持工具调用与续接、工具选择和严格参数校验；支持联合类型与开放参数定义
 - **TTS 语音生成**: 支持 Gemini TTS 模型的单/多说话人音频生成
 - **图片生成**: 支持 Nano Banana 图片生成
 - **视频生成**: 支持 Veo 视频生成和图片转视频；Gemini Omni 通过四套生成接口接收文本、图片与视频输入，输出文本与 MP4 视频
@@ -248,7 +249,7 @@ providers:
 
 | 能力 | 端点 |
 | --- | --- |
-| 模型 | `GET /v1/models`、`GET /v1beta/models` |
+| 模型 | `GET /v1/models`、`GET /v1/models/{model}`、`GET /v1beta/models`、`GET /v1beta/models/{model}` |
 | OpenAI Chat | `POST /v1/chat/completions` |
 | OpenAI Responses | `POST /v1/responses` |
 | Files | `POST /v1/files`、`GET /v1/files/{id}`、`GET /v1/files/{id}/content`、`DELETE /v1/files/{id}` |

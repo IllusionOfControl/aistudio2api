@@ -137,11 +137,14 @@ type FunctionDeclaration struct {
 	Name        string          `json:"name"`
 	Description string          `json:"description,omitempty"`
 	Parameters  json.RawMessage `json:"parameters,omitempty"`
+	Strict      bool            `json:"strict,omitempty"`
 }
 
 // ToolConfig represents a tool enablement policy
 type ToolConfig struct {
-	Mode string `json:"mode,omitempty"`
+	Mode                 string   `json:"mode,omitempty"`
+	AllowedFunctionNames []string `json:"allowed_function_names,omitempty"`
+	ParallelCalls        *bool    `json:"parallel_calls,omitempty"`
 }
 
 // GoogleSearchTimeRange represents the retrieval time range for Google Search
@@ -152,9 +155,12 @@ type GoogleSearchTimeRange struct {
 
 // GoogleSearchOptions represents retrieval types and time ranges for Google Search
 type GoogleSearchOptions struct {
-	WebSearch   bool                   `json:"web_search,omitempty"`
-	ImageSearch bool                   `json:"image_search,omitempty"`
-	TimeRange   *GoogleSearchTimeRange `json:"time_range,omitempty"`
+	WebSearch      bool                   `json:"web_search,omitempty"`
+	ImageSearch    bool                   `json:"image_search,omitempty"`
+	TimeRange      *GoogleSearchTimeRange `json:"time_range,omitempty"`
+	ContextSize    string                 `json:"context_size,omitempty"`
+	UserLocation   json.RawMessage        `json:"user_location,omitempty"`
+	AllowedDomains []string               `json:"allowed_domains,omitempty"`
 }
 
 // Tools represents tools enabled for a request
@@ -222,6 +228,8 @@ type GenerationConfig struct {
 	ReasoningEffort     string               `json:"reasoning_effort,omitempty"`
 	ThinkingBudget      *int64               `json:"thinking_budget,omitempty"`
 	Seed                *int64               `json:"seed,omitempty"`
+	// HideThinking controls visibility of thought blocks in public responses
+	HideThinking bool `json:"hide_thinking,omitempty"`
 }
 
 // GenerateRequest represents a provider-agnostic generation request
@@ -237,6 +245,8 @@ type GenerateRequest struct {
 	ImageRoute bool `json:"-"`
 	// Unary marks a single non-streaming request (using ProxyUnaryCall in Build proxy).
 	Unary bool `json:"-"`
+	// Truncate removes earliest complete conversation turns before generation according to model context window
+	Truncate bool `json:"-"`
 }
 
 // TokenCountRequest represents a token counting request

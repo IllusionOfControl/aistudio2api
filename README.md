@@ -36,6 +36,7 @@
 ## Features
 
 - **Native Streaming**: Text, reasoning summaries, function calls, Google tools, media, and usage
+- **Function Tools**: Tool calls, continuation, selection, and strict argument validation across all four protocols, including union types and open parameter schemas
 - **TTS Speech Generation**: Gemini TTS models for single-speaker and multi-speaker audio
 - **Image Generation**: Nano Banana image generation
 - **Video Generation**: Veo video generation and image-to-video; Gemini Omni accepts text, image, and video input and returns text and MP4 video through the four generation APIs
@@ -248,7 +249,7 @@ Main endpoints:
 
 | Capability | Endpoint |
 | --- | --- |
-| Models | `GET /v1/models`, `GET /v1beta/models` |
+| Models | `GET /v1/models`, `GET /v1/models/{model}`, `GET /v1beta/models`, `GET /v1beta/models/{model}` |
 | OpenAI Chat | `POST /v1/chat/completions` |
 | OpenAI Responses | `POST /v1/responses` |
 | Files | `POST /v1/files`, `GET /v1/files/{id}`, `GET /v1/files/{id}/content`, `DELETE /v1/files/{id}` |

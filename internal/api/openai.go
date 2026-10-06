@@ -74,11 +74,62 @@ type openAITool struct {
 
 var assistantImagePattern = regexp.MustCompile(`!\[[^\]]*\]\((data:image/[A-Za-z0-9.+-]+;base64,[A-Za-z0-9+/_=\r\n-]+)\)`)
 
+// openAIModelObject projects shared public fields for model lists and single model lookups
+func openAIModelObject(model aistudio.Model) map[string]any {
+	item := map[string]any{
+		"id": model.ID, "object": "model", "created": 0, "owned_by": "google",
+		"name": model.Name, "description": model.Description,
+		"supported_generation_methods": model.Methods,
+		"input_token_limit":            model.InputTokenLimit, "output_token_limit": model.OutputTokenLimit,
+	}
+	if len(model.Capabilities) > 0 {
+		item["capabilities"] = model.Capabilities
+	}
+	if len(model.CapabilityOptions) > 0 {
+		item["capability_options"] = model.CapabilityOptions
+	}
+	if len(model.AccessModes) > 0 {
+		item["access_modes"] = model.AccessModes
+	}
+	if len(model.Channels) > 0 {
+		item["channels"] = model.Channels
+	}
+	if model.Paid {
+		item["paid"] = true
+	}
+	return item
+}
+
+// lookupPublicModel resolves from live catalog preferring canonical ID over aliases
+func lookupPublicModel(models []aistudio.Model, id string) (aistudio.Model, bool) {
+	id = strings.TrimPrefix(strings.TrimSpace(id), "models/")
+	if id == "" {
+		return aistudio.Model{}, false
+	}
+	for _, model := range models {
+		if model.ID == id {
+			return model, true
+		}
+	}
+	for _, model := range models {
+		for _, alias := range model.CapabilityOptions["aliases"] {
+			if strings.TrimPrefix(strings.TrimSpace(alias), "models/") == id {
+				return model, true
+			}
+		}
+	}
+	return aistudio.Model{}, false
+}
+
 func (s *server) handleOpenAIModels(w http.ResponseWriter, r *http.Request) {
 	models, err := s.service.Models(r.Context())
 	if err != nil {
 		if shouldWriteRequestError(r, err) {
-			writeOpenAIError(w, statusFromError(err), openAIErrorCode(err), err.Error())
+			if r.Header.Get("Anthropic-Version") != "" {
+				writeAnthropicError(w, statusFromError(err), anthropicErrorType(err), err.Error())
+			} else {
+				writeOpenAIError(w, statusFromError(err), openAIErrorCode(err), err.Error())
+			}
 		}
 		return
 	}
@@ -88,35 +139,39 @@ func (s *server) handleOpenAIModels(w http.ResponseWriter, r *http.Request) {
 	}
 	data := make([]map[string]any, 0, len(models))
 	for _, model := range models {
-		item := map[string]any{
-			"id":                           model.ID,
-			"object":                       "model",
-			"created":                      0,
-			"owned_by":                     "google",
-			"name":                         model.Name,
-			"description":                  model.Description,
-			"supported_generation_methods": model.Methods,
-			"input_token_limit":            model.InputTokenLimit,
-			"output_token_limit":           model.OutputTokenLimit,
-		}
-		if len(model.Capabilities) > 0 {
-			item["capabilities"] = model.Capabilities
-		}
-		if len(model.CapabilityOptions) > 0 {
-			item["capability_options"] = model.CapabilityOptions
-		}
-		if len(model.AccessModes) > 0 {
-			item["access_modes"] = model.AccessModes
-		}
-		if len(model.Channels) > 0 {
-			item["channels"] = model.Channels
-		}
-		if model.Paid {
-			item["paid"] = true
-		}
-		data = append(data, item)
+		data = append(data, openAIModelObject(model))
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": data})
+}
+
+// handleOpenAIModel returns a single model from the live catalog or a protocol-specific error
+func (s *server) handleOpenAIModel(w http.ResponseWriter, r *http.Request) {
+	models, err := s.service.Models(r.Context())
+	if err != nil {
+		if shouldWriteRequestError(r, err) {
+			if r.Header.Get("Anthropic-Version") != "" {
+				writeAnthropicError(w, statusFromError(err), anthropicErrorType(err), err.Error())
+			} else {
+				writeOpenAIError(w, statusFromError(err), openAIErrorCode(err), err.Error())
+			}
+		}
+		return
+	}
+	model, ok := lookupPublicModel(models, r.PathValue("model"))
+	if !ok {
+		message := fmt.Sprintf("model %q is unavailable", r.PathValue("model"))
+		if r.Header.Get("Anthropic-Version") != "" {
+			writeAnthropicError(w, http.StatusNotFound, "not_found_error", message)
+		} else {
+			writeOpenAIError(w, http.StatusNotFound, "model_not_found", message)
+		}
+		return
+	}
+	if r.Header.Get("Anthropic-Version") != "" {
+		writeJSON(w, http.StatusOK, anthropicModelObject(model))
+	} else {
+		writeJSON(w, http.StatusOK, openAIModelObject(model))
+	}
 }
 
 func (s *server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
@@ -195,11 +250,13 @@ func (request chatRequest) toGenerateRequest(id string) (aistudio.GenerateReques
 		if err := json.Unmarshal(request.WebSearchOptions, &options); err != nil {
 			return aistudio.GenerateRequest{}, fmt.Errorf("web_search_options must be an object")
 		}
-		if options.SearchContextSize != "" || rawJSONConfigured(options.UserLocation) {
-			return aistudio.GenerateRequest{}, fmt.Errorf("AI Studio Web does not support web_search_options search_context_size or user_location")
+		tools.GoogleSearch, err = mapSearchOptions(options.SearchContextSize, options.UserLocation, nil)
+		if err != nil {
+			return aistudio.GenerateRequest{}, err
 		}
 		tools.Google = appendUnique(tools.Google, "google_search")
 	}
+	tools.ToolConfig.ParallelCalls = request.ParallelToolCalls
 	config, err := request.generationConfig()
 	if err != nil {
 		return aistudio.GenerateRequest{}, err
@@ -454,9 +511,6 @@ func mapOpenAITools(tools []openAITool, choice json.RawMessage) (aistudio.Tools,
 			if tool.Function.Name == "" {
 				return aistudio.Tools{}, fmt.Errorf("function tool name is required")
 			}
-			if tool.Function.Strict != nil && *tool.Function.Strict {
-				return aistudio.Tools{}, fmt.Errorf("function tool strict is not supported by AI Studio Web")
-			}
 			parameters := tool.Function.Parameters
 			if len(parameters) == 0 {
 				parameters = json.RawMessage(`{"type":"object","properties":{}}`)
@@ -465,6 +519,7 @@ func mapOpenAITools(tools []openAITool, choice json.RawMessage) (aistudio.Tools,
 				Name:        tool.Function.Name,
 				Description: tool.Function.Description,
 				Parameters:  parameters,
+				Strict:      tool.Function.Strict != nil && *tool.Function.Strict,
 			})
 		case "web_search", "web_search_preview":
 			mapped.Google = appendUnique(mapped.Google, "google_search")
@@ -484,9 +539,6 @@ func mapOpenAITools(tools []openAITool, choice json.RawMessage) (aistudio.Tools,
 	if err != nil {
 		return aistudio.Tools{}, err
 	}
-	if len(mapped.Functions) == 0 && len(mapped.Google) == 0 {
-		return mapped, nil
-	}
 	mapped.ToolConfig = config
 	return mapped, nil
 }
@@ -498,22 +550,33 @@ func openAIToolChoice(raw json.RawMessage) (aistudio.ToolConfig, error) {
 	var mode string
 	if err := json.Unmarshal(raw, &mode); err == nil {
 		switch mode {
-		case "auto", "none":
+		case "auto", "none", "required":
 			return aistudio.ToolConfig{Mode: mode}, nil
-		case "required":
-			return aistudio.ToolConfig{}, fmt.Errorf("tool_choice required is not supported by AI Studio Web")
 		default:
 			return aistudio.ToolConfig{}, fmt.Errorf("unsupported tool_choice %q", mode)
 		}
 	}
-	var object map[string]any
+	var object struct {
+		Type      string `json:"type"`
+		Name      string `json:"name"`
+		Namespace string `json:"namespace"`
+		Function  *struct {
+			Name string `json:"name"`
+		} `json:"function"`
+	}
 	if err := json.Unmarshal(raw, &object); err != nil {
 		return aistudio.ToolConfig{}, fmt.Errorf("invalid tool_choice: %w", err)
 	}
-	if object == nil {
-		return aistudio.ToolConfig{}, fmt.Errorf("invalid tool_choice")
+	if object.Function != nil {
+		object.Name = object.Function.Name
 	}
-	return aistudio.ToolConfig{}, fmt.Errorf("named tool_choice is not supported by AI Studio Web")
+	if object.Type != "function" || object.Name == "" {
+		return aistudio.ToolConfig{}, fmt.Errorf("named tool_choice requires type function and a name")
+	}
+	if object.Namespace != "" {
+		object.Name = object.Namespace + "." + object.Name
+	}
+	return aistudio.ToolConfig{Mode: "required", AllowedFunctionNames: []string{object.Name}}, nil
 }
 
 func appendUnique(values []string, value string) []string {
@@ -528,9 +591,6 @@ func appendUnique(values []string, value string) []string {
 func (request chatRequest) generationConfig() (aistudio.GenerationConfig, error) {
 	if request.N != nil && *request.N != 1 {
 		return aistudio.GenerationConfig{}, fmt.Errorf("n must be 1")
-	}
-	if request.ParallelToolCalls != nil && !*request.ParallelToolCalls {
-		return aistudio.GenerationConfig{}, fmt.Errorf("parallel_tool_calls must be true")
 	}
 	if request.Logprobs != nil && *request.Logprobs {
 		return aistudio.GenerationConfig{}, fmt.Errorf("logprobs must be false")

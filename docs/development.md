@@ -232,6 +232,8 @@ Worker capacity is constrained by warm pool target, active worker ceiling, and p
 
 Failure recovery waits for active requests on the same account to release their leases; during this waiting period, new requests are suspended for that account. Client cancellations only terminate their own request. Warm-up runs are submitted once the official Run button is activated, and requests re-check account cooldown status immediately before transmission.
 
+Quota cooldowns are evaluated by `quota_unit`, `quota_limit`, `quota_metric`, and error messages in order. Explicit daily limits reset at midnight US Pacific Time the next day; minute limits reset according to valid `window_start_time`; generic 429 errors cool down for one minute. Retry delays provided by `RetryInfo` and `Retry-After` take precedence. Global scope is confirmed by quota metadata, while other errors only cool down the failed model or capability scope; post-body quota errors and Live session errors follow the same rules.
+
 Account states:
 
 | State | Meaning |
@@ -268,7 +270,7 @@ Public endpoints uniformly consume the same real-time model catalog and canonica
 
 | Protocol | Endpoints |
 | --- | --- |
-| OpenAI Chat | `GET /v1/models`, `POST /v1/chat/completions` |
+| OpenAI Chat | `GET /v1/models`, `GET /v1/models/{model}`, `POST /v1/chat/completions` |
 | OpenAI Responses | `POST /v1/responses` |
 | Gemini Interactions | `POST /v1beta/interactions`, `POST /v1/interactions` |
 | OpenAI Files | `POST /v1/files`, `GET/DELETE /v1/files/{file}`, `GET /v1/files/{file}/content` |
