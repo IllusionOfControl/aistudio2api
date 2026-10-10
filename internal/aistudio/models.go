@@ -253,6 +253,14 @@ func decodeCapabilityOptions(row []json.RawMessage, path string, evidence json.R
 		if err != nil {
 			return nil, err
 		}
+		selectable, err := decodeMappedCodes(rawAt(video, 7), path+"[70][7]", evidence, map[int64]string{3: "resolution"})
+		if err != nil {
+			return nil, err
+		}
+		if len(resolutions) == 0 && len(selectable) > 0 {
+			// When video capability includes code 3 without resolutions listed, official service provides 720p, 1080p, 4k
+			resolutions = []string{"720p", "1080p", "4k"}
+		}
 		appendOption(options, "video_output_resolutions", resolutions)
 	}
 	if len(options) == 0 {
@@ -381,6 +389,20 @@ func (c *Client) modelEntry(ctx context.Context, accountID string, modelID strin
 		return modelEntry{}, fmt.Errorf("%w: %s", ErrModelNotFound, normalized)
 	}
 	return entry, nil
+}
+
+// cachedModelEntries returns model entries from loaded account catalogs without issuing network requests
+func (c *Client) cachedModelEntries(modelID string) []modelEntry {
+	normalized := strings.TrimPrefix(strings.TrimSpace(modelID), "models/")
+	c.catalogMu.RLock()
+	defer c.catalogMu.RUnlock()
+	var entries []modelEntry
+	for _, catalog := range c.catalogs {
+		if entry, exists := catalog.lookup(normalized); exists {
+			entries = append(entries, entry)
+		}
+	}
+	return entries
 }
 
 func (catalog modelCatalog) lookup(modelID string) (modelEntry, bool) {

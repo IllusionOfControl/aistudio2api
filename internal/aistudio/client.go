@@ -186,7 +186,7 @@ func newRPCRequest(method string, accountID string, requestID string, body []byt
 		Header: http.Header{
 			"Content-Type": []string{JSONProtobufContentType},
 		},
-		Body:      append([]byte(nil), body...),
+		Body:      body,
 		Streaming: streaming,
 	}
 }

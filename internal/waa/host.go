@@ -1,9 +1,12 @@
 package waa
 
 import (
+	"bytes"
+	"compress/gzip"
 	_ "embed"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"strings"
 	"sync"
@@ -15,8 +18,23 @@ import (
 //go:embed dom.js
 var domJavaScript string
 
-//go:embed firefox152.json
-var firefoxShapeJSON string
+//go:embed firefox152.json.gz
+var firefoxShapeGzip []byte
+
+// gunzip decompresses embedded gzip data
+func gunzip(data []byte) ([]byte, error) {
+	reader, err := gzip.NewReader(bytes.NewReader(data))
+	if err != nil {
+		return nil, err
+	}
+	return io.ReadAll(reader)
+}
+
+// firefoxShapeJSON decompresses embedded Firefox shape table
+var firefoxShapeJSON = sync.OnceValues(func() (string, error) {
+	data, err := gunzip(firefoxShapeGzip)
+	return string(data), err
+})
 
 // Profile holds host values determined by account fingerprint and page state
 type Profile struct {
@@ -46,6 +64,7 @@ type hostState struct {
 	shape     goja.Value
 	order     *globalOrderShape
 	brands    goja.Value
+	storage   *goja.Object
 	topAPI    goja.Value
 }
 
@@ -91,6 +110,7 @@ const hostJavaScript = `
   return input.installDOM(input.shape, input.profile, {
     markNative,
     brands: input.brands,
+    storage: input.storage,
     realm: input.realm,
     topRealm: input.topRealm,
     trust: input.trust,
@@ -102,6 +122,8 @@ const hostJavaScript = `
     loadImage: input.loadImage,
     resolveInterface: input.resolveInterface,
     orderKeys: input.orderKeys,
+    intl: input.intl,
+    intlHost: input.intlHost,
   });
 })
 `
@@ -127,12 +149,16 @@ func (state *hostState) installRealmHost(vm *goja.Runtime, realm string, createI
 		return nil, errors.New("WAA Realm host is not a function")
 	}
 	if state.shape == nil {
+		shapeJSON, err := firefoxShapeJSON()
+		if err != nil {
+			return nil, fmt.Errorf("read Firefox shape table: %w", err)
+		}
 		parse, _ := goja.AssertFunction(vm.Get("JSON").ToObject(vm).Get("parse"))
-		state.shape, err = parse(goja.Undefined(), vm.ToValue(firefoxShapeJSON))
+		state.shape, err = parse(goja.Undefined(), vm.ToValue(shapeJSON))
 		if err != nil {
 			return nil, fmt.Errorf("parse Firefox shape table: %w", err)
 		}
-		state.order, err = parseGlobalOrderShape(firefoxShapeJSON)
+		state.order, err = parseGlobalOrderShape(shapeJSON)
 		if err != nil {
 			return nil, fmt.Errorf("parse Firefox global key order: %w", err)
 		}
@@ -141,6 +167,7 @@ func (state *hostState) installRealmHost(vm *goja.Runtime, realm string, createI
 		if err != nil {
 			return nil, err
 		}
+		state.storage = vm.NewObject()
 	}
 	timers := &realmTimers{vm: vm, schedule: state.schedule, active: make(map[int64]bool)}
 	timerObject := vm.NewObject()
@@ -171,10 +198,21 @@ func (state *hostState) installRealmHost(vm *goja.Runtime, realm string, createI
 		}
 		return goja.Undefined()
 	})
+	intlHost, err := state.installIntlHost(vm)
+	if err != nil {
+		return nil, err
+	}
+	installIntl, err := vm.RunProgram(intlInstaller)
+	if err != nil {
+		return nil, fmt.Errorf("compile WAA Intl host: %w", err)
+	}
+	_ = input.Set("intl", installIntl)
+	_ = input.Set("intlHost", intlHost)
 	_ = input.Set("timers", timerObject)
 	_ = input.Set("installDOM", installDOM)
 	_ = input.Set("shape", state.shape)
 	_ = input.Set("brands", state.brands)
+	_ = input.Set("storage", state.storage)
 	_ = input.Set("realm", realm)
 	_ = input.Set("profile", state.realmProfile(realm))
 	vm.SetTimeLocation(state.location)

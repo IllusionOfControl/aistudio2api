@@ -26,9 +26,6 @@ var interactionStatusHTTP = map[int64]int{
 
 // EncodeCreateInteractionStreamRequest encodes official CreateInteractionStream request and returns text content participating in WAA binding
 func EncodeCreateInteractionStreamRequest(request GenerateRequest, defaults GenerationDefaults) ([]byte, []Content, error) {
-	if len(request.Config.StopSequences) > 0 {
-		return nil, nil, fmt.Errorf("Interaction models do not support stop sequences")
-	}
 	steps, binding, hasModelTurn, err := encodeInteractionSteps(request.Contents)
 	if err != nil {
 		return nil, nil, err
@@ -41,7 +38,10 @@ func EncodeCreateInteractionStreamRequest(request GenerateRequest, defaults Gene
 	if request.Config.MaxOutputTokens != nil {
 		maxOutput = *request.Config.MaxOutputTokens
 	}
-	if maxOutput <= 0 || maxOutput > defaults.MaxOutputTokens {
+	if maxOutput > defaults.MaxOutputTokens {
+		maxOutput = defaults.MaxOutputTokens
+	}
+	if maxOutput <= 0 {
 		return nil, nil, fmt.Errorf("max output tokens %d exceeds model range 1-%d", maxOutput, defaults.MaxOutputTokens)
 	}
 	// GenerationConfig: field 6 thinking level, field 7 thinking summaries, field 8 max output tokens
@@ -68,54 +68,90 @@ func EncodeCreateInteractionStreamRequest(request GenerateRequest, defaults Gene
 	return body, binding, nil
 }
 
-// encodeInteractionSteps encodes canonical messages into Interaction input steps; user is step field 1, model is field 2
+// encodeInteractionSteps encodes canonical messages into alternating user step field 1 and model step field 2 input steps, converting tool parts to text transcripts and moving model attachments to subsequent user step.
 func encodeInteractionSteps(contents []Content) ([]any, []Content, bool, error) {
-	steps := make([]any, 0, len(contents))
+	type step struct {
+		model bool
+		parts []any
+	}
+	contents, err := transcribeFunctionParts(contents)
+	if err != nil {
+		return nil, nil, false, fmt.Errorf("Interaction model %w", err)
+	}
+	steps := make([]step, 0, len(contents))
 	binding := make([]Content, 0, len(contents))
-	hasModelTurn := false
+	var carried []any
 	for index, content := range contents {
+		if content.Role != RoleUser && content.Role != RoleAssistant && content.Role != RoleTool {
+			return nil, nil, false, fmt.Errorf("Interaction model does not accept %s messages", content.Role)
+		}
+		model := content.Role == RoleAssistant
 		parts := make([]any, 0, len(content.Parts))
 		texts := make([]Part, 0, len(content.Parts))
 		for _, part := range content.Parts {
 			switch {
-			case part.Thought || part.Text == "" && part.ThoughtSignature != "" && part.InlineData == nil && part.File == nil:
+			case part.Thought:
 				continue
-			case part.Text != "" && part.InlineData == nil && part.File == nil && part.FunctionCall == nil && part.FunctionResult == nil:
+			case part.ExecutableCode != nil || part.CodeExecutionResult != nil:
+				transcript, err := toolPartTranscript(part)
+				if err != nil {
+					return nil, nil, false, fmt.Errorf("Interaction model contents[%d]: %w", index, err)
+				}
+				parts = append(parts, []any{[]any{transcript}})
+				texts = append(texts, Part{Text: transcript})
+			case part.Text != "" && part.InlineData == nil && part.File == nil:
 				parts = append(parts, []any{[]any{part.Text}})
 				texts = append(texts, Part{Text: part.Text})
-			case part.File != nil && strings.TrimSpace(part.File.ID) != "" && part.Text == "" && content.Role == RoleUser:
+			case part.Text == "" && part.ThoughtSignature != "" && part.InlineData == nil && part.File == nil:
+				continue
+			case part.File != nil && strings.TrimSpace(part.File.ID) != "" && part.Text == "":
 				// Content field 9 is Drive file reference
-				parts = append(parts, []any{nil, nil, nil, nil, nil, nil, nil, nil, []any{strings.TrimSpace(part.File.ID)}})
+				file := []any{nil, nil, nil, nil, nil, nil, nil, nil, []any{strings.TrimSpace(part.File.ID)}}
+				if model {
+					carried = append(carried, file)
+				} else {
+					parts = append(parts, file)
+				}
 			case part.InlineData != nil:
 				return nil, nil, false, fmt.Errorf("Interaction model contents[%d] attachment requires account Drive authorization", index)
 			default:
-				return nil, nil, false, fmt.Errorf("Interaction model contents[%d] only accepts text and user attachment parts", index)
+				return nil, nil, false, fmt.Errorf("Interaction model contents[%d] only accepts text, attachment, and tool parts", index)
 			}
+		}
+		if !model && len(carried) > 0 {
+			parts = append(carried, parts...)
+			carried = nil
 		}
 		if len(parts) == 0 {
 			continue
 		}
-		switch content.Role {
-		case RoleUser:
-			steps = append(steps, []any{[]any{parts}})
-		case RoleAssistant:
-			steps = append(steps, []any{nil, []any{parts}})
-			hasModelTurn = true
-		default:
-			return nil, nil, false, fmt.Errorf("Interaction model does not accept %s messages", content.Role)
+		if last := len(steps) - 1; last >= 0 && steps[last].model == model {
+			steps[last].parts = append(steps[last].parts, parts...)
+		} else {
+			steps = append(steps, step{model: model, parts: parts})
 		}
 		binding = append(binding, Content{Role: content.Role, Parts: texts})
 	}
 	if len(steps) == 0 {
 		return nil, nil, false, fmt.Errorf("CreateInteractionStream contents cannot be empty")
 	}
-	return steps, binding, hasModelTurn, nil
+	wire := make([]any, 0, len(steps))
+	hasModelTurn := false
+	for _, step := range steps {
+		if step.model {
+			wire = append(wire, []any{nil, []any{step.parts}})
+			hasModelTurn = true
+		} else {
+			wire = append(wire, []any{[]any{step.parts}})
+		}
+	}
+	return wire, binding, hasModelTurn, nil
 }
 
 // interactionThinkingLevel selects supported Interaction thinking level based on requested effort or budget
 func interactionThinkingLevel(config GenerationConfig, defaults GenerationDefaults) (int64, error) {
 	level := defaults.DefaultThinkingLevel
-	switch strings.ToLower(strings.TrimSpace(config.ReasoningEffort)) {
+	switch normalizedReasoningEffort(config.ReasoningEffort) {
 	case "":
 		if config.ThinkingBudget != nil {
 			level = thinkingLevelForBudget(*config.ThinkingBudget)
@@ -129,7 +165,7 @@ func interactionThinkingLevel(config GenerationConfig, defaults GenerationDefaul
 	case "high":
 		level = 3
 	default:
-		return 0, fmt.Errorf("reasoning effort must be none, minimal, low, medium, or high")
+		return 0, fmt.Errorf("reasoning effort must be none, minimal, low, medium, high, xhigh, or max")
 	}
 	level = closestSupportedThinkingLevel(level, defaults.ThinkingLevels)
 	wire, ok := interactionThinkingLevels[level]
@@ -162,10 +198,17 @@ func (c *Client) generateInteraction(ctx context.Context, request GenerateReques
 	if err != nil {
 		return nil, err
 	}
+	matcher := newStopSequenceMatcher(request.Config.StopSequences)
+	var stopTokenCount <-chan tokenCountResult
+	cancelTokenCount := context.CancelFunc(func() {})
+	if matcher != nil {
+		stopTokenCount, cancelTokenCount = c.countStopInput(ctx, request)
+	}
 	events := make(chan Event, 8)
 	ready := make(chan error, 1)
 	go func() {
 		defer close(events)
+		defer cancelTokenCount()
 		stopClose := context.AfterFunc(ctx, func() {
 			_ = response.Body.Close()
 		})
@@ -190,8 +233,36 @@ func (c *Client) generateInteraction(ctx context.Context, request GenerateReques
 				return ctx.Err()
 			}
 		}
-		err := DecodeInteractionStream(observeStreamActivity(ctx, response.Body), send)
-		if closeErr := response.Body.Close(); err == nil && ctx.Err() == nil {
+		var output generatedOutputParts
+		var usage *Event
+		matchedStopSequence := ""
+		// forward stores usage to send alongside finish state after flushing stop sequence pending text
+		forward := func(event Event) error {
+			switch event.Kind {
+			case EventUsage:
+				usage = &event
+				return nil
+			case EventFinish:
+				if usage != nil {
+					if err := send(*usage); err != nil {
+						return err
+					}
+				}
+			default:
+				output.observe(event)
+			}
+			return send(event)
+		}
+		emit := send
+		if matcher != nil {
+			emit = stopSequenceEmitter(matcher, forward, &matchedStopSequence)
+		}
+		err := DecodeInteractionStream(observeStreamActivity(ctx, response.Body), emit)
+		if errors.Is(err, errStopSequenceMatched) {
+			_ = response.Body.Close()
+			finishAtStopSequence(ctx, request, output, stopTokenCount, matchedStopSequence, send)
+			err = ctx.Err()
+		} else if closeErr := response.Body.Close(); err == nil && ctx.Err() == nil {
 			err = closeErr
 		}
 		if err == nil || ctx.Err() != nil {

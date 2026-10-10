@@ -94,9 +94,24 @@ func generationChannelSelection(selection AccountSelection) bool {
 		strings.TrimSpace(selection.Capability) == "" && !selection.PlaygroundOnly
 }
 
-// selectionChannelsLocked returns available channel order for selection; non-generation requests only use Playground RPC
+// buildMethods lists upstream methods called via the Build proxy serving models absent from the Playground catalog.
+var buildMethods = []string{"embedContent", "bidiGenerateContent", "bidiGenerateMusic"}
+
+// buildMethodSelection checks whether the selection is an embedding or realtime method serving Build-exclusive models.
+func buildMethodSelection(selection AccountSelection) bool {
+	return strings.TrimSpace(selection.ModelID) != "" && slices.Contains(buildMethods, selection.Method) &&
+		strings.TrimSpace(selection.Capability) == "" && !selection.PlaygroundOnly
+}
+
+// selectionChannelsLocked returns available channel order for selection, preferred channel first; embeddings use Build only, realtime methods try Playground then Build, other non-generation requests use Playground RPC only.
 func (p *AccountPool) selectionChannelsLocked(selection AccountSelection) []Channel {
 	if !generationChannelSelection(selection) {
+		if buildMethodSelection(selection) && p.channelEnabledLocked(ChannelBuild) {
+			if selection.Method == "embedContent" {
+				return []Channel{ChannelBuild}
+			}
+			return []Channel{ChannelPlayground, ChannelBuild}
+		}
 		return []Channel{ChannelPlayground}
 	}
 	if selection.Channel != "" {
@@ -105,7 +120,28 @@ func (p *AccountPool) selectionChannelsLocked(selection AccountSelection) []Chan
 		}
 		return nil
 	}
-	return p.enabledChannelsLocked()
+	channels := p.enabledChannelsLocked()
+	if selection.PreferredChannel == "" || !slices.Contains(channels, selection.PreferredChannel) {
+		return channels
+	}
+	ordered := []Channel{selection.PreferredChannel}
+	for _, channel := range channels {
+		if channel != selection.PreferredChannel {
+			ordered = append(ordered, channel)
+		}
+	}
+	return ordered
+}
+
+// preferredChannelOpenLocked checks whether account preferred channel supports selection and is not cooling down
+func (p *AccountPool) preferredChannelOpenLocked(account *Account, selection AccountSelection, now time.Time) bool {
+	preferred := selection.PreferredChannel
+	if preferred == "" || !slices.Contains(p.selectionChannelsLocked(selection), preferred) ||
+		!p.channelSupportsLocked(account, preferred, selection) {
+		return false
+	}
+	_, cooling := accountCooldown(account, ChannelCooldownScope(preferred, selectionAccessScope(selection)), now)
+	return !cooling
 }
 
 // channelSupportsLocked determines whether account channel catalog supports selection
@@ -120,6 +156,9 @@ func (p *AccountPool) channelSupportsLocked(account *Account, channel Channel, s
 		}
 		return accountSupportsSelection(account, selection)
 	case ChannelBuild:
+		if buildMethodSelection(selection) {
+			return p.channelEnabledLocked(ChannelBuild) && p.buildSupportsMethodLocked(account, selection.ModelID, selection.Method)
+		}
 		return generationChannelSelection(selection) && p.channelEnabledLocked(ChannelBuild) &&
 			p.buildSupportsModelLocked(account, selection.ModelID)
 	default:
@@ -226,7 +265,36 @@ func buildRequiresSpecialTool(modelID string) bool {
 	return strings.Contains(modelID, "computer-use")
 }
 
-// buildOnlyModelsLocked returns generatable models in enabled accounts' Build catalog that are absent from Playground catalog
+// buildSupportsMethodLocked checks if account Build catalog can call a model absent from Playground catalog via embedding or realtime methods.
+func (p *AccountPool) buildSupportsMethodLocked(account *Account, modelID string, method string) bool {
+	modelID = strings.TrimPrefix(strings.TrimSpace(modelID), "models/")
+	if p.hasPlaygroundModelLocked(modelID) {
+		return false
+	}
+	for _, model := range account.buildModels {
+		if model.ID == modelID && hasMethod(model, method) {
+			return true
+		}
+	}
+	return false
+}
+
+// buildPublicMethods returns callable methods in public catalog for Build-exclusive embedding and realtime models.
+func buildPublicMethods(model Model) []string {
+	var methods []string
+	for _, method := range buildMethods {
+		if !hasMethod(model, method) {
+			continue
+		}
+		if method == "embedContent" {
+			methods = append(methods, "batchEmbedContents")
+		}
+		methods = append(methods, method)
+	}
+	return methods
+}
+
+// buildOnlyModelsLocked returns generatable, embedding, and realtime models in enabled accounts' Build catalog absent from Playground catalog.
 func (p *AccountPool) buildOnlyModelsLocked() []Model {
 	if !p.channelEnabledLocked(ChannelBuild) {
 		return nil
@@ -241,11 +309,17 @@ func (p *AccountPool) buildOnlyModelsLocked() []Model {
 			if _, exists := seen[model.ID]; exists || p.hasPlaygroundModelLocked(model.ID) {
 				continue
 			}
-			if !p.buildSupportsModelLocked(account, model.ID) {
+			listed := cloneAccountModels([]Model{model})[0]
+			if !hasMethod(model, "generateContent") {
+				listed.Methods = buildPublicMethods(model)
+			} else if !p.buildSupportsModelLocked(account, model.ID) {
+				continue
+			}
+			if len(listed.Methods) == 0 {
 				continue
 			}
 			seen[model.ID] = struct{}{}
-			models = append(models, cloneAccountModels([]Model{model})[0])
+			models = append(models, listed)
 		}
 	}
 	return models
@@ -265,6 +339,16 @@ func (p *AccountPool) hasPlaygroundModelLocked(modelID string) bool {
 	return false
 }
 
+// BidiMethod returns model realtime method: bidiGenerateMusic for Build realtime music models, otherwise bidiGenerateContent
+func (p *AccountPool) BidiMethod(modelID string) string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.hasBuildModelLocked(strings.TrimPrefix(strings.TrimSpace(modelID), "models/"), "bidiGenerateMusic") {
+		return "bidiGenerateMusic"
+	}
+	return "bidiGenerateContent"
+}
+
 func (p *AccountPool) hasBuildModelLocked(modelID string, method string) bool {
 	if !p.channelEnabledLocked(ChannelBuild) {
 		return false
@@ -274,8 +358,16 @@ func (p *AccountPool) hasBuildModelLocked(modelID string, method string) bool {
 			continue
 		}
 		for _, model := range account.buildModels {
-			if model.ID == modelID && (method == "" || hasMethod(model, method)) && p.buildSupportsModelLocked(account, modelID) {
+			if model.ID != modelID || method != "" && !hasMethod(model, method) {
+				continue
+			}
+			if hasMethod(model, "generateContent") && p.buildSupportsModelLocked(account, modelID) {
 				return true
+			}
+			for _, served := range buildMethods {
+				if (method == "" || method == served) && p.buildSupportsMethodLocked(account, modelID, served) {
+					return true
+				}
 			}
 		}
 	}
@@ -287,6 +379,8 @@ func (p *AccountPool) modelChannelsLocked(model Model) []string {
 	selection := AccountSelection{ModelID: model.ID}
 	if hasMethod(model, "generateContent") {
 		selection.Method = "generateContent"
+	} else if index := slices.IndexFunc(buildMethods, func(method string) bool { return hasMethod(model, method) }); index >= 0 {
+		selection.Method = buildMethods[index]
 	}
 	var channels []string
 	for _, channel := range p.selectionChannelsLocked(selection) {

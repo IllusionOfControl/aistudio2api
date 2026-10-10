@@ -22,6 +22,7 @@ type authRuntimeRefresher struct {
 	pool           *aistudio.AccountPool
 	refresh        chromeCookieRefreshFunc
 	importCurrent  func(context.Context, aistudio.AuthSource, *aistudio.ChromeOAuthMaterial, string) (aistudio.StorageState, error)
+	chromeHas      func(string) bool
 	reset          func(string) error
 	prepareHeaders func(string) (func(bool), error)
 	globalProxy    string
@@ -155,11 +156,30 @@ func newAuthRuntimeRefresher(
 		pool:           workers.pool,
 		refresh:        chromeauth.Refresh,
 		importCurrent:  importCurrentChromeState,
+		chromeHas:      chromeIdentityImportable,
 		reset:          workers.Reset,
 		prepareHeaders: headers.prepareInvalidate,
 		globalProxy:    globalProxy,
 		requests:       requests,
 	}
+}
+
+// chromeIdentityImportable checks whether local Chrome is logged into the email and credentials can be imported.
+func chromeIdentityImportable(email string) bool {
+	root, err := chromeauth.DefaultChromeRoot()
+	if err != nil {
+		return false
+	}
+	accounts, err := chromeauth.Discover(root)
+	if err != nil {
+		return false
+	}
+	for _, account := range accounts {
+		if account.Importable && strings.EqualFold(account.Email, email) {
+			return true
+		}
+	}
+	return false
 }
 
 // importCurrentChromeState updates authentication credentials for the same Google account from its original source
@@ -369,7 +389,7 @@ func (refresher *authRuntimeRefresher) Refresh(ctx context.Context) error {
 			return err
 		}
 		if !exists {
-			return fmt.Errorf("account %s missing Chrome OAuth renewal material", account.ID)
+			extension = aistudio.AuthExtension{Source: aistudio.AuthSource{Browser: "chrome", Email: account.ID}}
 		}
 		proxy := account.EffectiveProxy(refresher.globalProxy)
 		var cookies []aistudio.StateCookie
@@ -447,7 +467,13 @@ func (refresher *authRuntimeRefresher) Available(ctx context.Context) bool {
 	}
 
 	extension, exists, err := state.AuthExtension()
-	return err == nil && exists && (extension.OAuth != nil || extension.Source.Browser == "chrome")
+	if err != nil {
+		return false
+	}
+	if exists {
+		return extension.OAuth != nil || extension.Source.Browser == "chrome"
+	}
+	return refresher.chromeHas != nil && refresher.chromeHas(lease.Account().ID)
 }
 
 func authenticationFailed(response *aistudio.RPCResponse) bool {

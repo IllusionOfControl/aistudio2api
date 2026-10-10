@@ -17,6 +17,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Mag1cFall/AIStudio2API/internal/proxydial"
 	"github.com/gofrs/flock"
 )
 
@@ -49,7 +50,18 @@ func launchBrowser(ctx context.Context, options Options, config map[string]any) 
 	if err != nil {
 		return nil, "", err
 	}
-	prefs, err := firefoxPreferences(options.Proxy, options.ProxyBypass)
+	relay, proxyValue, err := browserProxy(options.Proxy)
+	if err != nil {
+		_ = removeProfile(profile, profileLock)
+		return nil, "", err
+	}
+	launched := false
+	defer func() {
+		if relay != nil && !launched {
+			_ = relay.Close()
+		}
+	}()
+	prefs, err := firefoxPreferences(proxyValue, options.ProxyBypass)
 	if err != nil {
 		_ = removeProfile(profile, profileLock)
 		return nil, "", err
@@ -103,8 +115,12 @@ func launchBrowser(ctx context.Context, options Options, config map[string]any) 
 		profile: profile,
 		lock:    profileLock,
 	}
+	launched = true
 	go func() {
 		waitErr := command.Wait()
+		if relay != nil {
+			_ = relay.Close()
+		}
 		process.mu.Lock()
 		process.waitErr = waitErr
 		process.mu.Unlock()
@@ -210,6 +226,20 @@ func normalizeBiDiEndpoint(endpoint string) string {
 
 // headlessFrameRate is the page refresh frame rate for headless workers.
 const headlessFrameRate = 1
+
+// browserProxy starts local SOCKS5 relay for proxies requiring authentication, returning proxy URL for browser
+func browserProxy(value string) (*proxydial.Relay, string, error) {
+	value = strings.TrimSpace(value)
+	parsed, err := url.Parse(value)
+	if value == "" || err != nil || parsed.User == nil {
+		return nil, value, nil
+	}
+	relay, err := proxydial.StartRelay(parsed)
+	if err != nil {
+		return nil, "", err
+	}
+	return relay, "socks5://" + relay.Addr().String(), nil
+}
 
 func firefoxPreferences(proxyValue, bypass string) (map[string]any, error) {
 	prefs := map[string]any{

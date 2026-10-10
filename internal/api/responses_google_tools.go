@@ -17,28 +17,22 @@ func responsesUsesWebSearch(tools []responsesTool) bool {
 	return false
 }
 
-func validateResponsesCodeContainer(raw json.RawMessage) error {
+// responsesContainerFiles returns file IDs carried by the code_interpreter auto container; container ID strings carry no files.
+func responsesContainerFiles(raw json.RawMessage) ([]string, error) {
 	if !rawJSONConfigured(raw) {
-		return nil
+		return nil, nil
 	}
-	var name string
-	if err := json.Unmarshal(raw, &name); err == nil {
-		if name == "auto" {
-			return nil
-		}
-		return fmt.Errorf("code_interpreter container only supports auto in AI Studio Web")
+	var id string
+	if json.Unmarshal(raw, &id) == nil {
+		return nil, nil
 	}
 	var container struct {
-		Type    string   `json:"type"`
 		FileIDs []string `json:"file_ids"`
 	}
-	if err := json.Unmarshal(raw, &container); err != nil || container.Type != "auto" {
-		return fmt.Errorf("code_interpreter container only supports auto in AI Studio Web")
+	if err := json.Unmarshal(raw, &container); err != nil {
+		return nil, fmt.Errorf("code_interpreter container must be a container ID or object")
 	}
-	if len(container.FileIDs) > 0 {
-		return fmt.Errorf("code_interpreter does not support container file_ids in AI Studio Web")
-	}
-	return nil
+	return container.FileIDs, nil
 }
 
 func responseWebSearchItems(responseID string, events []aistudio.Event) []any {

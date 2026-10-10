@@ -10,8 +10,10 @@ import (
 	"net/http"
 	"net/mail"
 	"os"
+	"os/user"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -215,6 +217,7 @@ type AccountSelection struct {
 	AllowedAccountIDs []string
 	PlaygroundOnly    bool
 	Channel           Channel
+	PreferredChannel  Channel
 }
 
 const preferredBootstrapModelID = "gemini-flash-latest"
@@ -2375,6 +2378,9 @@ func (p *AccountPool) tryAcquireLocked(selection AccountSelection, now time.Time
 				continue
 			}
 		}
+		if candidate.channel != selection.PreferredChannel && p.preferredChannelOpenLocked(account, selection, now) {
+			continue
+		}
 		refreshRuntime := false
 		if account.active == 0 {
 			leaseLock, leasePath, err := acquireAccountFileLease(account.StoragePath)
@@ -3036,8 +3042,8 @@ func (p *AccountPool) refreshResource(ctx context.Context, resourceID string) er
 	p.mu.Lock()
 	ownerID, exists := p.resources[resourceID]
 	owner := p.byID[ownerID]
+	p.mu.Unlock()
 	if exists && owner != nil {
-		p.mu.Unlock()
 		if err := p.refreshAccountRuntime(ctx, owner); err != nil {
 			if errors.Is(err, ErrAccountNotFound) {
 				p.markStaleAccountUnavailable(owner)
@@ -3047,26 +3053,14 @@ func (p *AccountPool) refreshResource(ctx context.Context, resourceID string) er
 		}
 		return nil
 	}
-	accounts := append([]*Account(nil), p.accounts...)
-	p.mu.Unlock()
-	var failures []error
-	for _, result := range p.refreshAccountRuntimes(ctx, accounts) {
-		if result.err == nil {
-			continue
-		}
-		if errors.Is(result.err, ErrAccountNotFound) {
-			p.markStaleAccountUnavailable(result.account)
-			continue
-		}
-		failures = append(failures, result.err)
-	}
+	refreshErr := p.refreshAllRuntimes(ctx)
 	p.mu.Lock()
 	_, found := p.resources[resourceID]
 	p.mu.Unlock()
 	if found {
 		return nil
 	}
-	return errors.Join(failures...)
+	return refreshErr
 }
 
 func (p *AccountPool) refreshSelectionRuntimes(ctx context.Context, selection AccountSelection) error {
@@ -3270,7 +3264,7 @@ func AcquireAccountRuntimeLease(accountID string) (*AccountRuntimeLease, error) 
 	if err != nil {
 		return nil, err
 	}
-	cacheRoot, err := os.UserCacheDir()
+	cacheRoot, err := userCacheRoot()
 	if err != nil {
 		return nil, fmt.Errorf("read user cache directory: %w", err)
 	}
@@ -3289,7 +3283,29 @@ func AcquireAccountRuntimeLease(accountID string) (*AccountRuntimeLease, error) 
 	return &AccountRuntimeLease{lock: lock}, nil
 }
 
-// Release releases the account WAA runtime lock
+// userCacheRoot returns the current user cache directory, falling back to home directory derivation if environment variables are missing.
+func userCacheRoot() (string, error) {
+	if directory, err := os.UserCacheDir(); err == nil {
+		return directory, nil
+	}
+	current, err := user.Current()
+	if err != nil {
+		return "", err
+	}
+	if !filepath.IsAbs(current.HomeDir) {
+		return "", fmt.Errorf("invalid user home directory: %q", current.HomeDir)
+	}
+	switch runtime.GOOS {
+	case "windows":
+		return filepath.Join(current.HomeDir, "AppData", "Local"), nil
+	case "darwin", "ios":
+		return filepath.Join(current.HomeDir, "Library", "Caches"), nil
+	default:
+		return filepath.Join(current.HomeDir, ".cache"), nil
+	}
+}
+
+// Release releases the account WAA runtime lock.
 func (lease *AccountRuntimeLease) Release() error {
 	if lease == nil || lease.lock == nil {
 		return nil

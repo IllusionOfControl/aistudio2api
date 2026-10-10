@@ -15,7 +15,7 @@ Before forwarding, the host page requires `navigator.userActivation.hasBeenActiv
 | Files & cache uploads | `ProxyUnaryFileApiCall` |
 | Live WebSocket | Host page WebChannel forwarding |
 
-The service implements generation and model catalogs over `ProxyStreamedCall` and `ProxyUnaryCall`. Handling of `ProxyUnaryFileApiCall` and Live bridging is described in "Capability Routing & Boundaries".
+The service connects generation, embedding, and model catalogs over `ProxyStreamedCall` and `ProxyUnaryCall`, as well as Live and realtime music forwarded by the host page WebChannel. Handling of `ProxyUnaryFileApiCall` is described under "Capability Routing and Boundaries".
 
 ### Configuration & Display
 
@@ -30,7 +30,7 @@ The service implements generation and model catalogs over `ProxyStreamedCall` an
 - List order defines channel priority within the same account.
 - Configured via `.env`, the "Upstream Channels" setting in the management dashboard (must retain at least one, saved in `playground,build` order), or `PUT /api/config` with `upstream_channels`; saved values take effect on next generation service startup.
 
-`BUILD_NATIVE_NONSTREAM=true` is the default: non-streaming requests across Gemini, Chat, Responses, Anthropic, Interactions, image, and audio endpoints prioritize eligible Build channels executing `ProxyUnaryCall` with `:generateContent`. When that channel is disabled, the model is unsupported, or quota is in cooldown, requests schedule to remaining available channels; file references and dedicated capabilities route to Playground. Disabling this option schedules by original channel order, though non-streaming requests selecting Build still execute unary calls.
+`BUILD_NATIVE_NONSTREAM=true` is the default: non-streaming requests across Gemini, Chat, Responses, Anthropic, Interactions, image, and speech endpoints prioritize the Build channel on each account, executing `ProxyUnaryCall` with `:generateContent`. If the channel is disabled or the account Build channel is cooling down or does not support the model, requests fall back to Playground streaming.
 
 Playground `GenerateContent` responses consist of repeated streaming frames converted into canonical non-streaming responses after complete accumulation. Upstream call logs record actual channel, `native` / `stream` mode, and RPC; when non-streaming requests fall back to streaming, a WARN log records "fallback streaming" and the reason. When Build explicitly returns that unary calls are unsupported, it falls back to `ProxyStreamedCall` on that channel; parameter errors return the original error.
 
@@ -38,10 +38,8 @@ Channel visibility across the service:
 
 | Location | Field |
 | --- | --- |
-| `GET /v1/models` (OpenAI format), `GET /v1beta/models` (Gemini format), admin `GET /api/models`, and management UI model list | Model object `channels`, listing channels where at least one enabled account can invoke the model |
-| `GET /api/requests` and management UI request list | Current attempted `channel` |
-| Request log `request.channel` and management UI logs | Channel actually utilized |
-| `GET /api/cooldowns` and management UI cooldown list | `channel` and `model_id` without the `build:` prefix |
+| `GET /v1/models` (OpenAI format), `GET /v1beta/models` (Gemini format), admin `GET /api/models`, and management UI model list | Model object `channels` |
+| `GET /v1/models/{model}` and `GET /v1beta/models/{model}` | Single model details |
 
 ## 2. Proxy RPC & WAA
 
@@ -70,7 +68,7 @@ Non-streaming requests, as well as models where AccessModes is non-empty and Fre
 
 ### Request Headers
 
-Proxy RPC headers match the set, order, and values of Playground text `GenerateContent`: `content-type`, `x-goog-api-key`, `x-goog-authuser`, `x-user-agent`, `x-aistudio-visit-id`, `x-goog-ext-519733851-bin`, `authorization`, and account cookies. Playground image requests omit `x-goog-ext-519733851-bin`, whereas Build proxy image generation requests still carry it. Benefit tier header `X-AIStudio-G1-Tier` is only sent with `ProxyUnaryCall` (`TIER1` for Pro, `TIER2` for Ultra, `TIER0` for Plus, omitted for Free); `ProxyStreamedCall` omits this header. Models requiring subscription tiers return HTTP 403 Code 7 when invoked via `ProxyStreamedCall`, so such models are permanently routed to `ProxyUnaryCall`.
+Proxy RPC headers match the set, order, and values of Playground text `GenerateContent`: `content-type`, `x-goog-api-key`, `x-goog-authuser`, `x-user-agent`, `x-aistudio-visit-id`, `x-goog-ext-525001262-jspb` (with empty binding), `sec-fetch-dest: empty`, `sec-fetch-mode: cors`, `sec-fetch-site: cross-site`, and `priority: u=1, i`.
 
 ### WAA Proof
 
@@ -98,6 +96,28 @@ A successful `ProxyUnaryCall` response is a ProxyResponse:
 ```
 
 In a ProxyResponse, index `0` contains the JSON string body, and index `2` contains Base64 encoded byte body (one of the two). Each body represents a complete Gemini API `GenerateContentResponse`. Streaming decoders parse each element as soon as a complete element appears in the response array.
+
+### embedding
+
+`POST /v1/embeddings`, `:embedContent`, and `:batchEmbedContents` all call upstream `:batchEmbedContents` via `ProxyUnaryCall`; upstream `:embedContent` and `/v1beta/openai/embeddings` are both handled this way.
+
+```json
+["/v1beta/models/<MODEL_ID>:batchEmbedContents", "{\"requests\":[{\"content\":{\"role\":\"user\",\"parts\":[{\"text\":\"hello\"}]},\"taskType\":\"RETRIEVAL_QUERY\",\"title\":\"doc\"}]}"]
+```
+
+- Target: `models/<MODEL_ID>` or `<MODEL_ID>`, converted to standard URI prefix
+- Body: `requests` list, mapping task type, title, and output dimensions
+- Response: `{"embeddings":[{"values":[...]}]}`
+- Tokens: calculated using `len(values)` as prompt tokens; `batchEmbedContents` aggregates across all sub-requests
+
+### Live & Realtime Music
+
+Models in the Build catalog supporting `bidiGenerateContent` or `bidiGenerateMusic` are called via the host page WebChannel:
+- URL: `https://alkalimakersuite-pa.clients6.google.com/upload/webchannel/`
+- Query parameters: `app=alkali&authuser=0&clcid=build`
+- Initial handshake: `POST /upload/webchannel?RID=rpc&SID=...&CI=0&AID=0&TYPE=xmlhttp`
+- Format: Protobuf array-encoded frames
+- Upstream: routes across independent Build quota
 
 ## 3. Models, Eligibility, and Scheduling
 
@@ -131,11 +151,13 @@ An account's Build channel can serve requests for model M when all of the follow
 4. When M appears in any account's Playground catalog: M is neither an Interactions nor a transcription model, and the account's tier satisfies M's AccessModes.
 5. When M appears exclusively in the Build catalog: M is not a Computer Use-only model.
 
-The following requests exclusively route through Playground: CountTokens, Live & Robotics, Veo, transcription, Interactions models, generations referencing Drive files, and TTS with multi-speaker `mode`. Embedding, `aqa`, and models supporting only real-time methods do not support `generateContent` and are excluded from Build.
+The following requests exclusively route through Playground: CountTokens, Live and Robotics models present in the Playground catalog, Veo, transcription, Interactions models, generation with Drive file references, and TTS with multi-speaker `mode`.
+
+Embedding (`embedContent`), Live (`bidiGenerateContent`), and realtime music (`bidiGenerateMusic`) models absent from the Playground catalog are called exclusively via the Build channel: `UPSTREAM_CHANNELS` has `build` enabled, and the account Build catalog contains the model.
 
 ### Public Catalog
 
-The public catalog represents the union of enabled channels. Models unique to Build that can be generated by at least one enabled account are added to the public catalog. When a model appears in Playground's catalog, Build requests use Playground's default parameters and capabilities; models unique to Build default output limits to `outputTokenLimit` and thinking capabilities to `thinking`. Each model's `channels` field lists available invocation channels.
+The public catalog represents the union of enabled channels. Models unique to Build that can be called by at least one enabled account for generation, embedding, Live, or realtime music are added to the public catalog; embedding model methods are `batchEmbedContents, embedContent`, and realtime models are `bidiGenerateContent` or `bidiGenerateMusic`. When a model appears in the Playground catalog, Build requests use the Playground catalog default parameters and capabilities; for Build-only models, the default output limit is `outputTokenLimit`, and thinking capability is derived from `thinkingLevel` and `thinkingBudget`.
 
 ### Scheduling & Cooldowns
 
@@ -147,11 +169,7 @@ Candidate scheduling units are combinations of account and channel, ordered by a
 | `fill-first` | Always starts from first available combination |
 
 - Concurrency slots, workers, and WAA are shared per account; both channels consume the same pool of request slots.
-- Cooldowns are tracked per channel: `<model>` for Playground, `build:<model>` for Build; global `*` cooldowns apply to both channels.
-- An account is only considered in cooldown for a model once all supported channels for that model enter cooldown.
-- When a channel returns a quota error, cooldown is recorded for that specific channel; if another channel on the same account is available, the request retries on that channel without incrementing the tried-accounts count.
-- When all candidate combinations enter cooldown, requests with recovery times within 1 minute queue waiting; requests with later recovery return HTTP 429 `rate_limit_exceeded` indicating the earliest recovery time.
-- Successful generation writes `verified` to that channel's scope (`<model>` or `build:<model>`).
+- Cooldown is tracked per channel: `<model>` for Playground, `build:<model>` for Build; Live media input scope is `bidi-media:<model>`, and `build:bidi-media:<model>` when routed through Build; global `*` cooldown applies to both channels.
 
 ### Attachments & File References
 
@@ -169,12 +187,12 @@ Build requests share the same preprocessing pipeline as Playground: tool validat
 
 | Field | Value |
 | --- | --- |
-| `contents` | Canonical contents array |
+| `contents` | Canonical contents |
 | `systemInstruction` | `{"parts":[{"text":"<SYSTEM>"}]}` when system prompt is non-empty |
 | `tools` | Tool declarations |
-| `toolConfig` | `{"includeServerSideToolInvocations":true}` when declaring both functions and Google tools |
-| `generationConfig` | Generation configuration parameters |
-| `safetySettings` | `OFF` for harassment, hate speech, sexual content, and dangerous content; omitted for image models |
+| `safetySettings` | Safety settings |
+
+- `safetySettings` defaults to `OFF` across harassment, hate speech, sexual content, and dangerous content, overridden or appended by categories in the request; image routes only send categories in the request
 
 ```json
 {
@@ -231,20 +249,18 @@ Tool choice defaults or `auto` emit tool declarations; `none` omits `tools`; oth
 
 | Field | Value |
 | --- | --- |
-| `maxOutputTokens` | Request value or catalog default, validated against model limit; omitted when speechConfig is present and not explicitly set |
+| `maxOutputTokens` | Request value or catalog default |
 | `temperature`, `topP`, `topK`, `seed` | Request value or catalog default |
 | `responseMimeType` | Request value |
-| `responseSchema` | Reuses Playground Schema validation and normalization, converted to protobuf JSON: nested `type` uppercase enum, string `const` to `enum`, null unions to `nullable` |
-| `responseModalities` | Uppercase modalities; image models append `IMAGE`, `TEXT`; TTS and music models append `AUDIO` |
-| `imageConfig` | `{aspectRatio?, imageSize?}`; image models with resolution support default to `1K` |
-| `speechConfig` | Single voice: `voiceConfig.prebuiltVoiceConfig.voiceName`; multi-speaker: `multiSpeakerVoiceConfig.speakerVoiceConfigs[{speaker, voiceConfig}]` |
-| `thinkingConfig` | Sent when supported: `includeThoughts: true`, `thinkingBudget`, `thinkingLevel` |
+| `responseJsonSchema` | JSON Schema for structured output |
+| `mediaResolution` | Request value |
+| `thinkingConfig` | Converted from `reasoning_effort` or budget |
 
 Thinking levels map from Playground enums: Low=`LOW`, Medium=`MEDIUM`, High=`HIGH`, Minimal=`MINIMAL`. Conversion rules between `reasoning_effort`, token budgets, and levels match Playground.
 
 When TTS models support `speech_metadata`, `Speaker: text` scripts are split into segments with `speechMetadata`; other TTS models fold speaker and style back into text. Build requests only include `speakerVoiceConfigs` in `multiSpeakerVoiceConfig`; requests with `mode` route to Playground.
 
-Playground internal fields are omitted from Build requests: account timezone, fixed slots in GenerateContent and generation config, and default tool slots for image resolution. `candidateCount != 1` and logprobs are rejected by public adapters.
+Playground internal fields are omitted from Build requests: account timezone, fixed slots in GenerateContent and generation config, and default tool slots for variable-resolution image models.
 
 ## 5. Responses, Termination, and Usage
 
@@ -313,28 +329,17 @@ In `ProxyStreamedCall` trailing status, code 0 denotes success; other codes map 
 
 | Capability | Current Handling |
 | --- | --- |
-| Live WebSocket | Uses Playground `BidiGenerateContent` |
-| Files & cache uploads (`ProxyUnaryFileApiCall`) | Not implemented; attachments sent as `inlineData` |
-| Embedding | Upstream `batchEmbedContents` returns 200, `embedContent` returns 404; unexposed |
-| Interactions (`/v1beta/interactions` returns 404) | Uses Playground `CreateInteractionStream` |
-| Subscription image models on Free accounts | Upstream returns 403; excluded via AccessModes |
-| Direct connection with paid API key | Not utilized |
-
-## 7. Implementation Architecture
+| Live WebSocket | Playground `BidiGenerateContent` or Build WebChannel |
+| Files & cache uploads (`ProxyUnaryFileApiCall`) | Not used |
 
 | Path | Responsibility |
 | --- | --- |
 | `internal/config/config.go` | `UPSTREAM_CHANNELS` parsing and validation |
-| `internal/app/channels.go` | Configuration to scheduling channel pool mapping |
-| `internal/aistudio/channel.go` | Channel definitions, cooldown scopes, eligibility, combination sorting, and public `channels` |
-| `internal/aistudio/accounts.go` | Candidate classification, lease channels, all-channel cooldown handling |
-| `internal/aistudio/build.go` | Request encoding, proxy wire format, binding strings, response/trailer decoding, Build catalog |
-| `internal/aistudio/generate.go` | Channel dispatching, shared preprocessing, stop sequences, and usage calculation |
-| `internal/aistudio/service.go` | Protected transmission and Build proof field insertion |
-| `internal/aistudio/upload.go` | Inline attachment handling for Build channel |
-| `internal/app/runtime.go` | Retries, cooldown persistence, intra-account channel switching, file replication |
-| `internal/app/admin.go`, `internal/api` | Channel fields in cooldowns, requests, logs, and model catalogs |
-| `web/src` | Channel selection in settings and channel badges across UI lists |
+| `internal/app/channels.go` | Configuration to scheduler pool channel mapping |
+| `internal/aistudio/channel.go` | Multi-channel selection, Build model qualification, and catalog merging |
+| `internal/aistudio/build.go` | Wire payload assembly, JSON escaping, and response parsing for Build proxy RPC |
+| `internal/aistudio/build_bidi.go` | Build WebChannel protocol client for realtime generation |
+| `internal/aistudio/client.go` | RPC dispatch routing: `ProxyStreamedCall` vs `ProxyUnaryCall` |
 
 ### Adding Capabilities to Build
 
@@ -351,11 +356,9 @@ When adding a Build proxy method or routing an existing capability through Build
 
 | Scope | Required Outcome |
 | --- | --- |
-| Channel Selection | When `playground`, `build` are enabled independently or together, catalogs and routing reflect configuration |
-| Quota Isolation | When one channel enters model cooldown, another channel on the same account can still serve requests; global cooldown applies to both |
-| Protocol Consistency | Non-streaming and streaming payloads and termination semantics match across Chat, Responses, Anthropic, and Gemini |
-| Content Fidelity | System prompts, multi-turn dialogs, functions, Google tools, image inputs, TTS, and image outputs encode according to model capabilities |
-| Lifecycle | Cancellations, client disconnects, stop sequences, and trailing errors release leases and concurrency slots |
-| Observability | Model catalogs, request lists, logs, and cooldown views consistently report the actual channel used |
+| Channel Selection | When `playground` and `build` are enabled independently or together, catalogs and routing reflect configuration |
+| Quota Isolation | After one channel enters model cooldown, the same account other channel continues serving requests; global cooldown affects both |
+| Protocol Support | Chat, Responses, Anthropic, Gemini, Embeddings, and Live route correctly across both channels |
+| Header Matching | Upstream accepts requests without HTTP 400 parameter errors |
 
 When debugging proxy payloads, capture the final Gemini API JSON, outer array, and decoded google.rpc status. HTTP 200 merely indicates proxy RPC arrival; operational success requires receiving expected content, valid usage, and a single terminal state.

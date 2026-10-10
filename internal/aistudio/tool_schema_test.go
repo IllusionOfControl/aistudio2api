@@ -27,11 +27,11 @@ func TestToolSchemaMixedOptions(t *testing.T) {
 		t.Fatalf("missing complete constraints or transmittable parameter structure: %#v", wire)
 	}
 	request := GenerateRequest{Tools: Tools{Functions: []FunctionDeclaration{declaration}}}
-	if requestNeedsBuildSchema(request) {
+	if RequestNeedsBuildSchema(request) {
 		t.Fatal("tool declaration triggered Build diversion")
 	}
 	request.Config.ResponseSchema = json.RawMessage(`{"type":"object","properties":{"value":{}}}`)
-	if !requestNeedsBuildSchema(request) {
+	if !RequestNeedsBuildSchema(request) {
 		t.Fatal("native channel selection for structured output lost")
 	}
 }

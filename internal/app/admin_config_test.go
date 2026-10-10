@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/Mag1cFall/AIStudio2API/internal/aistudio"
 	"github.com/Mag1cFall/AIStudio2API/internal/config"
 )
 
@@ -24,7 +25,7 @@ func TestAdminConfig(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	admin := &runtimeAdmin{configPath: path, requests: newRequestRegistry(ctx)}
+	admin := &runtimeAdmin{configPath: path, requests: newRequestRegistry(ctx), pool: aistudio.NewAccountPool(nil, 1)}
 	value, err := admin.RuntimeConfig(ctx)
 	if err != nil {
 		t.Fatal(err)
@@ -36,6 +37,7 @@ func TestAdminConfig(t *testing.T) {
 	if strings.Contains(string(raw), "test-password") || !value.AdminPasswordSet || !value.BuildNativeNonstream {
 		t.Fatalf("config=%s", raw)
 	}
+
 	manager := &runtimeManager{activeManagement: cfg}
 	differentCfg := cfg
 	differentCfg.AdminUsername = "different-operator"
@@ -44,4 +46,5 @@ func TestAdminConfig(t *testing.T) {
 	if !decorated.ManagementRestartRequired || decorated.AdminPassword != nil {
 		t.Fatalf("restart=%+v", decorated)
 	}
+
 }

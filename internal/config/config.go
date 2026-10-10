@@ -19,7 +19,7 @@ const (
 	defaultRequestTimeout     = 5 * time.Minute
 	defaultWarmWorkerLimit    = 5
 	defaultMaxActiveWorkers   = 10
-	defaultWarmConcurrency    = 2
+	defaultWarmConcurrency    = 5
 	defaultAccountConcurrency = 2
 	defaultHeadless           = true
 	defaultAutoStart          = false
@@ -44,6 +44,7 @@ var configKeys = [...]string{
 	"WAA_BACKEND",
 	"AUTO_START",
 	"WAA_AUTO_START",
+	"REQUEST_BODY_LOG",
 	"ADMIN_AUTH_ENABLED",
 	"ADMIN_USERNAME",
 	"ADMIN_PASSWORD",
@@ -61,6 +62,8 @@ const WAABackendGo = "go"
 
 // Config holds the global configuration for the service.
 type Config struct {
+	AutoStart              bool          `json:"auto_start"`
+	RequestBodyLog         bool          `json:"request_body_log"`
 	AdminAuthEnabled       bool          `json:"admin_auth_enabled"`
 	AdminUsername          string        `json:"admin_username"`
 	AdminPassword          string        `json:"-"`
@@ -80,7 +83,6 @@ type Config struct {
 	TemporaryChat          bool          `json:"temporary_chat"`
 	Headless               bool          `json:"headless"`
 	WAABackend             string        `json:"waa_backend"`
-	AutoStart              bool          `json:"auto_start"`
 }
 
 // Default returns a default configuration ready for startup.
@@ -118,6 +120,18 @@ func Load(path string) (Config, error) {
 	}
 
 	cfg := Default()
+	if value, ok := values["AUTO_START"]; ok {
+		cfg.AutoStart, err = strconv.ParseBool(strings.TrimSpace(value))
+		if err != nil {
+			return Config{}, fmt.Errorf("AUTO_START must be true or false")
+		}
+	}
+	if value, ok := values["REQUEST_BODY_LOG"]; ok {
+		cfg.RequestBodyLog, err = strconv.ParseBool(strings.TrimSpace(value))
+		if err != nil {
+			return Config{}, fmt.Errorf("REQUEST_BODY_LOG must be true or false")
+		}
+	}
 	if value, ok := values["ADMIN_AUTH_ENABLED"]; ok {
 		cfg.AdminAuthEnabled, err = strconv.ParseBool(strings.TrimSpace(value))
 		if err != nil {
@@ -232,6 +246,7 @@ func Load(path string) (Config, error) {
 
 
 
+
 // Validate checks if the configuration values are valid for service startup.
 func (c Config) Validate() error {
 	if c.AdminAuthEnabled && (strings.TrimSpace(c.AdminUsername) == "" || strings.TrimSpace(c.AdminPassword) == "") {
@@ -264,9 +279,8 @@ func (c Config) Validate() error {
 	if c.MaxActiveWorkers < c.WarmWorkerLimit {
 		return fmt.Errorf("MAX_ACTIVE_WORKERS must be greater than or equal to WARM_WORKER_LIMIT")
 	}
-
-	if c.WarmStartupConcurrency <= 0 || c.WarmStartupConcurrency > c.WarmWorkerLimit {
-		return fmt.Errorf("WARM_STARTUP_CONCURRENCY must be between 1 and WARM_WORKER_LIMIT")
+	if c.WarmStartupConcurrency <= 0 || c.WarmStartupConcurrency > c.MaxActiveWorkers {
+		return fmt.Errorf("WARM_STARTUP_CONCURRENCY must be between 1 and MAX_ACTIVE_WORKERS")
 	}
 
 	if c.PerAccountConcurrency <= 0 {
@@ -321,6 +335,8 @@ func validateUpstreamChannels(channels []string) error {
 // MarshalJSON outputs durations in string format matching env conventions.
 func (c Config) MarshalJSON() ([]byte, error) {
 	type payload struct {
+		AutoStart              bool     `json:"auto_start"`
+		RequestBodyLog         bool     `json:"request_body_log"`
 		AdminAuthEnabled       bool     `json:"admin_auth_enabled"`
 		AdminUsername          string   `json:"admin_username"`
 		BuildNativeNonstream   bool     `json:"build_native_nonstream"`
@@ -342,6 +358,8 @@ func (c Config) MarshalJSON() ([]byte, error) {
 	}
 
 	return json.Marshal(payload{
+		AutoStart:              c.AutoStart,
+		RequestBodyLog:         c.RequestBodyLog,
 		AdminAuthEnabled:       c.AdminAuthEnabled,
 		AdminUsername:          c.AdminUsername,
 		BuildNativeNonstream:   c.BuildNativeNonstream,
@@ -366,6 +384,8 @@ func (c Config) MarshalJSON() ([]byte, error) {
 // UnmarshalJSON parses configuration from textual durations used in admin endpoints.
 func (c *Config) UnmarshalJSON(data []byte) error {
 	type payload struct {
+		AutoStart              bool     `json:"auto_start"`
+		RequestBodyLog         bool     `json:"request_body_log"`
 		AdminAuthEnabled       bool     `json:"admin_auth_enabled"`
 		AdminUsername          string   `json:"admin_username"`
 		AdminPassword          string   `json:"admin_password"`
@@ -403,6 +423,8 @@ func (c *Config) UnmarshalJSON(data []byte) error {
 	}
 
 	parsed := Config{
+		AutoStart:              value.AutoStart,
+		RequestBodyLog:         value.RequestBodyLog,
 		AdminAuthEnabled:       value.AdminAuthEnabled,
 		AdminUsername:          strings.TrimSpace(value.AdminUsername),
 		AdminPassword:          value.AdminPassword,
@@ -449,9 +471,8 @@ func ValidateProxy(value string) error {
 	default:
 		return fmt.Errorf("PROXY must be a valid http, https, or socks5 URL")
 	}
-
-	if parsed.User != nil {
-		return fmt.Errorf("PROXY cannot contain user authentication")
+	if parsed.User != nil && parsed.User.Username() == "" {
+		return fmt.Errorf("PROXY authentication is missing a username")
 	}
 
 	if parsed.Path != "" && parsed.Path != "/" || parsed.RawQuery != "" || parsed.Fragment != "" {

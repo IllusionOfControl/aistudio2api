@@ -48,6 +48,25 @@ func NewNativeWorker(ctx context.Context, accountID string, options camoufoxnati
 
 // Prepare generates fresh proof and writes to the request's designated WAA field
 func (worker *NativeWorker) Prepare(ctx context.Context, request ProtectedRequest) (PreparedProtectedRequest, error) {
+	start, end, err := arrayElementSpan(request.Body, request.ProofField-1)
+	if err != nil {
+		return PreparedProtectedRequest{}, fmt.Errorf("protected request missing WAA field %d: %w", request.ProofField, err)
+	}
+	proof, headers, err := worker.proofAndHeaders(ctx, request.Prompt, request.PagePrompt)
+	if err != nil {
+		return PreparedProtectedRequest{}, err
+	}
+	encoded, err := json.Marshal(proof)
+	if err != nil {
+		return PreparedProtectedRequest{}, fmt.Errorf("encode WAA proof: %w", err)
+	}
+	body := make([]byte, 0, len(request.Body)-(end-start)+len(encoded))
+	body = append(append(append(body, request.Body[:start]...), encoded...), request.Body[end:]...)
+	return PreparedProtectedRequest{Body: body, Headers: headers}, nil
+}
+
+// proofAndHeaders writes page to prompt, generates fresh proof for binding SHA-256, and retrieves protocol headers
+func (worker *NativeWorker) proofAndHeaders(ctx context.Context, binding, page string) (string, http.Header, error) {
 	worker.operationMu.Lock()
 	defer worker.operationMu.Unlock()
 	worker.updateState(func(state *WorkerState) {
@@ -55,31 +74,15 @@ func (worker *NativeWorker) Prepare(ctx context.Context, request ProtectedReques
 		state.RequestCount++
 		state.LastError = ""
 	})
-	digest := sha256.Sum256([]byte(request.Prompt))
-	proof, err := worker.runtime.Proof(ctx, fmt.Sprintf("%x", digest), request.Prompt)
+	digest := sha256.Sum256([]byte(binding))
+	proof, err := worker.runtime.Proof(ctx, fmt.Sprintf("%x", digest), page)
 	if err != nil {
 		if ctx.Err() != nil {
 			worker.updateState(func(state *WorkerState) { state.Phase = WorkerReady })
 		} else {
 			worker.fail(err)
 		}
-		return PreparedProtectedRequest{}, err
-	}
-	var payload []any
-	if err := json.Unmarshal(request.Body, &payload); err != nil {
-		worker.fail(err)
-		return PreparedProtectedRequest{}, fmt.Errorf("parse protected request: %w", err)
-	}
-	if request.ProofField < 1 || len(payload) < request.ProofField {
-		err := fmt.Errorf("protected request missing WAA field %d", request.ProofField)
-		worker.fail(err)
-		return PreparedProtectedRequest{}, err
-	}
-	payload[request.ProofField-1] = proof
-	body, err := json.Marshal(payload)
-	if err != nil {
-		worker.fail(err)
-		return PreparedProtectedRequest{}, fmt.Errorf("encode protected request: %w", err)
+		return "", nil, err
 	}
 	headers, err := worker.runtime.ProtocolHeaders(ctx)
 	if err != nil {
@@ -88,15 +91,61 @@ func (worker *NativeWorker) Prepare(ctx context.Context, request ProtectedReques
 		} else {
 			worker.fail(err)
 		}
-		return PreparedProtectedRequest{}, err
+		return "", nil, err
 	}
 	worker.updateState(func(state *WorkerState) {
 		state.Phase = WorkerReady
 	})
-	return PreparedProtectedRequest{
-		Body:    body,
-		Headers: headers,
-	}, nil
+	return proof, headers, nil
+}
+
+// arrayElementSpan returns the byte range of the index-th element in a compact top-level JSON array.
+func arrayElementSpan(body []byte, index int) (int, int, error) {
+	depth, element, start := 0, 0, -1
+	inString, escaped := false, false
+	for position, char := range body {
+		if inString {
+			switch {
+			case escaped:
+				escaped = false
+			case char == '\\':
+				escaped = true
+			case char == '"':
+				inString = false
+			}
+			continue
+		}
+		switch char {
+		case '"':
+			inString = true
+		case '[', '{':
+			depth++
+			if depth == 1 {
+				continue
+			}
+		case ']', '}':
+			depth--
+			if depth == 0 {
+				if element == index && start >= 0 {
+					return start, position, nil
+				}
+				return 0, 0, fmt.Errorf("top-level array only contains %d elements", element+1)
+			}
+		case ',':
+			if depth == 1 {
+				if element == index {
+					return start, position, nil
+				}
+				element++
+				start = -1
+				continue
+			}
+		}
+		if depth >= 1 && element == index && start < 0 {
+			start = position
+		}
+	}
+	return 0, 0, fmt.Errorf("JSON top-level array is incomplete")
 }
 
 // SendProtected streams the prepared request via the account's WAA runtime

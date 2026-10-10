@@ -3,6 +3,7 @@ package api
 import (
 	"encoding/json"
 	"fmt"
+	"mime"
 	"strings"
 
 	"github.com/Mag1cFall/AIStudio2API/internal/aistudio"
@@ -16,7 +17,6 @@ type interactionRequest struct {
 	Stream     bool            `json:"stream"`
 	Store      *bool           `json:"store"`
 	PreviousID string          `json:"previous_interaction_id"`
-	Background bool            `json:"background"`
 	Formats    json.RawMessage `json:"response_format"`
 	Tools      []responsesTool `json:"tools"`
 	Generation struct {
@@ -40,7 +40,6 @@ type interactionFormat struct {
 	Schema      json.RawMessage `json:"schema"`
 	SampleRate  int             `json:"sample_rate"`
 	BitRate     int             `json:"bit_rate"`
-	Delivery    string          `json:"delivery"`
 	AspectRatio string          `json:"aspect_ratio"`
 	ImageSize   string          `json:"image_size"`
 }
@@ -59,6 +58,7 @@ type interactionInput struct {
 	Name        string             `json:"name"`
 	Arguments   json.RawMessage    `json:"arguments"`
 	Result      json.RawMessage    `json:"result"`
+	IsError     bool               `json:"is_error"`
 	Signature   string             `json:"signature"`
 	Annotations []struct {
 		Type    string `json:"type"`
@@ -88,19 +88,13 @@ func interactionList[T any](raw json.RawMessage) ([]T, error) {
 // toGenerateRequest maps model, structured input, generation parameters, and function declarations.
 func (request interactionRequest) toGenerateRequest(id string) (aistudio.GenerateRequest, error) {
 	generate := aistudio.GenerateRequest{ID: id, Model: strings.TrimPrefix(strings.TrimSpace(request.Model), "models/"), System: request.System}
-	if generate.Model == "" || len(request.Input) == 0 {
-		return generate, fmt.Errorf("model and input are required")
-	}
-	if request.Background {
-		return generate, fmt.Errorf("background must be false")
+	if generate.Model == "" {
+		return generate, fmt.Errorf("model is required")
 	}
 	var err error
 	generate.Contents, err = interactionContents(request.Input)
 	if err != nil {
 		return generate, err
-	}
-	if len(generate.Contents) == 0 {
-		return generate, fmt.Errorf("input must contain content")
 	}
 	generation := request.Generation
 	generate.Config = aistudio.GenerationConfig{
@@ -115,17 +109,21 @@ func (request interactionRequest) toGenerateRequest(id string) (aistudio.Generat
 	if err != nil {
 		return generate, err
 	}
-	formats, err := interactionList[interactionFormat](request.Formats)
+	formats, err := interactionList[json.RawMessage](request.Formats)
 	if err != nil {
 		return generate, fmt.Errorf("response_format: %w", err)
 	}
-	for _, format := range formats {
-		if format.Delivery != "" && format.Delivery != "inline" {
-			return generate, fmt.Errorf("response_format.delivery must be inline")
+	for _, raw := range formats {
+		var format interactionFormat
+		if err := json.Unmarshal(raw, &format); err != nil {
+			return generate, fmt.Errorf("response_format: %w", err)
 		}
 		switch format.Type {
 		case "text":
 			generate.Config.ResponseModalities = append(generate.Config.ResponseModalities, aistudio.ResponseModalityText)
+			if format.MIME == "" && len(format.Schema) > 0 {
+				format.MIME = "application/json"
+			}
 			if format.MIME != "" && format.MIME != "text/plain" && format.MIME != "application/json" {
 				return generate, fmt.Errorf("text mime_type must be text/plain or application/json")
 			}
@@ -134,17 +132,21 @@ func (request interactionRequest) toGenerateRequest(id string) (aistudio.Generat
 			if len(format.Schema) > 0 && format.MIME != "application/json" {
 				return generate, fmt.Errorf("response_format.schema requires application/json")
 			}
+		case "", "object", "array", "string", "number", "integer", "boolean", "null":
+			generate.Config.ResponseModalities = append(generate.Config.ResponseModalities, aistudio.ResponseModalityText)
+			generate.Config.ResponseMIMEType = "application/json"
+			generate.Config.ResponseSchema = raw
 		case "audio":
-			if format.MIME != "" && format.MIME != "audio/wav" && format.MIME != "audio/l16" {
-				return generate, fmt.Errorf("audio mime_type must be audio/wav or audio/l16")
+			if _, ok := interactionAudioEncodings[format.MIME]; format.MIME != "" && !ok {
+				return generate, fmt.Errorf("audio mime_type must be audio/wav, audio/l16, audio/mp3, audio/ogg_opus, audio/alaw or audio/mulaw")
 			}
-			if format.SampleRate != 0 && format.SampleRate != 24000 || format.BitRate != 0 {
-				return generate, fmt.Errorf("audio output uses 24000 Hz PCM with no bit_rate setting")
+			if format.SampleRate < 0 || format.BitRate < 0 {
+				return generate, fmt.Errorf("audio sample_rate and bit_rate must not be negative")
 			}
 			generate.Config.ResponseModalities = append(generate.Config.ResponseModalities, aistudio.ResponseModalityAudio)
 		case "image":
-			if format.MIME != "" {
-				return generate, fmt.Errorf("image mime_type is selected by the model")
+			if format.MIME != "" && format.MIME != "image/jpeg" {
+				return generate, fmt.Errorf("image mime_type must be image/jpeg")
 			}
 			generate.Config.ResponseModalities = append(generate.Config.ResponseModalities, aistudio.ResponseModalityImage)
 			generate.Config.ImageConfig = &aistudio.ImageConfig{AspectRatio: format.AspectRatio, ImageSize: format.ImageSize}
@@ -152,26 +154,58 @@ func (request interactionRequest) toGenerateRequest(id string) (aistudio.Generat
 			return generate, fmt.Errorf("unsupported response_format type %q", format.Type)
 		}
 	}
-	tools := append([]responsesTool(nil), request.Tools...)
-	for i := range tools {
-		switch tools[i].Type {
+	tools := make([]responsesTool, 0, len(request.Tools))
+	for _, tool := range request.Tools {
+		switch tool.Type {
 		case "function", "url_context", "google_maps":
 		case "google_search":
-			tools[i].Type = "web_search"
+			tool.Type = "web_search"
 		case "code_execution":
-			tools[i].Type = "code_interpreter"
+			tool.Type = "code_interpreter"
+		case "computer_use", "file_search", "mcp_server", "retrieval":
+			continue
 		default:
-			return generate, fmt.Errorf("unsupported interaction tool %q", tools[i].Type)
+			return generate, fmt.Errorf("unsupported interaction tool %q", tool.Type)
 		}
+		tools = append(tools, tool)
 	}
-	if rawJSONConfigured(generation.ToolChoice) {
-		var mode string
-		if json.Unmarshal(generation.ToolChoice, &mode) != nil || mode != "auto" && mode != "none" {
-			return generate, fmt.Errorf("generation_config.tool_choice must be auto or none")
-		}
+	generate.Tools, err = mapResponsesTools(tools, nil)
+	if err != nil {
+		return generate, err
 	}
-	generate.Tools, err = mapResponsesTools(tools, generation.ToolChoice)
+	generate.Tools.ToolConfig, err = interactionToolChoice(generation.ToolChoice)
 	return generate, err
+}
+
+// interactionToolChoice maps call mode or allowed_tools configuration to unified tool choice.
+func interactionToolChoice(raw json.RawMessage) (aistudio.ToolConfig, error) {
+	if !rawJSONConfigured(raw) {
+		return aistudio.ToolConfig{Mode: "auto"}, nil
+	}
+	var mode string
+	var names []string
+	if json.Unmarshal(raw, &mode) != nil {
+		var config struct {
+			AllowedTools struct {
+				Mode  string   `json:"mode"`
+				Tools []string `json:"tools"`
+			} `json:"allowed_tools"`
+		}
+		if err := json.Unmarshal(raw, &config); err != nil {
+			return aistudio.ToolConfig{}, fmt.Errorf("generation_config.tool_choice: %w", err)
+		}
+		mode, names = config.AllowedTools.Mode, config.AllowedTools.Tools
+	}
+	switch mode {
+	case "", "auto":
+		mode = "auto"
+	case "any":
+		mode = "required"
+	case "none", "validated":
+	default:
+		return aistudio.ToolConfig{}, fmt.Errorf("unsupported generation_config.tool_choice %q", mode)
+	}
+	return aistudio.ToolConfig{Mode: mode, AllowedFunctionNames: names}, nil
 }
 
 // interactionContents preserves step order and merges content chunks of the same role.
@@ -179,7 +213,7 @@ func interactionContents(raw json.RawMessage) ([]aistudio.Content, error) {
 	var text string
 	if json.Unmarshal(raw, &text) == nil {
 		if strings.TrimSpace(text) == "" {
-			return nil, fmt.Errorf("input text is empty")
+			return nil, nil
 		}
 		return []aistudio.Content{{Role: aistudio.RoleUser, Parts: []aistudio.Part{{Text: text}}}}, nil
 	}
@@ -226,6 +260,16 @@ func interactionContents(raw json.RawMessage) ([]aistudio.Content, error) {
 			if item.Signature != "" {
 				pendingSignature = item.Signature
 			}
+		case "code_execution_call", "code_execution_result":
+			role = aistudio.RoleAssistant
+			if text := item.codeExecutionText(); text != "" {
+				parts = []aistudio.Part{{Text: text}}
+			}
+		case "google_search_call", "google_search_result", "url_context_call", "url_context_result",
+			"google_maps_call", "google_maps_result", "file_search_call", "file_search_result",
+			"mcp_server_tool_call", "mcp_server_tool_result", "retrieval_call", "retrieval_result",
+			"processing_call", "processing_result":
+			continue
 		default:
 			parts, err = item.parts()
 			if err != nil {
@@ -255,6 +299,26 @@ func interactionContents(raw json.RawMessage) ([]aistudio.Content, error) {
 	return contents, nil
 }
 
+// codeExecutionText renders code and execution results from history as text matching service output format.
+func (item interactionInput) codeExecutionText() string {
+	if item.Type == "code_execution_call" {
+		var call aistudio.ExecutableCode
+		if json.Unmarshal(item.Arguments, &call) != nil {
+			return ""
+		}
+		return renderCodeExecution(aistudio.Event{Kind: aistudio.EventExecutableCode, ExecutableCode: &call})
+	}
+	var output string
+	if json.Unmarshal(item.Result, &output) != nil {
+		return ""
+	}
+	result := aistudio.CodeExecutionResult{Outcome: "OUTCOME_OK", Output: output}
+	if item.IsError {
+		result = aistudio.CodeExecutionResult{Outcome: "OUTCOME_FAILED", Error: output}
+	}
+	return renderCodeExecution(aistudio.Event{Kind: aistudio.EventCodeExecutionResult, CodeExecutionResult: &result})
+}
+
 // parts reuses Gemini text, media, and file input mappings.
 func (content interactionInput) parts() ([]aistudio.Part, error) {
 	var part geminiPart
@@ -270,11 +334,22 @@ func (content interactionInput) parts() ([]aistudio.Part, error) {
 			}
 		}
 	case "image", "audio", "video", "document":
-		if content.MIME == "" || (content.Data == "") == (content.URI == "") {
-			return nil, fmt.Errorf("%s content requires mime_type and exactly one of data or uri", content.Type)
+		if (content.Data == "") == (content.URI == "") {
+			return nil, fmt.Errorf("%s content requires exactly one of data or uri", content.Type)
 		}
 		if content.Data != "" {
-			part.InlineData = &geminiBlobPart{MIMEType: content.MIME, Data: content.Data}
+			mimeType := content.MIME
+			if mimeType == "" {
+				data, err := decodeBase64Flexible(content.Data)
+				if err != nil {
+					return nil, fmt.Errorf("%s data: %w", content.Type, err)
+				}
+				mimeType = detectMediaType("", data)
+				if mimeType == "application/octet-stream" {
+					return nil, fmt.Errorf("%s content requires mime_type", content.Type)
+				}
+			}
+			part.InlineData = &geminiBlobPart{MIMEType: mimeType, Data: content.Data}
 		} else {
 			part.FileData = &geminiFilePart{MIMEType: content.MIME, FileURI: content.URI}
 		}
@@ -291,9 +366,8 @@ func interactionSpeech(raw json.RawMessage) (*aistudio.SpeechConfig, error) {
 		return nil, nil
 	}
 	type voice struct {
-		Voice    string `json:"voice"`
-		Speaker  string `json:"speaker"`
-		Language string `json:"language"`
+		Voice   string `json:"voice"`
+		Speaker string `json:"speaker"`
 	}
 	var config struct {
 		Mode     string  `json:"mode"`
@@ -314,9 +388,6 @@ func interactionSpeech(raw json.RawMessage) (*aistudio.SpeechConfig, error) {
 		if strings.TrimSpace(speaker.Voice) == "" {
 			return nil, fmt.Errorf("speech_config voice is required")
 		}
-		if speaker.Language != "" {
-			return nil, fmt.Errorf("speech language is determined by the input text")
-		}
 		if len(config.Speakers) == 1 && speaker.Speaker == "" {
 			speech.VoiceName = speaker.Voice
 		} else {
@@ -329,21 +400,87 @@ func interactionSpeech(raw json.RawMessage) (*aistudio.SpeechConfig, error) {
 	return speech, nil
 }
 
-// audioFormat selects full WAV or streaming PCM based on requested modality.
-func (request interactionRequest) audioFormat() string {
+// imageMIME returns the MIME type requested by the image response format.
+func (request interactionRequest) imageMIME() string {
+	formats, _ := interactionList[interactionFormat](request.Formats)
+	for _, format := range formats {
+		if format.Type == "image" {
+			return format.MIME
+		}
+	}
+	return ""
+}
+
+// interactionAudioFormat represents the MIME, sample rate, and bit rate for Interactions audio output.
+type interactionAudioFormat struct {
+	MIME       string
+	SampleRate int
+	BitRate    int
+}
+
+// interactionAudioEncodings maps audio output MIME types to encoding format and content MIME.
+var interactionAudioEncodings = map[string]struct{ format, content string }{
+	"audio/wav": {"pcm", "audio/l16"}, "audio/l16": {"pcm", "audio/l16"}, "audio/mp3": {"mp3", "audio/mp3"},
+	"audio/ogg_opus": {"opus", "audio/ogg"}, "audio/alaw": {"alaw", "audio/alaw"}, "audio/mulaw": {"mulaw", "audio/mulaw"},
+}
+
+// audioFormat returns audio output configuration; defaults to WAV for non-streaming and L16 for streaming when unspecified.
+func (request interactionRequest) audioFormat() interactionAudioFormat {
+	audio := interactionAudioFormat{MIME: "audio/wav"}
+	if request.Stream {
+		audio.MIME = "audio/l16"
+	}
 	formats, _ := interactionList[interactionFormat](request.Formats)
 	for _, format := range formats {
 		if format.Type == "audio" {
-			if format.MIME == "audio/wav" {
-				return "wav"
-			}
-			if format.MIME == "audio/l16" {
-				return "pcm"
+			audio.SampleRate, audio.BitRate = format.SampleRate, format.BitRate
+			if format.MIME != "" {
+				audio.MIME = format.MIME
 			}
 		}
 	}
-	if request.Stream {
-		return "pcm"
+	return audio
+}
+
+// container returns packaging for interactionMedia: WAV packages PCM, other formats output raw encoded result
+func (audio interactionAudioFormat) container() string {
+	if audio.MIME == "audio/wav" {
+		return "wav"
 	}
-	return "wav"
+	return "pcm"
+}
+
+// encode transcodes upstream PCM or MP3 to requested encoding and sample rate, preserving raw data when matching
+func (audio interactionAudioFormat) encode(media aistudio.Media) (aistudio.Media, error) {
+	baseType, _, _ := mime.ParseMediaType(media.MIME)
+	if media.URL != "" || baseType != "audio/l16" && baseType != "audio/wav" && baseType != "audio/x-wav" && baseType != "audio/mpeg" {
+		return media, nil
+	}
+	source, err := mediaPCM(media)
+	if err != nil {
+		return media, err
+	}
+	encoding := interactionAudioEncodings[audio.MIME]
+	sameRate := audio.SampleRate == 0 || audio.SampleRate == source.SampleRate
+	switch {
+	case baseType == "audio/mpeg" && encoding.format == "mp3" && sameRate && audio.BitRate == 0:
+		return aistudio.Media{MIME: fmt.Sprintf("%s;rate=%d;channels=%d", encoding.content, source.SampleRate, source.Channels), Data: media.Data}, nil
+	case baseType != "audio/mpeg" && encoding.format == "pcm" && sameRate:
+		return media, nil
+	}
+	data, encoded, err := encodeAudio(source, audioOutput{Format: encoding.format, SampleRate: audio.SampleRate, BitRate: audio.BitRate})
+	return aistudio.Media{MIME: fmt.Sprintf("%s;rate=%d;channels=%d", encoding.content, encoded.SampleRate, encoded.Channels), Data: data}, err
+}
+
+// streams determines whether audio chunks can stream incrementally; container, resampling, and MP3 decoding require full audio
+func (audio interactionAudioFormat) streams(media aistudio.Media) bool {
+	switch audio.MIME {
+	case "audio/l16", "audio/alaw", "audio/mulaw":
+		if baseType, _, _ := mime.ParseMediaType(media.MIME); baseType == "audio/mpeg" {
+			return false
+		}
+		source, err := mediaPCM(media)
+		return err != nil || audio.SampleRate == 0 || audio.SampleRate == source.SampleRate
+	}
+	return false
 }

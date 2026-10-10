@@ -115,3 +115,38 @@ This sync integrates all these changes, resolves 24 conflicted files, and transl
 - Updated English documentation (`README.md`, `docs/development.md`, `docs/protocol.md`) and synchronized Chinese documentation (`README_ch.md`).
 - Validated with `go test ./...` (all passing), `go vet ./...` (0 issues), `npm --prefix web run typecheck` (0 errors), and `go build ./cmd/aistudio2api`.
 - Merged into `dev` (`38e80dd`).
+
+---
+
+### Update: Upstream Full Protocol Compatibility & v0.2.8 Synchronization (2026-10-09)
+
+**Task**: Synchronize `sync/upstream-main` with upstream commits up to `5ec39b8` (release v0.2.8), resolve all merge conflicts preserving read-only configuration and English-only code invariants, translate all newly introduced comments and error messages to English, and merge into `dev`.
+
+**Upstream Additions**:
+1. **Authenticated Proxy & Relay (`internal/proxydial`)**:
+   - Support for HTTP, HTTPS, and SOCKS5 upstream proxies with username/password credentials.
+   - Local loopback SOCKS5 relay service for Camoufox to prevent credential leakage into browser profiles.
+2. **Remote Account Pairing (`internal/setup`, `internal/api/pairing.go`)**:
+   - Remote pairing tokens with 10-minute expiration (`POST /api/pairing`, `POST /api/pairing/accounts`).
+   - Remote account onboarding via `aistudio2api setup --remote <origin> [--token <TOKEN>]`.
+3. **Request Usage Ledger & Analytics Dashboard (`internal/requestdb`)**:
+   - High-performance local SQLite request ledger in `runtime/requests.db`.
+   - Hourly and daily rollups, latency percentiles, dimensional aggregation (model, account, channel, protocol, state), CSV export, and optional request/response body capture (`REQUEST_BODY_LOG=true`).
+   - Embedded Vue 3 Usage analytics dashboard tab with interactive time range picker and charts.
+4. **Full Protocol Compatibility & Embeddings**:
+   - Embeddings API (`/v1/embeddings`, `:embedContent`, `:batchEmbedContents`) via Build `ProxyUnaryCall` with batch chunking.
+   - Realtime Live & Music over Build WebChannel (`internal/aistudio/build_bidi.go`).
+   - Assistant turn tail continuation (`internal/aistudio/turns.go`) and system-instruction-only generation support.
+   - Upstream streaming errors before first event return immediate HTTP 4xx/5xx status before SSE headers are committed.
+5. **Pure-Go WAA Runtime Enhancements (`internal/waa`)**:
+   - Precompiled prompt program and gzipped Firefox 152 shape table (`firefox152.json.gz`).
+   - Full `Intl` constructor suite (`intl.js`) with localized date formatting and CLDR collation.
+6. **Safety Settings & Stop Sequence Parity**:
+   - Unified `safetySettings` wire encoder (`internal/aistudio/safety.go`) supporting standard harm categories and threshold enums.
+   - Parallel `CountTokens` execution for accurate token usage reporting on stop sequence termination.
+
+**Resolution & Adaptations**:
+1. **Immutable Configuration Preserved**: Dropped upstream `.env` mutation logic (`Config.Save()`), dynamic update handler (`UpdateRuntimeConfig`), and form inputs with save buttons. `SettingsPanel.vue` continues to serve strictly as a read-only configuration inspector, updated to display `REQUEST_BODY_LOG` and `AUTO_START`.
+2. **English-Only Code & Logs**: Identified and translated 668 lines of Chinese comments, log messages, CLI output, and error strings across all Go and TypeScript files into idiomatic English. Zero Chinese characters remain in source files outside of i18n dictionaries.
+3. **Frontend Build & Validation**: Validated Vue 3 codebase with `npm run typecheck` (0 errors), `npm run lint` (0 errors), `npm run format:check`, and rebuilt production bundle via `npm run build` embedded into binary.
+4. **Backend Verification**: Ran static analysis (`go vet ./...`, 0 issues) and full test suite (`go test ./...`, all packages passing). Verified binary compilation via `go build ./cmd/aistudio2api`.

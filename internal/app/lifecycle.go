@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"slices"
 	"sync"
 	"time"
@@ -10,6 +11,7 @@ import (
 	"github.com/Mag1cFall/AIStudio2API/internal/aistudio"
 	"github.com/Mag1cFall/AIStudio2API/internal/api"
 	"github.com/Mag1cFall/AIStudio2API/internal/config"
+	"github.com/Mag1cFall/AIStudio2API/internal/requestdb"
 )
 
 // managedService represents a hot-swappable generation service.
@@ -73,6 +75,7 @@ type runtimeManager struct {
 	mu               sync.RWMutex
 	current          *runtimeGeneration
 	startCancel      context.CancelFunc
+	ledger           *requestdb.Store
 }
 
 // newRuntimeManager creates a process-level manager and initializes the first generation service.
@@ -270,6 +273,28 @@ func (manager *runtimeManager) GetGenerateVideoOperation(ctx context.Context, id
 	return service.GetGenerateVideoOperation(ctx, id)
 }
 
+// ListVideos lists video operations using the current generation service.
+func (manager *runtimeManager) ListVideos(ctx context.Context) ([]aistudio.VideoOperation, error) {
+	manager.mu.RLock()
+	defer manager.mu.RUnlock()
+	service, ok := manager.current.service.(aistudio.VideoService)
+	if !ok {
+		return nil, fmt.Errorf("video service unavailable")
+	}
+	return service.ListVideos(ctx)
+}
+
+// DeleteVideo deletes a video operation using the current generation service.
+func (manager *runtimeManager) DeleteVideo(ctx context.Context, id string) error {
+	manager.mu.RLock()
+	defer manager.mu.RUnlock()
+	service, ok := manager.current.service.(aistudio.VideoService)
+	if !ok {
+		return fmt.Errorf("video service unavailable")
+	}
+	return service.DeleteVideo(ctx, id)
+}
+
 // DownloadFile downloads a file using the current generation service.
 func (manager *runtimeManager) DownloadFile(ctx context.Context, id string) (aistudio.MediaStream, error) {
 	manager.mu.RLock()
@@ -307,6 +332,17 @@ func (manager *runtimeManager) FileMetadata(ctx context.Context, id string) (ais
 	}
 
 	return service.FileMetadata(ctx, id)
+}
+
+// ListFiles lists uploaded files using the current generation service.
+func (manager *runtimeManager) ListFiles(ctx context.Context) ([]aistudio.FileMetadata, error) {
+	manager.mu.RLock()
+	defer manager.mu.RUnlock()
+	service, ok := manager.current.service.(aistudio.FileService)
+	if !ok {
+		return nil, fmt.Errorf("file service unavailable")
+	}
+	return service.ListFiles(ctx)
 }
 
 // DeleteFile deletes a file using the current generation service.
@@ -388,6 +424,13 @@ func (manager *runtimeManager) ImportChromeAccounts(ctx context.Context, input a
 	return manager.current.admin.ImportChromeAccounts(ctx, input)
 }
 
+// ImportAccountState imports a remotely paired account in the current generation service.
+func (manager *runtimeManager) ImportAccountState(ctx context.Context, input api.AccountStateInput) (api.AdminAccount, error) {
+	manager.mu.RLock()
+	defer manager.mu.RUnlock()
+	return manager.current.admin.ImportAccountState(ctx, input)
+}
+
 // UpdateAccount updates an account in the current generation service.
 func (manager *runtimeManager) UpdateAccount(ctx context.Context, id string, input api.AccountInput) (api.AdminAccount, error) {
 	manager.mu.RLock()
@@ -441,6 +484,7 @@ func (manager *runtimeManager) RuntimeConfig(ctx context.Context) (api.RuntimeCo
 
 
 
+
 // Cooldowns returns the cooldown states for the current generation service.
 func (manager *runtimeManager) Cooldowns(ctx context.Context) ([]api.AdminCooldown, error) {
 	manager.mu.RLock()
@@ -477,11 +521,14 @@ func (manager *runtimeManager) RecordAccessStart(entry api.AccessLog) {
 	manager.mu.RUnlock()
 }
 
-// RecordAccessLog records the result of a public API request.
+// RecordAccessLog records public API request outcomes; requests passing API key validation are also written to the usage ledger.
 func (manager *runtimeManager) RecordAccessLog(entry api.AccessLog) {
 	manager.mu.RLock()
 	manager.current.admin.RecordAccessLog(entry)
 	manager.mu.RUnlock()
+	if entry.Method == http.MethodPost && entry.Authorized {
+		manager.ledger.Record(requestRow(entry, time.Now().UTC()))
+	}
 }
 
 // decorateRuntimeConfig marks whether changes require a management or service restart.
@@ -516,14 +563,11 @@ func sameDataConfig(value api.RuntimeConfig, active config.Config, overrides dat
 		WarmStartupConcurrency: value.WarmStartupConcurrency,
 		PerAccountConcurrency:  value.PerAccountConcurrency,
 		TemporaryChat:          value.TemporaryChat,
-		RoutingStrategy:        value.RoutingStrategy,
 		UpstreamChannels:       value.UpstreamChannels,
-		Headless:               value.Headless,
 		WAABackend:             value.WAABackend,
 		AutoStart:              value.AutoStart,
 		BuildNativeNonstream:   value.BuildNativeNonstream,
 	}
-
 	overrides.Apply(&saved)
 
 	return saved.AuthStates == active.AuthStates &&
@@ -535,9 +579,7 @@ func sameDataConfig(value api.RuntimeConfig, active config.Config, overrides dat
 		saved.WarmStartupConcurrency == active.WarmStartupConcurrency &&
 		saved.PerAccountConcurrency == active.PerAccountConcurrency &&
 		saved.TemporaryChat == active.TemporaryChat &&
-		saved.RoutingStrategy == active.RoutingStrategy &&
 		slices.Equal(saved.UpstreamChannels, active.UpstreamChannels) &&
-		saved.Headless == active.Headless &&
 		saved.WAABackend == active.WAABackend &&
 		saved.AutoStart == active.AutoStart &&
 		saved.BuildNativeNonstream == active.BuildNativeNonstream

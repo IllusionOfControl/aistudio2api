@@ -156,7 +156,7 @@ In the console, each line is an independent JSON event:
 {"time":"2026-09-06T14:11:47Z","level":"INFO","msg":"tool calls completed","event":"request.finished","source":"account@example.com","request":{"id":"chatcmpl_example","state":"tool_calls","model":"gemini-3.8-flash","status":200,"duration_ms":4758,"tool_calls":1,"finish_reason":"stop","usage":{"input_tokens":100,"reasoning_tokens":32,"reply_tokens":38,"output_tokens":70,"total_tokens":170,"average_tokens_per_second":14.712064}}}
 ```
 
-Sampling parameters are recorded in `request.parameters`. `first_event_ms` and `upstream_bytes` are preserved as JSON diagnostic fields. The dashboard supports searching by severity, account, model, request ID, and HTTP status code.
+Sampling parameters are preserved in `request.parameters`. `first_event_ms`, `queue_ms`, `proof_ms`, and `upstream_bytes` are retained as JSON diagnostic fields: `queue_ms` is the duration from request arrival to acquiring the final execution account, and `proof_ms` is the time spent waiting for and generating WAA proof. The management interface supports filtering by level, account, model, request ID, and status code.
 
 Client cancellations are recorded as `499`; authentication, quota, and upstream failures use respective HTTP status codes and `request.error`.
 
@@ -204,13 +204,14 @@ SSE clients treat this frame as a keep-alive signal, while message content, reas
 
 ## Account Events
 
-HTTP `401` triggers an automatic cookie renewal using the OAuth/DBSC materials saved for Chrome-imported accounts, resets the WAA worker, and replays the request once.
+HTTP `401` triggers cookie renewal using the account saved OAuth/DBSC renewal materials; if the account lacks material or it is rejected, renewal material for the same email is imported from local Chrome. Subsequently, the WAA Worker is reset and the request is retried once.
 
 ```text
-INFO  account@example.com  account auth renewal | 1/2 | refreshing cookies
-INFO  account@example.com  account auth renewal | 2/2 | resetting protocol runtime
-INFO  account@example.com  account auth renewal completed | elapsed=1.116s
-ERROR account@example.com  account auth renewal failed | elapsed=1.116s | err=<ERROR>
+INFO  account@example.com  Account auth renewal | 1/2 | Refreshing cookies
+INFO  account@example.com  Account auth renewal | Updating Chrome source material
+INFO  account@example.com  Account auth renewal | 2/2 | Resetting protocol runtime
+INFO  account@example.com  Account auth renewal completed | duration=1.234s
+```
 ```
 
 HTTP `403` and protocol Code 7 retain the account and model's `verified` record without marking permanent permission failure. Protocol Code 5, worker process crashes, or worker replacements trigger worker recreation and a single replay; other retriable errors enter temporary cooldown.
@@ -245,7 +246,18 @@ Resource and scope tracking events:
 
 Delayed authentication results apply only when `authGeneration` and `checkedAt` match the current account; delayed model successes or cooldown results apply only when `modelAccessGeneration` and `checked_at` match the current model catalog. Logs record changes actually committed to runtime state and any persistence failures.
 
-## Management Event Stream
+## Usage Ledger
+
+`runtime/requests.db` is a local SQLite ledger. Every POST request on `/v1` and `/v1beta` passing API key authentication writes one row upon completion: request ID, completion timestamp, protocol, path, model, account, channel, HTTP status, `request.state`, latency, first upstream event latency, queue wait, token usage, tool call count, error message, and attempt count.
+
+```text
+INFO  service  Request ledger rebuilt daily summaries according to server timezone | days=<COUNT>
+INFO  service  Request ledger pruned expired records | count=<COUNT>
+```
+
+- Retention: ledger records and daily summaries are kept for 90 days, daily vacuum and cleanup run on startup
+- Request Bodies: when `REQUEST_BODY_LOG=true` is enabled, POST request and response bodies are captured up to 64 KiB each, with the latest 1000 retained
+- Inspection: the web UI "Usage" dashboard renders time ranges, breakdowns by dimension (model, account, channel, protocol, state), token distributions, and drill-down into captured request and response payloads
 
 When the management dashboard connects to `GET /api/events`, it initially receives current service status, models, accounts, the last 2000 log events, cooldowns, and active requests, followed by real-time incremental events. Request events aggregate by ID in the UI, and the console outputs line-by-line JSON via Go's `slog.JSONHandler`.
 

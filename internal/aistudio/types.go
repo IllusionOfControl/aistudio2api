@@ -189,6 +189,12 @@ type ImageConfig struct {
 	ImageSize   string `json:"image_size,omitempty"`
 }
 
+// SafetySetting represents the block threshold for a safety category, using Gemini API enum names.
+type SafetySetting struct {
+	Category  string `json:"category"`
+	Threshold string `json:"threshold"`
+}
+
 // SpeakerVoiceConfig represents voice selection for multi-speaker synthesis
 type SpeakerVoiceConfig struct {
 	Speaker   string `json:"speaker"`
@@ -228,6 +234,8 @@ type GenerationConfig struct {
 	ReasoningEffort     string               `json:"reasoning_effort,omitempty"`
 	ThinkingBudget      *int64               `json:"thinking_budget,omitempty"`
 	Seed                *int64               `json:"seed,omitempty"`
+	// MediaResolution is the input media resolution using Gemini API enum names
+	MediaResolution string `json:"media_resolution,omitempty"`
 	// HideThinking controls visibility of thought blocks in public responses
 	HideThinking bool `json:"hide_thinking,omitempty"`
 }
@@ -241,6 +249,8 @@ type GenerateRequest struct {
 	Config    GenerationConfig `json:"config,omitempty"`
 	Tools     Tools            `json:"tools,omitempty"`
 	AccountID string           `json:"account_id,omitempty"`
+	// SafetySettings overrides block thresholds for corresponding categories; unlisted categories remain off
+	SafetySettings []SafetySetting `json:"safety_settings,omitempty"`
 	// ImageRoute internal flag: image generation model (derived from model catalog capabilities)
 	ImageRoute bool `json:"-"`
 	// Unary marks a single non-streaming request (using ProxyUnaryCall in Build proxy).
@@ -369,6 +379,7 @@ type Event struct {
 	Transcript          *TranscriptMetadata  `json:"transcript,omitempty"`
 	Usage               *Usage               `json:"usage,omitempty"`
 	FinishReason        string               `json:"finish_reason,omitempty"`
+	FinishMessage       string               `json:"finish_message,omitempty"`
 	StopSequence        string               `json:"stop_sequence,omitempty"`
 	ProviderModel       string               `json:"provider_model,omitempty"`
 	ThoughtSignature    string               `json:"thought_signature,omitempty"`

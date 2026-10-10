@@ -141,6 +141,7 @@ type accountWorkerManager struct {
 	warmTarget      int
 	maxActive       int
 	warmConcurrency int
+	startupSlots    chan struct{}
 	temporaryChat   bool
 	headless        bool
 	lifecycle       context.Context
@@ -216,26 +217,21 @@ const (
 
 // Prepare generates proof while the account worker is valid.
 func (preparer *accountWorkerPreparer) Prepare(ctx context.Context, request aistudio.ProtectedRequest) (aistudio.PreparedProtectedRequest, error) {
-	preparer.account.mu.Lock()
-	defer preparer.account.mu.Unlock()
-
-	if preparer.account.worker != preparer.worker {
+	if !preparer.current() {
 		return aistudio.PreparedProtectedRequest{}, errAccountWorkerReplaced
 	}
-	if preparer.account.bootstrapModel != preparer.bootstrapModel {
+	startedAt := time.Now()
+	defer func() { api.AddAccessLogProof(ctx, time.Since(startedAt)) }()
+	prepared, err := preparer.worker.Prepare(ctx, request)
+	if err != nil && !preparer.current() {
 		return aistudio.PreparedProtectedRequest{}, errAccountWorkerReplaced
 	}
-
-	return preparer.worker.Prepare(ctx, request)
+	return prepared, err
 }
 
 // SendProtected validates the current account worker and sends a browser request.
 func (preparer *accountWorkerPreparer) SendProtected(ctx context.Context, request aistudio.ProtectedRequest) (*aistudio.RPCResponse, error) {
-	preparer.account.mu.Lock()
-	current := preparer.account.worker == preparer.worker && preparer.account.bootstrapModel == preparer.bootstrapModel
-	preparer.account.mu.Unlock()
-
-	if !current {
+	if !preparer.current() {
 		return nil, errAccountWorkerReplaced
 	}
 
@@ -244,14 +240,21 @@ func (preparer *accountWorkerPreparer) SendProtected(ctx context.Context, reques
 
 // BrowserStorageState returns browser cookie state for the same valid account worker.
 func (preparer *accountWorkerPreparer) BrowserStorageState(ctx context.Context) (aistudio.StorageState, error) {
-	preparer.account.mu.Lock()
-	defer preparer.account.mu.Unlock()
-
-	if preparer.account.worker != preparer.worker || preparer.account.bootstrapModel != preparer.bootstrapModel {
+	if !preparer.current() {
 		return aistudio.StorageState{}, errAccountWorkerReplaced
 	}
+	state, err := preparer.worker.BrowserStorageState(ctx)
+	if err != nil && !preparer.current() {
+		return aistudio.StorageState{}, errAccountWorkerReplaced
+	}
+	return state, err
+}
 
-	return preparer.worker.BrowserStorageState(ctx)
+// current checks inside the account lock that the worker and page model have not been replaced.
+func (preparer *accountWorkerPreparer) current() bool {
+	preparer.account.mu.Lock()
+	defer preparer.account.mu.Unlock()
+	return preparer.account.worker == preparer.worker && preparer.account.bootstrapModel == preparer.bootstrapModel
 }
 
 // accountWorkerInitError indicates initialization failure of an account WAA worker.
@@ -268,7 +271,7 @@ func (err *accountWorkerInitError) Unwrap() error {
 	return err.err
 }
 
-// newAccountWorkerManager creates account worker manager.
+// newAccountWorkerManager creates account worker manager configuration.
 func newAccountWorkerManager(
 	pool *aistudio.AccountPool,
 	accounts []*aistudio.Account,
@@ -282,26 +285,20 @@ func newAccountWorkerManager(
 	temporaryChat bool,
 	headless bool,
 ) *accountWorkerManager {
+	if camoufoxPath == "" {
+		warmConcurrency = max(maxActive, 1)
+	}
 	lifecycle, cancel := context.WithCancel(context.Background())
 
 	manager := &accountWorkerManager{
-		pool:            pool,
-		accounts:        make(map[string]*accountWorker, len(accounts)),
-		requests:        requests,
-		camoufox:        camoufoxPath,
-		globalProxy:     globalProxy,
-		initTimeout:     initTimeout,
-		warmTarget:      warmTarget,
-		maxActive:       maxActive,
-		warmConcurrency: warmConcurrency,
-		temporaryChat:   temporaryChat,
-		headless:        headless,
-		openings:        make(map[string]chan struct{}),
-		lifecycle:       lifecycle,
-		cancel:          cancel,
-		signal:          make(chan struct{}),
-		dispatch:        newDispatchQueue(),
-		victims:         make(map[string]struct{}),
+		pool: pool, accounts: make(map[string]*accountWorker, len(accounts)), requests: requests, camoufox: camoufoxPath,
+		globalProxy: globalProxy, initTimeout: initTimeout,
+		warmTarget: warmTarget, maxActive: maxActive, warmConcurrency: warmConcurrency, temporaryChat: temporaryChat,
+		headless:     headless,
+		startupSlots: make(chan struct{}, max(warmConcurrency, 1)),
+		openings:     make(map[string]chan struct{}),
+		lifecycle:    lifecycle, cancel: cancel, signal: make(chan struct{}), dispatch: newDispatchQueue(),
+		victims: make(map[string]struct{}),
 	}
 	manager.background, manager.stopBackground = context.WithCancel(lifecycle)
 	for _, account := range accounts {
@@ -1103,9 +1100,16 @@ func (manager *accountWorkerManager) startReservedWorker(
 		ownsLease = true
 		manager.clearRuntimeBusy(account)
 	}
-
+	select {
+	case manager.startupSlots <- struct{}{}:
+	case <-ctx.Done():
+		if ownsLease {
+			_ = runtimeLease.Release()
+		}
+		account.startupMu.Unlock()
+		return nil, ctx.Err()
+	}
 	manager.requests.log(label, "INFO", "WAA worker startup | 1/7 | Initializing page | page_model="+bootstrapModel)
-
 	initCtx, cancel := context.WithTimeout(ctx, manager.initTimeout)
 	options.Model = bootstrapModel
 	options.StartupProgress = func(stage camoufoxnative.StartupStage) {
@@ -1114,7 +1118,7 @@ func (manager *accountWorkerManager) startReservedWorker(
 	}
 	worker, initErr := newWAAWorker(initCtx, account.id, options)
 	cancel()
-
+	<-manager.startupSlots
 	if initErr != nil {
 		if ownsLease {
 			_ = runtimeLease.Release()
@@ -3026,6 +3030,38 @@ func (service *trackedService) GetGenerateVideoOperation(ctx context.Context, op
 	return operation, requestErr
 }
 
+// ListVideos lists video operations.
+func (service *trackedService) ListVideos(ctx context.Context) ([]aistudio.VideoOperation, error) {
+	requestCtx, cancel, err := service.observedDataRequestContext(ctx, "")
+	if err != nil {
+		return nil, err
+	}
+	defer cancel()
+	video, ok := service.service.(aistudio.VideoService)
+	if !ok {
+		return nil, fmt.Errorf("video service unavailable")
+	}
+	videos, requestErr := video.ListVideos(requestCtx)
+	api.SetAccessLogError(requestCtx, requestErr)
+	return videos, requestErr
+}
+
+// DeleteVideo deletes a video operation and its result file.
+func (service *trackedService) DeleteVideo(ctx context.Context, operationID string) error {
+	requestCtx, cancel, err := service.observedDataRequestContext(ctx, "")
+	if err != nil {
+		return err
+	}
+	defer cancel()
+	video, ok := service.service.(aistudio.VideoService)
+	if !ok {
+		return fmt.Errorf("video service unavailable")
+	}
+	requestErr := video.DeleteVideo(requestCtx, operationID)
+	api.SetAccessLogError(requestCtx, requestErr)
+	return requestErr
+}
+
 // DownloadFile downloads a Drive file associated with a generation task.
 func (service *trackedService) DownloadFile(ctx context.Context, fileID string) (aistudio.MediaStream, error) {
 	requestCtx, cancel, err := service.observedDataRequestContext(ctx, "")
@@ -3388,6 +3424,13 @@ func (service *trackedService) Generate(ctx context.Context, request aistudio.Ge
 	api.StartAccessLog(ctx)
 	request.Model = service.pool.CanonicalModelID(request.Model)
 	requestCtx, cancel, err := service.dataRequestContext(ctx)
+	if validator, ok := service.service.(interface {
+		ValidateGenerateRequest(aistudio.GenerateRequest) error
+	}); ok && err == nil {
+		if err = validator.ValidateGenerateRequest(request); err != nil {
+			cancel()
+		}
+	}
 	if err != nil {
 		api.SetAccessLogError(ctx, err)
 		service.requests.start(request, func() {})
@@ -3469,15 +3512,21 @@ func (service *trackedService) generateWithRetry(
 		if resourceID != "" || request.Config.SpeechConfig != nil && request.Config.SpeechConfig.Mode != "" {
 			selection.PlaygroundOnly = true
 		}
+		if !selection.PlaygroundOnly && service.pool.BuildEnabled() && aistudio.RequestNeedsBuildSchema(request) {
+			selection.Channel = aistudio.ChannelBuild
+		}
 		fallbackReason := ""
 		if request.Unary {
 			switch {
 			case selection.PlaygroundOnly:
 				fallbackReason = "request contains Playground-specific capabilities or file references"
+			case selection.Channel != "":
+			case !service.pool.BuildEnabled():
+				fallbackReason = "Build channel is not enabled"
 			case !service.buildNativeNonstream:
 				fallbackReason = "Build native non-streaming preference is disabled"
 			default:
-				selection.Channel = aistudio.ChannelBuild
+				selection.PreferredChannel = aistudio.ChannelBuild
 			}
 		}
 		if (unbound || fileBound) && len(attempted) > 0 {
@@ -3490,13 +3539,16 @@ func (service *trackedService) generateWithRetry(
 		}
 
 		nextLease, acquireErr := service.acquireWarmLease(requestCtx, selection)
-		if acquireErr != nil && selection.Channel == aistudio.ChannelBuild && requestCtx.Err() == nil {
-			var cooling *aistudio.AllCoolingError
-			if errors.Is(acquireErr, aistudio.ErrNoEligibleAccount) || errors.As(acquireErr, &cooling) {
-				fallbackReason = "native Build channel unavailable: " + acquireErr.Error()
-				selection.Channel = ""
-				nextLease, acquireErr = service.acquireWarmLease(requestCtx, selection)
-			}
+		var buildCooling *aistudio.AllCoolingError
+		if acquireErr != nil && selection.Channel == aistudio.ChannelBuild && requestCtx.Err() == nil &&
+			(errors.Is(acquireErr, aistudio.ErrNoEligibleAccount) || errors.As(acquireErr, &buildCooling)) {
+			// When no account can serve via Build, structured output schema falls back to Playground carrier
+			selection.Channel = ""
+			fallbackReason = "Build channel has no available accounts"
+			nextLease, acquireErr = service.acquireWarmLease(requestCtx, selection)
+		}
+		if acquireErr == nil && selection.PreferredChannel == aistudio.ChannelBuild && nextLease.Channel() != aistudio.ChannelBuild {
+			fallbackReason = "account Build channel cooling down or model not supported"
 		}
 		if acquireErr != nil {
 			var ownerCooling *aistudio.AllCoolingError
@@ -3515,6 +3567,7 @@ func (service *trackedService) generateWithRetry(
 		}
 
 		lease = nextLease
+		attemptStartedAt := time.Now()
 		err = nil
 		source = nil
 		request.AccountID = lease.Account().ID
@@ -3524,6 +3577,7 @@ func (service *trackedService) generateWithRetry(
 		accountLabel := lease.Account().Config.Label
 		api.SetAccessLogChannel(requestCtx, string(lease.Channel()))
 		api.SetAccessLogTarget(requestCtx, modelID, accountLabel)
+		api.MarkAccessLogScheduled(requestCtx)
 		service.requests.markRunning(request.ID, request.AccountID, accountLabel)
 		service.requests.markChannel(request.ID, string(lease.Channel()))
 		service.requests.logRequestProgress(request.ID, accountLabel, "INFO", "Waiting for upstream response")
@@ -3660,7 +3714,10 @@ func (service *trackedService) generateWithRetry(
 		if attemptCopies != nil {
 			err = errors.Join(err, attemptCopies.Cleanup())
 		}
-
+		api.AddAccessLogAttempt(requestCtx, api.RequestAttempt{
+			Account: accountLabel, Channel: string(lease.Channel()), Error: err.Error(),
+			DurationMS: time.Since(attemptStartedAt).Milliseconds(),
+		})
 		workerFailed := service.workers.WorkerFailed(request.AccountID)
 		waaRuntimeFailed := aistudio.DefinitiveWAARuntimeFailure(err)
 		workerReplaced := errors.Is(err, errAccountWorkerReplaced)
@@ -3694,9 +3751,7 @@ func (service *trackedService) generateWithRetry(
 					"Account cooldown | type=%s | scope=%s | reset=%s",
 					cooldown.Kind, scopeLabel, cooldown.Until.Format(time.RFC3339),
 				))
-				availableSelection := selection
-				availableSelection.Channel = ""
-				if !cooldown.Global && service.pool.AccountChannelAvailable(request.AccountID, availableSelection) {
+				if !cooldown.Global && service.pool.AccountChannelAvailable(request.AccountID, selection) {
 					delete(attempted, request.AccountID)
 					maxAttempts++
 				}

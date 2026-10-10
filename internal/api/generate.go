@@ -27,6 +27,7 @@ type generationResult struct {
 	media         []aistudio.Media
 	usage         *aistudio.Usage
 	finishReason  string
+	finishMessage string
 	stopSequence  string
 	providerModel string
 	finished      bool
@@ -93,11 +94,48 @@ func (result *generationResult) apply(event aistudio.Event) error {
 		}
 	case aistudio.EventFinish:
 		result.finishReason = event.FinishReason
+		result.finishMessage = event.FinishMessage
 		result.stopSequence = event.StopSequence
 		result.finished = true
 	}
 	result.events = append(result.events, event)
 	return nil
+}
+
+// awaitStreamStart waits for first event before writing streaming response headers; returns error if first event is error, or returns stream if heartbeat elapses
+func awaitStreamStart(ctx context.Context, events <-chan aistudio.Event) (<-chan aistudio.Event, error) {
+	timer := time.NewTimer(streamHeartbeatInterval)
+	defer timer.Stop()
+	var first aistudio.Event
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-timer.C:
+		return events, nil
+	case event, ok := <-events:
+		if !ok {
+			return nil, errIncompleteStream
+		}
+		if event.Kind == aistudio.EventError {
+			if event.Err != nil {
+				return nil, event.Err
+			}
+			return nil, errUpstreamStream
+		}
+		first = event
+	}
+	replay := make(chan aistudio.Event)
+	go func() {
+		defer close(replay)
+		for event, ok := first, true; ok; event, ok = <-events {
+			select {
+			case replay <- event:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+	return replay, nil
 }
 
 func consumeEvents(ctx context.Context, events <-chan aistudio.Event, emit func(aistudio.Event) error) (result generationResult, resultErr error) {

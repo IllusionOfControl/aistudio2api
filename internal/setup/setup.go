@@ -2,11 +2,16 @@ package setup
 
 import (
 	"bufio"
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
+	"net"
+	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -14,6 +19,7 @@ import (
 	"text/tabwriter"
 
 	"github.com/Mag1cFall/AIStudio2API/internal/aistudio"
+	"github.com/Mag1cFall/AIStudio2API/internal/api"
 	"github.com/Mag1cFall/AIStudio2API/internal/camoufoxnative"
 	"github.com/Mag1cFall/AIStudio2API/internal/chromeauth"
 	"github.com/Mag1cFall/AIStudio2API/internal/config"
@@ -45,23 +51,44 @@ type setupOptions struct {
 	locale       string
 	localeSet    bool
 	timezone     string
+	remote       string
+	token        string
 }
 
-// Run executes local Chrome import, storage state file import, or isolated login.
+// accountTarget saves an account obtained during setup and returns the account name.
+type accountTarget interface {
+	Save(ctx context.Context, accountConfig aistudio.AccountConfig, state aistudio.StorageState, fingerprintDirectory string) (string, error)
+}
+
+// Run executes local Chrome import, file import, or isolated login, writing results to the local account directory or a remote instance.
 func Run(ctx context.Context, cfg config.Config, args []string) error {
 	options, err := parseSetupFlags(args, cfg)
 	if err != nil {
 		return err
 	}
-
-	if err := validateSetupRoot(cfg.AuthStates); err != nil {
-		return err
+	input := bufio.NewReader(os.Stdin)
+	var target accountTarget
+	if options.remote != "" {
+		token := options.token
+		if token == "" {
+			if token, err = readPairingToken(input, os.Stdout); err != nil {
+				return err
+			}
+		}
+		target = remoteTarget{
+			client: &http.Client{Timeout: cfg.RequestTimeout, CheckRedirect: func(*http.Request, []*http.Request) error {
+				return http.ErrUseLastResponse
+			}},
+			origin: options.remote, token: token,
+		}
+	} else {
+		if err := validateSetupRoot(cfg.AuthStates); err != nil {
+			return err
+		}
+		target = localTarget{store: aistudio.NewAccountStore(cfg.AuthStates)}
 	}
-
-	store := aistudio.NewAccountStore(cfg.AuthStates)
-
 	if options.storageState != "" {
-		return importStorageState(store, options)
+		return importStorageState(ctx, target, options)
 	}
 
 	if options.login {
@@ -69,13 +96,123 @@ func Run(ctx context.Context, cfg config.Config, args []string) error {
 		if err != nil {
 			return err
 		}
-		return importIsolatedLogin(ctx, store, options, driver)
+		return importIsolatedLogin(ctx, target, options, driver)
 	}
-
-	return importChromeAccounts(ctx, cfg, store, options, os.Stdin, os.Stdout)
+	return importChromeAccounts(ctx, cfg, target, options, input, os.Stdout)
 }
 
-func importStorageState(store *aistudio.AccountStore, options setupOptions) error {
+// localTarget writes account to local account directory
+type localTarget struct {
+	store *aistudio.AccountStore
+}
+
+// Save creates local account directory and persists isolated login fingerprint
+func (target localTarget) Save(
+	_ context.Context,
+	accountConfig aistudio.AccountConfig,
+	state aistudio.StorageState,
+	fingerprintDirectory string,
+) (string, error) {
+	account, publishLease, err := target.store.Create(accountConfig, state)
+	if err != nil {
+		return "", err
+	}
+	if fingerprintDirectory != "" {
+		if err := camoufoxnative.PersistAccountFingerprint(fingerprintDirectory, account.Directory); err != nil {
+			return "", errors.Join(err, target.store.Delete(account), publishLease.Release())
+		}
+	}
+	return account.Config.Label, publishLease.Release()
+}
+
+// remoteTarget uploads account to remote instance using pairing token
+type remoteTarget struct {
+	client *http.Client
+	origin string
+	token  string
+}
+
+// Save uploads authentication state and isolated login fingerprint
+func (target remoteTarget) Save(
+	ctx context.Context,
+	accountConfig aistudio.AccountConfig,
+	state aistudio.StorageState,
+	fingerprintDirectory string,
+) (string, error) {
+	input := api.AccountStateInput{
+		Label: accountConfig.Label, Locale: accountConfig.Locale, Timezone: accountConfig.Timezone, StorageState: state,
+	}
+	if fingerprintDirectory != "" {
+		data, err := os.ReadFile(filepath.Join(fingerprintDirectory, "camoufox-fingerprint.json"))
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			return "", fmt.Errorf("read Camoufox fingerprint: %w", err)
+		}
+		input.Fingerprint = data
+	}
+	payload, err := json.Marshal(input)
+	if err != nil {
+		return "", fmt.Errorf("encode account: %w", err)
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, target.origin+"/api/pairing/accounts", bytes.NewReader(payload))
+	if err != nil {
+		return "", err
+	}
+	request.Header.Set("Authorization", "Bearer "+target.token)
+	request.Header.Set("Content-Type", "application/json")
+	response, err := target.client.Do(request)
+	if err != nil {
+		return "", fmt.Errorf("connect to remote instance: %w", err)
+	}
+	defer response.Body.Close()
+	var result struct {
+		Account api.AdminAccount `json:"account"`
+		Error   struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	decodeErr := json.NewDecoder(io.LimitReader(response.Body, 1<<20)).Decode(&result)
+	if response.StatusCode != http.StatusCreated {
+		if result.Error.Message != "" {
+			return "", fmt.Errorf("remote import failed: HTTP %d: %s", response.StatusCode, result.Error.Message)
+		}
+		return "", fmt.Errorf("remote import failed: HTTP %d", response.StatusCode)
+	}
+	if decodeErr != nil {
+		return "", fmt.Errorf("decode remote instance response: %w", decodeErr)
+	}
+	return result.Account.Label, nil
+}
+
+// readPairingToken reads pairing token from standard input, keeping it out of shell history
+func readPairingToken(input *bufio.Reader, output io.Writer) (string, error) {
+	fmt.Fprint(output, "Paste pairing token generated on remote instance accounts page: ")
+	line, err := input.ReadString('\n')
+	if err != nil && err != io.EOF {
+		return "", fmt.Errorf("read pairing token: %w", err)
+	}
+	token := strings.TrimSpace(line)
+	if token == "" {
+		return "", fmt.Errorf("pairing token cannot be empty")
+	}
+	return token, nil
+}
+
+// remoteOrigin validates remote instance address has scheme and host only; non-loopback must use HTTPS
+func remoteOrigin(raw string) (string, error) {
+	parsed, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || parsed.Host == "" || parsed.User != nil ||
+		parsed.Path != "" && parsed.Path != "/" || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return "", fmt.Errorf("--remote must be origin of remote instance, e.g. https://example.com")
+	}
+	ip := net.ParseIP(parsed.Hostname())
+	loopback := strings.EqualFold(parsed.Hostname(), "localhost") || ip != nil && ip.IsLoopback()
+	if parsed.Scheme != "https" && (parsed.Scheme != "http" || !loopback) {
+		return "", fmt.Errorf("--remote must use HTTPS; HTTP is only allowed for loopback")
+	}
+	return parsed.Scheme + "://" + parsed.Host, nil
+}
+
+func importStorageState(ctx context.Context, target accountTarget, options setupOptions) error {
 	state, err := aistudio.LoadStorageState(options.storageState)
 	if err != nil {
 		return err
@@ -91,26 +228,20 @@ func importStorageState(store *aistudio.AccountStore, options setupOptions) erro
 	} else if exists && strings.TrimSpace(extension.Source.Email) != "" {
 		label = extension.Source.Email
 	}
-
-	account, publishLease, err := store.Create(setupAccountConfig(label, options), state)
+	saved, err := target.Save(ctx, setupAccountConfig(label, options), state, "")
 	if err != nil {
 		return err
 	}
-
-	if err := publishLease.Release(); err != nil {
-		return err
-	}
-
-	fmt.Fprintf(os.Stdout, "Account saved: %s\n", account.Config.Label)
+	fmt.Fprintf(os.Stdout, "Account saved: %s\n", saved)
 	return nil
 }
 
 func importIsolatedLogin(
 	ctx context.Context,
-	store *aistudio.AccountStore,
+	target accountTarget,
 	options setupOptions,
 	driver aistudio.IsolatedLoginDriver,
-) (resultErr error) {
+) error {
 	loginDirectory, err := os.MkdirTemp("", "aistudio2api-login-*")
 	if err != nil {
 		return fmt.Errorf("create isolated login directory: %w", err)
@@ -131,33 +262,18 @@ func importIsolatedLogin(
 	if _, err := aistudio.NewSigner().Sign(result.StorageState); err != nil {
 		return fmt.Errorf("storage state cannot be used with AI Studio: %w", err)
 	}
-
-	account, publishLease, err := store.Create(setupAccountConfig(result.Email, options), result.StorageState)
+	saved, err := target.Save(ctx, setupAccountConfig(result.Email, options), result.StorageState, loginDirectory)
 	if err != nil {
 		return err
 	}
-	defer func() {
-		resultErr = errors.Join(resultErr, publishLease.Release())
-	}()
-
-	if err := camoufoxnative.PersistAccountFingerprint(loginDirectory, account.Directory); err != nil {
-		return errors.Join(err, store.Delete(account))
-	}
-	fmt.Fprintf(os.Stdout, "Account saved: %s\n", account.Config.Label)
+	fmt.Fprintf(os.Stdout, "Account saved: %s\n", saved)
 	if result.DriveError != "" {
 		fmt.Fprintf(os.Stdout, "Drive authorization failed: %s\n", result.DriveError)
 	}
 	return nil
 }
 
-func importChromeAccounts(
-	ctx context.Context,
-	cfg config.Config,
-	store *aistudio.AccountStore,
-	options setupOptions,
-	input io.Reader,
-	output io.Writer,
-) error {
+func importChromeAccounts(ctx context.Context, cfg config.Config, target accountTarget, options setupOptions, input io.Reader, output io.Writer) error {
 	root := options.chromeRoot
 	if root == "" {
 		var err error
@@ -207,13 +323,7 @@ func importChromeAccounts(
 		if !options.localeSet && result.Locale != "" {
 			accountOptions.locale = result.Locale
 		}
-
-		_, publishLease, err := store.Create(setupAccountConfig(result.Email, accountOptions), result.State)
-		if err != nil {
-			return err
-		}
-
-		if err := publishLease.Release(); err != nil {
+		if _, err := target.Save(ctx, setupAccountConfig(result.Email, accountOptions), result.State, ""); err != nil {
 			return err
 		}
 
@@ -280,15 +390,15 @@ func promptChromeAccounts(accounts []chromeauth.Account, input io.Reader, output
 func parseSetupFlags(args []string, cfg config.Config) (setupOptions, error) {
 	flags := flag.NewFlagSet("aistudio2api setup", flag.ContinueOnError)
 	flags.Usage = func() {
-		fmt.Fprintln(flags.Output(), "Chrome import:  aistudio2api setup")
-		fmt.Fprintln(flags.Output(), "File import:    aistudio2api setup --storage-state <file>")
-		fmt.Fprintln(flags.Output(), "Isolated login: aistudio2api setup --login")
+		fmt.Fprintln(flags.Output(), "Chrome import:   aistudio2api setup")
+		fmt.Fprintln(flags.Output(), "File import:     aistudio2api setup --storage-state <file>")
+		fmt.Fprintln(flags.Output(), "Isolated login:  aistudio2api setup --login")
+		fmt.Fprintln(flags.Output(), "Remote instance: add --remote <origin> to any of the above commands")
 		flags.PrintDefaults()
 	}
 
 	var profiles setupStrings
 	var emails setupStrings
-
 	flags.Var(&profiles, "profile", "Chrome profile to import, can be repeated")
 	flags.Var(&emails, "email", "Google email to import, can be repeated")
 	storageState := flags.String("storage-state", "", "Playwright storage state file")
@@ -297,7 +407,8 @@ func parseSetupFlags(args []string, cfg config.Config) (setupOptions, error) {
 	proxy := flags.String("proxy", cfg.Proxy, "Fixed HTTP, HTTPS, or SOCKS5 proxy for accounts")
 	locale := flags.String("locale", aistudio.DefaultAccountLocale(), "Account locale")
 	timezone := flags.String("timezone", aistudio.DefaultAccountTimezone(), "Account timezone")
-
+	remote := flags.String("remote", "", "Remote instance origin, accounts are uploaded to this instance")
+	token := flags.String("token", "", "Pairing token generated on remote instance accounts page; read from stdin if omitted")
 	if err := flags.Parse(args); err != nil {
 		return setupOptions{}, err
 	}
@@ -307,14 +418,20 @@ func parseSetupFlags(args []string, cfg config.Config) (setupOptions, error) {
 	}
 
 	options := setupOptions{
-		storageState: strings.TrimSpace(*storageState),
-		login:        *login,
-		chromeRoot:   strings.TrimSpace(*chromeRoot),
-		profiles:     profiles,
-		emails:       emails,
-		proxy:        strings.TrimSpace(*proxy),
-		locale:       strings.TrimSpace(*locale),
-		timezone:     strings.TrimSpace(*timezone),
+		storageState: strings.TrimSpace(*storageState), login: *login,
+		chromeRoot: strings.TrimSpace(*chromeRoot), profiles: profiles, emails: emails,
+		proxy:  strings.TrimSpace(*proxy),
+		locale: strings.TrimSpace(*locale), timezone: strings.TrimSpace(*timezone),
+		token: strings.TrimSpace(*token),
+	}
+	if strings.TrimSpace(*remote) != "" {
+		origin, err := remoteOrigin(*remote)
+		if err != nil {
+			return setupOptions{}, err
+		}
+		options.remote = origin
+	} else if options.token != "" {
+		return setupOptions{}, fmt.Errorf("--token must be used together with --remote")
 	}
 
 	flags.Visit(func(value *flag.Flag) {

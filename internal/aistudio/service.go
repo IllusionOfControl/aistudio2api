@@ -104,17 +104,22 @@ func NewWorkerProtectedTransport(options WorkerProtectedTransportOptions) (*Work
 
 // DoProtected writes fresh proof and sends GenerateContent or Build proxy requests via Camoufox
 func (t *WorkerProtectedTransport) DoProtected(ctx context.Context, request GenerateRequest, rpc RPCRequest) (*RPCResponse, error) {
-	prompt, err := bindingPrompt(request)
+	var prompt, page string
+	var err error
 	proofField := 5
 	if rpc.Method == buildProxyStreamedMethod || rpc.Method == buildProxyUnaryMethod {
 		prompt, err = buildBindingPrompt(rpc.Body)
+		page = contentsText(request.Contents)
 		proofField = buildProofField
+	} else {
+		prompt, err = bindingPrompt(request)
+		page = prompt
 	}
 	if err != nil {
 		return nil, err
 	}
 	modelID := strings.TrimPrefix(strings.TrimSpace(request.Model), "models/")
-	return t.doBrowserPrepared(ctx, prompt, proofField, AccountSelection{
+	return t.doBrowserPrepared(ctx, prompt, page, proofField, AccountSelection{
 		ModelID: modelID, Method: "generateContent", AccountID: strings.TrimSpace(request.AccountID),
 	}, rpc)
 }
@@ -122,11 +127,12 @@ func (t *WorkerProtectedTransport) DoProtected(ctx context.Context, request Gene
 func (t *WorkerProtectedTransport) doBrowserPrepared(
 	ctx context.Context,
 	prompt string,
+	page string,
 	proofField int,
 	selection AccountSelection,
 	rpc RPCRequest,
 ) (*RPCResponse, error) {
-	lease, worker, rpc, err := t.prepareProtectedRequest(ctx, prompt, proofField, selection, rpc)
+	lease, worker, rpc, err := t.prepareProtectedRequest(ctx, prompt, page, proofField, selection, rpc)
 	if err != nil {
 		return nil, err
 	}
@@ -164,6 +170,7 @@ func (t *WorkerProtectedTransport) doBrowserPrepared(
 func (t *WorkerProtectedTransport) prepareProtectedRequest(
 	ctx context.Context,
 	prompt string,
+	page string,
 	proofField int,
 	selection AccountSelection,
 	rpc RPCRequest,
@@ -181,8 +188,8 @@ func (t *WorkerProtectedTransport) prepareProtectedRequest(
 	}
 	reportRequestPhase(ctx, RequestPhasePreparingWAA)
 	prepared, err := worker.Prepare(ctx, ProtectedRequest{
-		URL: rpc.URL, Headers: rpc.Header.Clone(), Body: append([]byte(nil), rpc.Body...),
-		Prompt: prompt, ProofField: proofField,
+		URL: rpc.URL, Headers: rpc.Header.Clone(), Body: rpc.Body,
+		Prompt: prompt, PagePrompt: page, ProofField: proofField,
 	})
 	if err != nil {
 		return nil, nil, RPCRequest{}, fmt.Errorf("prepare fresh WAA proof: %w", err)
@@ -192,7 +199,7 @@ func (t *WorkerProtectedTransport) prepareProtectedRequest(
 	}
 	requestHeaders := rpc.Header
 	rpc.AccountID = lease.Account().ID
-	rpc.Body = append([]byte(nil), prepared.Body...)
+	rpc.Body = prepared.Body
 	rpc.Header = prepared.Headers.Clone()
 	for name, values := range requestHeaders {
 		rpc.Header.Del(name)
@@ -219,7 +226,7 @@ func (t *WorkerProtectedTransport) doPrepared(
 	selection AccountSelection,
 	rpc RPCRequest,
 ) (*RPCResponse, error) {
-	_, _, rpc, err := t.prepareProtectedRequest(ctx, prompt, proofField, selection, rpc)
+	_, _, rpc, err := t.prepareProtectedRequest(ctx, prompt, prompt, proofField, selection, rpc)
 	if err != nil {
 		return nil, err
 	}
@@ -253,6 +260,19 @@ func bindingPrompt(request GenerateRequest) (string, error) {
 		}
 	}
 	return strings.Join(values, " "), nil
+}
+
+// contentsText returns text across all parts joined by spaces, used as the prompt written to the page for Build requests.
+func contentsText(contents []Content) string {
+	values := make([]string, 0)
+	for _, content := range contents {
+		for _, part := range content.Parts {
+			if part.Text != "" {
+				values = append(values, part.Text)
+			}
+		}
+	}
+	return strings.Join(values, " ")
 }
 
 // RequestContext returns the account timezone
@@ -502,6 +522,10 @@ func (s *PooledService) CountTokens(ctx context.Context, request TokenCountReque
 	if modelID == "" {
 		return TokenCount{}, fmt.Errorf("%w: CountTokens model cannot be empty", ErrInvalidArgument)
 	}
+	request.System, request.Contents = normalizeTurns(request.System, request.Contents)
+	if len(request.Contents) == 0 {
+		return TokenCount{}, fmt.Errorf("%w: request contains neither system instruction nor conversation contents", ErrInvalidArgument)
+	}
 	modelAccessScope := ModelAccessKey("count-tokens", modelID)
 	selection := AccountSelection{ModelID: modelID, ModelAccessScope: modelAccessScope, Method: "countTokens"}
 	var count TokenCount
@@ -548,34 +572,44 @@ func (s *PooledService) CountTokens(ctx context.Context, request TokenCountReque
 	return count, requestErr
 }
 
+// ValidateGenerateRequest validates channel-agnostic generation parameters before account selection.
+func (s *PooledService) ValidateGenerateRequest(request GenerateRequest) error {
+	if strings.TrimPrefix(strings.TrimSpace(request.Model), "models/") == "" {
+		return fmt.Errorf("%w: GenerateContent model cannot be empty", ErrInvalidArgument)
+	}
+	request.System, request.Contents = normalizeTurns(request.System, request.Contents)
+	if len(request.Contents) == 0 {
+		return fmt.Errorf("%w: request contains neither system instruction nor conversation contents", ErrInvalidArgument)
+	}
+	request, _, err := prepareToolRequest(request)
+	if err != nil {
+		return fmt.Errorf("%w: %v", ErrInvalidArgument, err)
+	}
+	return s.client.validateGenerateRequest(request)
+}
+
 // Generate generates an event stream using an exclusive account supporting the target model
 func (s *PooledService) Generate(ctx context.Context, request GenerateRequest) (<-chan Event, error) {
 	modelID := strings.TrimPrefix(strings.TrimSpace(request.Model), "models/")
 	if modelID == "" {
 		return nil, fmt.Errorf("%w: GenerateContent model cannot be empty", ErrInvalidArgument)
 	}
-	request, contract, err := prepareToolRequest(request)
-	if err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrInvalidArgument, err)
+	request.System, request.Contents = normalizeTurns(request.System, request.Contents)
+	if len(request.Contents) == 0 {
+		return nil, fmt.Errorf("%w: request contains neither system instruction nor conversation contents", ErrInvalidArgument)
 	}
 	resourceID, err := s.pool.ResourceIDForContents(ctx, request.Contents)
 	if err != nil {
 		return nil, err
-	}
-	var channel Channel
-	nativeSchema := requestNeedsBuildSchema(request)
-	if nativeSchema && !s.pool.BuildEnabled() {
-		return nil, fmt.Errorf("%w: this structured output schema requires build channel", ErrInvalidArgument)
-	}
-	if nativeSchema || request.Unary && s.BuildNativeNonstream {
-		channel = ChannelBuild
 	}
 	selection := AccountSelection{
 		ModelID:    modelID,
 		Method:     "generateContent",
 		AccountID:  strings.TrimSpace(request.AccountID),
 		ResourceID: resourceID,
-		Channel:    channel,
+	}
+	if RequestNeedsBuildSchema(request) || request.Unary && s.BuildNativeNonstream {
+		selection.PreferredChannel = ChannelBuild
 	}
 	pinned := selection.AccountID != "" || selection.ResourceID != ""
 	if _, ok := AccountLeaseFromContext(ctx); ok {
@@ -584,13 +618,6 @@ func (s *PooledService) Generate(ctx context.Context, request GenerateRequest) (
 	var requestErr error
 	for attempt := 0; attempt < accountAttemptLimit(s.pool, pinned); attempt++ {
 		lease, owned, err := resolveAccountLease(ctx, s.pool, selection)
-		if err != nil && selection.Channel == ChannelBuild && !nativeSchema && ctx.Err() == nil {
-			var cooling *AllCoolingError
-			if errors.Is(err, ErrNoEligibleAccount) || errors.As(err, &cooling) {
-				selection.Channel = ""
-				lease, owned, err = resolveAccountLease(ctx, s.pool, selection)
-			}
-		}
 		if err != nil {
 			if requestErr != nil && errors.Is(err, ErrNoEligibleAccount) {
 				return nil, requestErr
@@ -601,7 +628,6 @@ func (s *PooledService) Generate(ctx context.Context, request GenerateRequest) (
 		request.AccountID = accountID
 		events, err := s.client.Generate(ContextWithAccountLease(ctx, lease), request)
 		if err == nil {
-			events = contract.forward(ctx, events)
 			if !owned {
 				return events, nil
 			}
@@ -811,13 +837,6 @@ func unionStrings(left []string, right []string) []string {
 	}
 	sort.Strings(result)
 	return result
-}
-
-func appendStatusError(failures []error, err error) []error {
-	if err != nil {
-		return append(failures, err)
-	}
-	return failures
 }
 
 func minimumPositive(left int64, right int64) int64 {

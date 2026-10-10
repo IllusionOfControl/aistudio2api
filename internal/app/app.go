@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"syscall"
@@ -18,6 +19,7 @@ import (
 
 	"github.com/Mag1cFall/AIStudio2API/internal/api"
 	"github.com/Mag1cFall/AIStudio2API/internal/config"
+	"github.com/Mag1cFall/AIStudio2API/internal/requestdb"
 	"github.com/Mag1cFall/AIStudio2API/internal/setup"
 	"github.com/Mag1cFall/AIStudio2API/internal/webui"
 )
@@ -67,8 +69,15 @@ func runCommand(args []string) error {
 	if err != nil {
 		return err
 	}
-
-	return errors.Join(runServer(ctx, cfg, options, manager), manager.Close())
+	ledger, err := requestdb.Open(filepath.Join("runtime", "requests.db"), func(level, message string) {
+		manager.requests.log("service", level, message)
+	})
+	if err != nil {
+		return errors.Join(fmt.Errorf("open request ledger: %w", err), manager.Close())
+	}
+	ledger.SetBodyCapture(cfg.RequestBodyLog)
+	manager.ledger = ledger
+	return errors.Join(runServer(ctx, cfg, options, manager), manager.Close(), ledger.Close())
 }
 
 // parseFlags parses CLI flags and overrides the current run configuration.
@@ -128,7 +137,7 @@ func runServer(ctx context.Context, cfg config.Config, options commandOptions, m
 		return fmt.Errorf("listen on %s: %w", cfg.ListenAddr, err)
 	}
 	apiHandler := api.NewHandler(manager, api.Config{
-		APIKey: cfg.ProxyAPIKey, Admin: manager,
+		APIKey: cfg.ProxyAPIKey, Admin: manager, Ledger: manager.ledger,
 		AdminAuthEnabled: cfg.AdminAuthEnabled, AdminUsername: cfg.AdminUsername, AdminPassword: cfg.AdminPassword,
 	})
 	server := &http.Server{
@@ -162,6 +171,10 @@ func runServer(ctx context.Context, cfg config.Config, options commandOptions, m
 		}
 	}
 
+	if cfg.AutoStart {
+		go autoStartService(ctx, manager)
+	}
+
 	select {
 	case err := <-serveError:
 		if errors.Is(err, http.ErrServerClosed) {
@@ -184,6 +197,14 @@ func runServer(ctx context.Context, cfg config.Config, options commandOptions, m
 	}
 }
 
+// autoStartService starts the generation service according to configuration after the management service is ready.
+func autoStartService(ctx context.Context, manager *runtimeManager) {
+	manager.requests.log("service", "INFO", "Auto-starting generation service")
+	if _, err := manager.StartService(ctx); err != nil && ctx.Err() == nil {
+		manager.requests.log("service", "ERROR", "Failed to auto-start generation service | error="+err.Error())
+	}
+}
+
 // rootHandler mounts the public API and internal web UI onto the same handler.
 func rootHandler(apiHandler http.Handler) http.Handler {
 	root := http.NewServeMux()
@@ -191,6 +212,7 @@ func rootHandler(apiHandler http.Handler) http.Handler {
 	root.Handle("/api/", apiHandler)
 	root.Handle("/v1/", apiHandler)
 	root.Handle("/v1beta/", apiHandler)
+	root.Handle("/upload/", apiHandler)
 	root.Handle("/", webui.Handler())
 	return securityHeaders(root)
 }

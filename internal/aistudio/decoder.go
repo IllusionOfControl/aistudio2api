@@ -20,8 +20,9 @@ type ProtocolEvidenceError struct {
 
 // PromptFeedbackError indicates that upstream rejected the prompt and returned no candidates
 type PromptFeedbackError struct {
-	Reason string
-	Raw    json.RawMessage
+	Reason  string
+	Message string
+	Raw     json.RawMessage
 }
 
 // Error returns the protocol evidence error
@@ -34,6 +35,9 @@ func (e *ProtocolEvidenceError) Error() string {
 
 // Error returns the reason for upstream prompt rejection
 func (e *PromptFeedbackError) Error() string {
+	if e.Message != "" {
+		return fmt.Sprintf("AI Studio rejected prompt: %s: %s", e.Reason, e.Message)
+	}
 	return fmt.Sprintf("AI Studio rejected prompt: %s", e.Reason)
 }
 

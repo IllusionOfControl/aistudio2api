@@ -107,9 +107,7 @@ Chrome Local State + Profile Preferences + Web Data/token_service
 
 OAuthMultilogin uses the `MultiOAuth` header. The first assertion is `DBSC_CHALLENGE_IF_REQUIRED`, and the response provides a challenge; the JWT header of the second assertion uses `ES256` and `DEVICE_BOUND_SESSION_CREDENTIALS_ASSERTION`. The payload binds the Google OAuth client, challenge, device public key issuer, and ephemeral HPKE public key. Cookie ciphertexts are decrypted using X25519, HKDF-SHA256, and AES-128-GCM.
 
-The Chrome import state preserves the source, Gaia ID, refresh token, and wrapped binding key within the `aistudio2api` extension of `storage-state.json`. Login page redirects, expired signature cookies, HTTP `401`, and protocol Code 16 enter the same authentication recovery workflow, covering worker pre-warming, on-demand startup, standard RPCs, protected RPCs, and Live connection establishment. The service prioritizes renewing cookies on the same account egress; when saved OAuth credentials are rejected, it matches the original account email and Gaia ID from the current Chrome profile to refresh the source credentials. Once valid cookies are committed, the service invalidates dynamic headers, terminates that account's WAA runtime, and retries the request once. Accounts that fail recovery are marked as `auth_required`, administrative events synchronously broadcast the account status, and subsequent scheduling selects other eligible accounts.
-
-Authentication recovery waits for in-flight normal requests on the same account to complete; concurrent invalidations reuse a single commit result. Replacing login credentials advances the authentication generation, and authentication outcomes of older requests are written back according to generation and request order; successful completion of generation confirms authentication validity. HTTP `403`, protocol Code 7, and Drive `unauthorized_client` preserve their semantic meaning for model permissions or Drive authorization. Isolated Camoufox logins and external storage states use their respective login credentials.
+The Chrome import state preserves the source, Gaia ID, refresh token, and wrapped binding key within the `aistudio2api` extension of `storage-state.json`. Login page redirects, expired signature cookies, HTTP `401`, and protocol Code 16 enter the same authentication recovery workflow, covering worker pre-warming, on-demand startup, standard RPCs, protected RPCs, and Live connection establishment. The service preferentially renews cookies on the same account egress; if saved OAuth renewal material is rejected, credentials for the same Google account email and Gaia ID are imported from the local Chrome profile. Accounts lacking the `aistudio2api` extension can also acquire materials and transition to renewal from local Chrome when signed in to the same email. Accounts requiring user interaction, invalid refresh tokens, and authentication renewal failures mark the account as `auth_required`.
 
 `storage-state.json` preserves Playwright root fields and unknown extension fields; its defined schema is shown below. `wrapped_binding_key` is a Base64-encoded JSON string representing a Go `[]byte`.
 
@@ -166,7 +164,7 @@ The root fields of `runtime-state.json` are `cooldowns`, `resources`, `model_acc
 
 Each runtime state transaction first acquires `auth/.leases/<Account>.runtime.lock`, retrying every 25ms with a maximum wait time of 2 seconds; transactions carrying a caller context (Go cancellation context) terminate immediately if the caller cancels or an earlier deadline is reached. After acquiring the lock, current on-disk values are re-read, only target fields are merged, and `runtime-state.json` is atomically replaced via a temporary file before synchronizing in-memory state and resource ownership. Lock acquisition failures, read failures, writeback failures, and unlock failures all return the original error chain.
 
-The scheduler selects candidates based on real-time model methods, capability, AccessModes, and account benefit tiers. It prioritizes warmed accounts that have already successfully invoked the target scope (the state-tracking scope for model eligibility and cooldowns), then sorts them by the target model's most recent time-to-first-event. Code 7 preserves existing account and model success records. Resident Workers prioritize accounts capable of invoking a broader range of models. When the warmed pool falls below the capacity limit, standby accounts are promoted; when all warmed accounts are busy, requests queue for concurrency slots. WAA proofs for the same account are generated sequentially, while prepared MakerSuite HTTP requests execute concurrently; the first active request acquires `.leases/<Email>.lock`, and the last releases it. Drive files, Veo operations, and artifact files always use their originating creator account.
+The scheduler selects candidates based on real-time model methods, capability, AccessModes, and account benefit tiers. It prioritizes warmed accounts that have already successfully invoked the target scope (the state-tracking scope for model eligibility and cooldowns), then sorts them by the target model's most recent time-to-first-event. Resident workers preferentially cover accounts capable of calling more models. When warmed accounts fall below the limit, standby accounts are promoted; when warmed accounts are busy, requests wait for concurrency slots. Same-account WAA proofs are generated serially, while prepared MakerSuite HTTP requests execute concurrently; the first active request acquires `.leases/<email>.lock`, and the last releases it. Drive files, Veo operations, and artifact files always use their creating account.
 
 ### Account Benefit Tiers
 
@@ -310,7 +308,7 @@ Image and video options use enum codes:
 | Video duration | `1=5s`, `2=6s`, `3=7s`, `4=8s`, `5=4s` |
 | Video resolution | `1=720p`, `2=1080p`, `3=4k`, `4=368p`, `5=360p` |
 
-Veo field 71 aspect ratio, duration, and resolution are located at sub-indices `4`, `5`, and `9`, respectively. TTS field 67 is a repeated voice row, where index `0` of each row is the voice name. Thinking field 72's default level is located at sub-index `5`.
+Veo field 71 aspect ratio, duration, and resolution are located at sub-indices `4`, `5`, and `9`, respectively; when sub-index `7` contains `3` and sub-index `9` is empty, resolutions default to official values `720p`, `1080p`, and `4k`. TTS field 67 is a repeated voice row, where index `0` of each row is the voice name. Thinking field 72's default level is located at sub-index `5`.
 
 Field 57 alias can be `["models/<ALIAS>"]` or a repeated row; when shaped as rows, take index `0` of each row and remove the `models/` prefix. The complete set of public `capability_options` keys consists of `aliases`, `voices`, `image_aspect_ratios`, `image_output_resolutions`, `video_aspect_ratios`, `video_durations_seconds`, and `video_output_resolutions`; keys without values are omitted.
 
@@ -433,6 +431,8 @@ safety settings:
 ]
 ```
 
+Each entry is `[null, null, category, threshold]`, matching Gemini API enum numbering: category `HARM_CATEGORY_HARASSMENT`=7, `HATE_SPEECH`=8, `SEXUALLY_EXPLICIT`=9, `DANGEROUS_CONTENT`=10, `CIVIC_INTEGRITY`=11; threshold `BLOCK_LOW_AND_ABOVE`=1, `BLOCK_MEDIUM_AND_ABOVE`=2, `BLOCK_ONLY_HIGH`=3, `BLOCK_NONE`=4, `OFF`=5. Non-image models default to sending categories 7-10 above as `OFF`, overridden or appended by categories in the Gemini request; image models send only categories present in the request (null if empty). Upstream returns HTTP 400 parameter errors for `HARM_CATEGORY_CIVIC_INTEGRITY` with `OFF`; other categories accept `OFF`.
+
 generation config fields:
 
 | JSON Index | Protobuf Field | Content |
@@ -448,6 +448,7 @@ generation config fields:
 | 14 | 15 | response modalities: TEXT=`1`, IMAGE=`2`, AUDIO=`3` |
 | 15 | 16 | speech config |
 | 16 | 17 | thinking config `[1, budget?, null, level]` |
+| 17 | 18 | media resolution：LOW=`1`、MEDIUM=`2`、HIGH=`3` |
 | 18 | 19 | seed |
 | 26 | 27 | image config `[aspectRatio?, imageSize?]` |
 | 31 | 32 | transcription config |
@@ -463,7 +464,9 @@ Generation parameter validation:
 | thinking level | ListModels field 72 | Low=`1`, Medium=`2`, High=`3`, Minimal=`4` |
 | thinking budget | Request value | Model capability codes include thinking budget |
 
-`reasoning_effort` / `thinkingLevel` / Anthropic `output_config.effort` accepts `none`, `minimal`, `low`, `medium`, and `high`. `none` uses a budget of 0 on models that only support thinking budget, the lowest available level on models supporting thinking level, and is ignored on models without thinking support. When a model only supports thinking budget, an explicit effort must also provide a budget; when a model only supports thinking level, an explicit budget degrades to level. If both capabilities are missing, a parameter error is returned.
+- If max output tokens exceeds the model limit, it is clamped to the model limit
+
+`reasoning_effort` / `thinkingLevel` / Anthropic `output_config.effort` accepts `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, and `max`; `xhigh` and `max` are treated as `high`, and `THINKING_LEVEL_UNSPECIFIED` is treated as unset. `none` uses a budget of 0 on models that only support thinking budget, the lowest available level on models supporting thinking level, and is ignored on models without thinking support. When a model only supports thinking budget, an explicit effort must also provide a numeric thinking budget; when a model supports thinking level, a budget converts to thinking level according to compatibility tiers (1024, 8192, 24576). Model requests lacking thinking support omit thinking configuration.
 
 response modalities:
 
@@ -476,7 +479,7 @@ response modalities:
 | image + text | `[2,1]` | Explicit combined request |
 | audio | `[3]` | speech / music route |
 
-AUDIO uses an independent output modality. JSON Schema type codes are string=`1`, number=`2`, integer=`3`, boolean=`4`, array=`5`, object=`6`; schema supports format, description, nullable, enum, items, properties, required, and field 23 `propertyOrdering`.
+AUDIO uses an independent output modality, intersecting with model capabilities when requested alongside other modalities. JSON Schema type codes are string=`1`, number=`2`, integer=`3`, boolean=`4`, array=`5`, object=`6`; schema supports format, description, nullable, enum, items, properties, required, and field 23 `propertyOrdering`.
 
 The following minimal combined request includes system, text, function declarations, generation config, WAA proof, and account timezone. Consecutive null slots are kept on the same line; see the tables above for field definitions:
 
@@ -575,6 +578,7 @@ Quick Reference for High-Frequency Paths:
 | response root | `$[0][frame]` | repeated frame |
 | candidate content | `$[0][frame][0][0][0]` | `[[parts], "model"]` |
 | candidate finish | `$[0][frame][0][0][1]` | finish reason code |
+| candidate finish message | `$[0][frame][0][0][3]` | finish message |
 | Part text | `...parts[part][1]` | text |
 | Part inline data | `...parts[part][2]` | `[mime, base64]` |
 | Part function call | `...parts[part][10]` | `[name, Struct, callId?]` |
@@ -659,7 +663,7 @@ Input statistics for OpenAI and Anthropic are computed as input + tool, while ou
 
 Anthropic streaming `message_start` writes an initial input estimate, while the final `message_delta` overrides it with the completion usage to provide authoritative input and output counts.
 
-Requests carrying stop sequences execute `CountTokens` in parallel under the same account. When the generated text matches the actual sequence, the protocol core terminates the generation stream and constructs the final usage from the `CountTokens` total input count along with already emitted text, reasoning, and tool statistics; if counting fails, it still returns the `stop_sequence` terminal state and omits usage.
+Requests carrying stop sequences execute `CountTokens` in parallel under the same account. When the generated text matches the actual sequence, the protocol core terminates the generation stream and constructs the final usage from the `CountTokens` total input count along with already emitted text, reasoning, and tool statistics; if counting fails, it still returns the `stop_sequence` finish state and omits usage.
 
 ### Finish and Errors
 
@@ -677,7 +681,9 @@ Requests carrying stop sequences execute `CountTokens` in parallel under the sam
 | 18 | missing_thought_signature | 19 | `provider_19` |
 | Other integers | `provider_<code>` | | |
 
-The root shape of an error response is `[null,[code,message,...]]`. The protocol core preserves HTTP status, protocol code, and message; public adapters map these to OpenAI, Anthropic, or Gemini error objects. Chat, Responses, Anthropic Messages, and Gemini GenerateContent output normal text from media models as text results; dedicated image endpoints require image results. HTTP/protocol errors or missing completion frames are treated as failures; upstream finish reasons are preserved as normal terminal states and mapped to each public protocol.
+generation config, safety settings, tools, and transcription configurations are validated against model catalogs loaded for each account before account selection; accepting by any account passes validation. Streaming requests wait for the first event before writing response headers: parameter errors and upstream errors before the first event return HTTP status and error objects non-streamingly; if no event arrives within 10 seconds, headers are written, and subsequent errors return as in-stream error events per protocol.
+
+The root shape of an error response is `[null,[code,message,...]]`. Rejected input returns `[null,[block_reason,null,message]]` as HTTP 400, including the rejection reason and upstream explanation. The protocol core preserves HTTP status, protocol code, and message; public adapters map these to OpenAI, Anthropic, or Gemini error objects. Chat, Responses, Anthropic Messages, and Gemini GenerateContent output normal text from media models as text results; dedicated image endpoints require image results. HTTP/protocol Code 16 and HTTP 401 trigger automatic token renewal and single retry.
 
 Specific terminal state mappings across protocols are as follows:
 
@@ -712,27 +718,15 @@ Public tool names are normalized before generating the Tool arrays described abo
 | AI Studio Tool | OpenAI Chat / Responses | Anthropic | Gemini |
 | --- | --- | --- | --- |
 | function declarations | `function` | Empty type or `custom` | `functionDeclarations` |
-| Google Search | `web_search`, `web_search_preview` | `web_search*` | `googleSearch`, `googleSearchRetrieval` |
+| Google Search | `web_search`, `web_search_preview` | `web_search_*` | `googleSearch`, `googleSearchRetrieval` |
 | Image Search | `image_search` | `image_search` | `imageSearch` |
 | URL Context | `url_context` | `web_fetch*`, `url_context*` | `urlContext` |
 | Code Execution | `code_interpreter` | `code_execution*` | `codeExecution` |
-| Google Maps | `google_maps` | `google_maps*` | `googleMaps` |
+| Google Maps | `google_maps` | `google_maps` | `googleMaps` |
 
-The specific server tool types accepted by Anthropic are:
-
-| AI Studio Tool | Anthropic Type |
-| --- | --- |
-| Google Search | `web_search_20250305` |
-| Image Search | `image_search` |
-| URL Context | `web_fetch_20250910`, `url_context` |
-| Code Execution | `code_execution_20250522`, `code_execution_20250825` |
-| Google Maps | `google_maps` |
-
-Root field 7 is encoded item-by-item according to the request declarations; function declarations and various Google tools are encoded into their corresponding Tool entries as shown in the table above. The model's supported tool scope is derived from the real-time capability code. Root field 14 is `ToolConfig`; when a request carries both function declarations and Google tools, its field 3 `include_server_side_tool_invocations` is set to `true`, allowing the upstream to execute Google tools within the same turn and return function calls.
-
-The encoder merges all function declarations into a single Tool entry; Google Search and Image Search are merged into a single search entry, occupying indices `0` and `1` of `searchTypes`, respectively; Code Execution, URL Context, and Maps each occupy one entry. Google Maps and Code Execution/URL Context form mutually exclusive tool groups; each request selects at most one of these groups.
-
-The `name` of an Anthropic server tool must be `web_search`, `image_search`, `web_fetch`, `code_execution`, `url_context`, or `google_maps`. These definitions accept only `type` and the corresponding `name`; extra options, `description`, or `input_schema` return a `400 invalid_request_error`.
+- Tools can be combined across declarations; Google Maps cannot be combined with Code Execution or URL Context
+- Tool choices `auto`, `none`, `required`, and named tools map to mode field 1 (`1=AUTO`, `2=ANY/REQUIRED`, `3=NONE`) and allowed function names field 2
+- Model capabilities gate tool declarations: models lacking `function_declarations` silently drop function declarations and tool choice; unsupported Google search tools are dropped; unknown or conflicting Google tools return an error
 
 Function JSON Structs use protobuf `Struct`/`Value` arrays: maps are represented as `[[[key,value],...]]`; `Value` oneof indices `0..5` represent null, number, string, bool, Struct, and ListValue, respectively. Object keys are sorted before encoding.
 
@@ -819,22 +813,17 @@ Structured output schema normalization rules:
 | --- | --- |
 | Explicit `null` in optional fields | Remove unset fields; `example: null` preserved as data value, `const` verified per constant rules, property names preserved |
 | Empty definition, `null`, `{}`, or `true` for 0-arg function | Object parameter structure |
-| Open `{}`, `true`, and array without item definition | Open nodes use `TYPE_UNSPECIFIED`, generation routes to Build channel |
-| `items: false` | Empty array constraint `maxItems=0`; returns argument error if set alongside positive `minItems` |
-| `not: false` | Remove empty negation constraint |
-| `not: true`, `not: {}`, root `false`, or `false` on required properties | Returns argument error forbidding all values |
-| `not: {type: "null"}` | Sets `nullable=false` |
-| String or string array in `not` | String enum exclusion constraint |
-| `$schema`, `default`, `additionalProperties`, `exclusiveMinimum`, `propertyNames`, `prefixItems` | Omitted from wire schema |
-| `type: [T, "null"]` | Root type `T` and `nullable=true` |
-| `null` branch in `anyOf` / `oneOf` | Remove `null` branch and set `nullable=true` |
-| Multiple non-null `type` values | Open root node and `anyOf` with full type set |
-| Composite Schema missing root `type` | Same-type branches infer root type; mixed types keep open root node, identical `items` written to root node |
-| Other nodes missing `type` | With `properties`: object; with `items` or `prefixItems`: array; string constraints infer string; otherwise open node |
-| Array missing `items` | Typed items in `prefixItems` form `anyOf`; others use open item node |
-| Other Schema fields | Returns `400 invalid_request` / `INVALID_ARGUMENT` |
-
-Function declarations treat the client JSON Schema as the parameter contract. Playground generates sendable parameter carriers for open nodes, mixed unions, references, numeric enums, and constants, embedding the full Schema in tool descriptions; normal expressible declarations retain original encoding, and historic calls and tool results retain original values. Build uses `parametersJsonSchema`, preserving combination branches and constraints. `strict: true` and Gemini `VALIDATED` validate the original parameter contract before returning complete tool events; upstream calls violating the contract return protocol errors.
+| Open `{}`, `true`, and array without item definition | Open nodes use `TYPE_UNSPECIFIED`, carrier types are filled for Playground and full schema appended to root description |
+| Gemini `type:"TYPE_UNSPECIFIED"` | Treated as typeless open node |
+| Non-negative integer constraint written as int64 string or `1.0` | Encoded as integer |
+| `items:false` | Empty array constraint `maxItems: 0` |
+| `prefixItems` | Converted to schema representation |
+| Open object schema `additionalProperties` | Schema mapping with open node properties |
+| Union type array (e.g., `["string", "null"]`) | Primary type with `nullable: true` |
+| Multiple non-null types in type array | Normalized to `anyOf` schema |
+| Disallowed keywords (`patternProperties`, `propertyNames`, `dependencies`, etc.) | Stripped with warning |
+| Root-level array schema | Wrapped in container object |
+| Numerical `const` in function arguments | Local type conversion preserving strict values |
 
 `auto` leaves invocation decisions to the model, and `none` omits tools. Named functions restrict declarations to a subset; Playground writes invocation requirements into generation instructions and checks actual returns, while Build uses native `functionCallingConfig`. Client tool choice mappings are as follows:
 
@@ -844,7 +833,7 @@ Function declarations treat the client JSON Schema as the parameter contract. Pl
 | Anthropic | Default, `auto`, `none` | `any`, named `tool` |
 | Gemini | Default, `AUTO`, `NONE`, `VALIDATED` | `ANY`, `allowedFunctionNames` |
 
-The function call response Part is `[name, Struct, callId?]`; the next turn's function result uses the same shape and carries back the thought signature as-is. When a tool result explicitly provides a function name, that value is preserved; when the name is missing, it is first associated by call ID with pending calls from the current turn that have not yet returned results; if unmatched and only one call remains, its name is used. Each result corresponds to one call; assistant text between calls and results does not affect the association; associations are re-established when a new round of normal conversation begins. When ambiguity exists or call records are missing, an invalid argument error is returned. Function arguments and results use JSON objects; scalar or array results are wrapped as `{"result":<VALUE>}`.
+The function call response Part is `[name, Struct, callId?]`; the next turn's function result uses the same shape and returns thought signature verbatim. When a tool result explicitly provides a function name, that name is preserved; when absent, it correlates with calls in the current turn lacking results by call ID, falling back to the single remaining call's name. Each result corresponds to one call; intermediate assistant text does not break correlation, and a new turn of normal dialogue resets correlation; ambiguities or missing call records return invalid argument errors. Function parameters and results use JSON objects; non-object values are wrapped as `{"result": <VALUE>}` to align with Gemini wire format in Build.
 
 ### Drive Uploads and File Parts
 
@@ -858,11 +847,9 @@ GenerateAccessToken ["users/me"]
   -> GenerateContent Part field 6 ["<FILE_ID>"]
 ```
 
-Drive tokens, uploads, and downloads use fixed egress endpoints belonging to the file's owning account. File IDs bound to accounts are written to `runtime-state.json`; generation requests can combine files from different accounts, where files from other accounts are temporarily copied to the account used for the current generation, and the copies are reclaimed after the request completes.
+Drive tokens, uploads, and downloads use fixed egress endpoints belonging to the file's owning account. File ID to account bindings are persisted in `runtime-state.json`; generation requests can combine files from different accounts, temporarily copying files from other accounts to the current executing account; copies from failed attempts are cleaned up immediately, while copies from successful attempts are cleaned up upon request completion.
 
-Inline attachments in generation requests are preferentially uploaded to the account used for the current generation, and the request body uses Drive file Parts. When `GenerateAccessToken` explicitly returns `401`, Code 16, and `OAuth error: unauthorized_client`, the body retains the original inline data Part, and the account continues participating in standard generation scheduling; other token errors maintain failure semantics. Uploads use the MIME type and raw byte content output by public adapters; inline GIFs have their first frame extracted and encoded as `image/png` at the adapter layer. Support for attachments such as images, audio, video, and PDFs is determined by the selected model. Plain text and external YouTube media retain their respective Part encodings.
-
-The OpenAI file endpoint receives `multipart/form-data` with `file` and `purpose`, with a single-file limit of 512 MiB. Requests with unknown content length use Drive resumable uploads with 8 MiB chunking; once uploaded, `POST /v1/files` returns a persistent file object, and `GET /v1/files/{id}` reads the filename, size, purpose, and creation time from the resource binding. Client cancellations abort the upload and release the account lease.
+Inline attachments in generation requests preferentially upload to the executing account as Drive file Parts. When `GenerateAccessToken` explicitly returns 401, Code 16, or `OAuth error: unauthorized_client`, the request preserves the original inline data Part and the account remains eligible for normal generation; other token errors fail the request and cooldown Drive operations for 15 minutes.
 
 ### Gemini 3.5 Transcribe
 
@@ -876,9 +863,7 @@ The OpenAI file endpoint receives `multipart/form-data` with `file` and `purpose
 | 8 | Repeated language codes |
 | 9 | Smart transcription, enabled with value `2` |
 
-Transcription metadata resides in response Part field 23, where subfield 1 is text, 2 is speaker label, and 3 is repeated timestamp spans. Field 2 and field 3 of each span represent the start and end times, respectively; duration/timestamp messages use seconds and nanos.
-
-`POST /v1/audio/transcriptions` accepts audio, MP4, or WebM files up to 512 MiB, with public formats including `json`, `text`, `verbose_json`, and `diarized_json`. Each account attempt creates a temporary Drive file, which is deleted on the same account once generation completes. Combining `smart_transcription` with explicit word timestamps or speaker labels returns a `400 invalid_request`.
+Transcription metadata resides in response Part field 23, where subfield 1 is text, 2 is speaker label, and 3 is repeated timestamp span. Each span's field 2 and field 3 are start and end times in seconds and nanos. Public transcription endpoints are described in "Files, Transcribe, and Media".
 
 ### Nano, TTS, and Lyria
 
@@ -890,7 +875,7 @@ These three media types reuse `GenerateContent`:
 | TTS | modalities `[3]`, speech config | Part field 3 audio chunks |
 | Lyria | modalities `[3]` | Part field 3 audio chunks |
 
-Single-voice speech config is `[[[voiceName]]]`. Multi-speaker speech config is `[null,null,[null,[[speaker,[[voiceName]]],...],mode?]]`, where mode `1` is `VERBATIM` and `2` is `CONVERSATIONAL`. Text Part field 41 is SpeechMetadata `[speaker?, style?]`; TTS models with capability code 85 require every text Part in a multi-speaker request to include a speaker, and transcript lines must not contain `## Transcript:`. Adjacent audio Parts with matching MIME types are concatenated in order of arrival. Image aspect ratio, image resolution, and TTS voice must be selected from the current model's capability options.
+Single-voice speech config is `[[[voiceName]]]`. When a TTS model request omits voice, the official default `Zephyr` is used. Multi-speaker speech config is `[null,null,[null,[[speaker,[[voiceName]]],...],mode?]]`, where mode `1` is `VERBATIM` and `2` is `CONVERSATIONAL`. Text Part field 41 is SpeechMetadata `[speaker?, style?]`; TTS models with capability code 85 require each text Part to provide a speaker, and lines omit speaker prefixes.
 
 ### Veo
 
@@ -909,7 +894,7 @@ Single-voice speech config is `[[[voiceName]]]`. Multi-speaker speech config is 
 ]
 ```
 
-The image source oneof for the starting frame is either an inline image or a Drive file. Field 1 of the creation response is the operation ID. Polling requests are `["<OPERATION_ID>"]`; field 1 of the polling response is `done`, and the artifact Drive file ID is located at `$[1][0][0][0]`. Both the operation and resulting file are bound to the creating account, and the media is subsequently downloaded via the Drive bearer token. Count, aspect ratio, duration in seconds, and resolution are validated against real-time model field 71.
+The image source oneof for the starting frame is either an inline image or a Drive file. Field 1 of the creation response is the operation ID. The polling request is `["<OPERATION_ID>"]`; polling response field 1 indicates done, and output Drive file ID is at `$[1][0][0][0]`. Both operation and result file bind to the creating account, downloaded via Drive bearer token. Aspect ratio, duration seconds, and resolution snap to the nearest supported values in live model field 71.
 
 ### Omni Interaction
 
@@ -926,7 +911,7 @@ Models with catalog field 79 type `2` that are not background tasks (`gemini-omn
 | 26 | `[[<STEP>...]]`; user steps are `[[<CONTENT>...]]`, model steps are `[null,[<CONTENT>...]]`; text content is `[[<TEXT>]]`, Drive attachment content is `[null×8,["<DRIVE_FILE_ID>"]]` |
 | 53 | Video output config `[[[null,null,null,[null,null,null,null,null,1]]]]` |
 
-The thinking level values are MINIMAL=1, LOW=2, MEDIUM=3, and HIGH=4, converted from `reasoning_effort` or the thinking budget based on the levels supported by the model, defaulting to the catalog default level. Interaction requests accept text content from user and assistant, as well as image and video attachments from the user; inline attachments are first uploaded to the selected account's Drive and then referenced by file ID (file IDs do not participate in binding). Audio attachments are rejected upstream with code 3 `Audio input modality is not enabled for this model`, which maps to HTTP 400; functions, tools, and stop sequences return invalid argument errors; `temperature`, `topP`, `topK`, and `seed` are not sent.
+Thinking level values are MINIMAL=1, LOW=2, MEDIUM=3, HIGH=4, converted from `reasoning_effort` or thinking budget according to model capabilities, defaulting to catalog default. Interaction requests accept user, assistant, and tool messages; tool messages are treated as user messages, adjacent same-role messages merge into one step, historical function calls/results and code executions are rewritten as Gemini API JSON text, and assistant attachments move to the subsequent user step; inline attachments upload to Drive, referenced by file ID which does not participate in binding. Audio streaming outputs 24 kHz 16-bit little-endian mono PCM deltas; non-streaming outputs a complete WAV or requested format.
 
 The response is `[[<EVENT>...], <STATUS>?]`. In the content delta at event index 10, field 1 is the main text, field 5 is video `[1,"<BASE64 MP4>"]`, and field 6 is the thought summary, mapping to text, `video/mp4` media, and reasoning events, respectively; the final interaction status `3` at index 19 yields usage (prompt, completion, thinking, and total tokens reside at usage indices 0, 4, 8, and 9) and a `stop` terminal state, while statuses `4` and `5` return errors. The `google.rpc` status following the event list maps to HTTP status codes by its code (quota code 8 maps to 429); errors occurring before the first text event trigger account rotation and cooldown, while subsequent errors terminate the stream with an in-stream error.
 
@@ -939,17 +924,11 @@ The official Build web app calls the MakerSuite proxy RPC via the host page to a
 ["/v1beta/models/<MODEL_ID>:generateContent", "<GEMINI_API_JSON>", "<WAA_PROOF>", "POST"]
 ```
 
-The former is dispatched to `ProxyStreamedCall`, and the latter to `ProxyUnaryCall`. The WAA proof resides in field 3, with the binding defined as the SHA-256 of the path and request body joined by a space. The entitlement header `X-AIStudio-G1-Tier` is only sent with `ProxyUnaryCall`; models requiring subscription entitlements are generated via `ProxyUnaryCall`, and the rest via `ProxyStreamedCall`. For model catalog, qualifications, scheduling and cooldown, request field mappings, response decoding, error mappings, and out-of-scope features, see [Build Channel](build.md).
+The former targets `ProxyStreamedCall`, while the latter targets `ProxyUnaryCall`. WAA proof resides in field 3, with binding computed as SHA-256 of path and body joined by space. RPC selection, headers, catalogs, eligibility, scheduling, field mappings, response decoding, error mappings, and unsupported scopes are detailed in [Build Channel](build.md). Embedding, Live, and realtime music models absent from Playground route exclusively via Build: embedding calls `:batchEmbedContents` via `ProxyUnaryCall`, and Live and realtime music route through the host page WebChannel.
 
 ### Live and Robotics WebSocket
 
-`GET /v1/live` and `GET /v1/robotics/stream` upgrade to WebSocket. The first client JSON sent after the connection is established must be a setup message:
-
-```json
-{"type":"setup","model":"gemini-3.1-flash-live-preview","input_modalities":["text"],"output_modalities":["audio"],"tools":[{"name":"get_weather","description":"Get weather","parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}],"session_token":""}
-```
-
-Live input modalities can consist of text, audio, and image, while output modalities are `["audio"]` or `["text"]`, determined by model capabilities: real-time translation models with capability code 46 output audio and require `translation`; real-time transcription models with capability code 77 output text and may include `transcription`; other Live models output audio. Robotics input and output are both text. Both endpoints use the client-provided model, and the `bidiGenerateContent` method from the real-time model catalog selects the account. The client must send the initial setup frame within 10 seconds of WebSocket establishment; upstream handshake, backchannel readiness, and setup completion share `INIT_TIMEOUT`, after which `session_opened` and `setup_complete` are sent sequentially.
+`GET /v1/live` and `GET /v1/robotics/stream` upgrade to WebSocket, where the first client frame is setup; public frames and events are detailed in "Live and Robotics Public Frames". Both endpoints use client-supplied models, selecting accounts by `bidiGenerateContent` in live catalog; models providing `bidiGenerateMusic` in Build catalog (e.g. `lyria-realtime-exp`) serve realtime music sessions. Live and realtime music models absent from Playground route via Build with matching public frames, wire format in [Build Channel](build.md). Upstream connection closes return status codes in 1000-4999 directly; unexpected closes return 1011.
 
 The upstream WebChannel consists of a handshake, forward POSTs, a long-polling backchannel, and termination. The handshake query uses `VER=8`, a random `RID`, `CVER=22`, `X-HTTP-Session-Id=gsessionid`, and `count=0`; the response header returns the gsessionid, and the first control envelope is:
 
@@ -968,26 +947,9 @@ The backchannel uses `RID=rpc`, the current SID, gsessionid, and AID. Each wire 
 
 The JSON root value contains repeated `[serverAID,payload]` envelopes. Once the payload is successfully decoded and published in order, the AID is committed as `max(currentAID,serverAID)`. Transient read failures after the initial backchannel is established retain the SID, gsessionid, and committed AID, and trigger a reconnect; initial establishment failures, terminal protocol states, explicit closes, or unrecoverable errors enter the shutdown pipeline. Session states follow `new -> handshaking -> ready -> reconnecting -> ready`, while the teardown path transitions through `closing -> closed`.
 
-Client frames:
+`tool_call` events convey single function calls; messages with multiple calls emit sequential events. `tool_call_cancellation.tool_call_ids` carries canceled IDs. New `session_resumption.session_token` values atomically replace prior tokens; subsequent setup frames carrying the token bind to the original account for resumption.
 
-| type | Fields | Description |
-| --- | --- | --- |
-| `text` | `text` | Sends text input |
-| `audio` | `mime_type: audio/pcm`, `data` | Sends PCM Base64 |
-| `image` | `mime_type: image/jpeg`, `data` | Sends JPEG Base64 |
-| `media_end` | None | Ends the current media input |
-| `tool_response` | `tool_responses` | Batches function results, preserving the invoked `id` and `name` |
-| `close` | None | Closes the logical session |
-
-`tool_response` example:
-
-```json
-{"type":"tool_response","tool_responses":[{"id":"call-1","name":"get_weather","content":{"temperature":26}}]}
-```
-
-Server events use `session_opened`, `setup_complete`, `text`, `media`, `input_transcription`, `output_transcription`, `interim_input_transcription`, `tool_call`, `tool_call_cancellation`, `interrupted`, `generation_complete`, `turn_complete`, `session_resumption`, `usage`, `go_away`, `provider`, `closed`, and `error`. `tool_call` carries a single function call; when an upstream message contains multiple calls, multiple events are dispatched sequentially. `tool_call_cancellation.tool_call_ids` carries the IDs of cancelled calls. A new `session_resumption.session_token` atomically replaces the previous token; subsequent setup messages carrying this token bind to the original account for resumption.
-
-Live pure text uses model scope, while Live audio/image and Robotics use the `bidi-media:<modelID>` scope. Upstream Code 7 is returned via an `error` event and terminates the current connection. The maximum client frame size is 8 MiB; exceeding this limit triggers WebSocket close code `1009`.
+Live plain text and realtime music use model scope; Live audio/image and Robotics use `bidi-media:<modelID>` scope, prefixed with `build:` when routed through Build. Upstream Code 7 releases scope cooldown via `bidi_quota_reset_delay`. Client disconnects release account leases immediately.
 
 The upstream Bidi client wire format uses 6-slot or 7-slot sparse arrays. Setup is located at outer field 7:
 
@@ -1071,22 +1033,27 @@ server content indices `0/1/2/4/5/6` correspond to model content, turn complete,
 | Protocol | Endpoints |
 | --- | --- |
 | OpenAI Chat | `GET /v1/models`, `GET /v1/models/{id}`, `POST /v1/chat/completions` |
-| OpenAI Responses | `POST /v1/responses` |
-| OpenAI Media | `POST /v1/images/generations`, `POST /v1/audio/speech`, `POST /v1/videos`, `GET /v1/videos/{id}`, `GET /v1/videos/{id}/content` |
-| Anthropic | `POST /v1/messages`, `POST /v1/messages/count_tokens` |
-| Gemini | `GET /v1beta/models`, `GET /v1beta/models/{model}`, `POST /v1beta/models/{model}:generateContent`, `:streamGenerateContent`, `:countTokens`, `:predictLongRunning`, `GET /v1beta/operations/{id}` |
+| OpenAI Responses | `POST /v1/responses`, `POST /v1/responses/input_tokens`, `GET /v1/responses/{id}`, `DELETE /v1/responses/{id}`, `GET /v1/responses/{id}/input_items`, `POST /v1/responses/{id}/cancel` |
+| OpenAI Embeddings | `POST /v1/embeddings` |
+| OpenAI Images | `POST /v1/images/generations`, `POST /v1/images/edits` |
+| OpenAI Speech | `POST /v1/audio/speech` |
+| OpenAI Videos | `POST /v1/videos`, `GET /v1/videos`, `GET /v1/videos/{id}`, `DELETE /v1/videos/{id}`, `GET /v1/videos/{id}/content` |
+| Anthropic Messages | `POST /v1/messages`, `POST /v1/messages/count_tokens` |
+| Anthropic Models | `GET /v1/models`, `GET /v1/models/{id}` |
+| Gemini Content | `POST /v1beta/models/{model}:generateContent`, `:streamGenerateContent`, `:countTokens` |
+| Gemini Embeddings | `POST /v1beta/models/{model}:embedContent`, `:batchEmbedContents` |
+| Gemini Videos | `POST /v1beta/models/{model}:predictLongRunning`, `GET /v1beta/operations/{id}` |
 
 Extended endpoints:
 
 | Protocol | Endpoints |
 | --- | --- |
-| OpenAI Files | `POST /v1/files`, `GET /v1/files/{id}`, `GET /v1/files/{id}/content`, `DELETE /v1/files/{id}` |
-| OpenAI Transcriptions | `POST /v1/audio/transcriptions` |
-| Realtime WebSockets | `GET /v1/live`, `GET /v1/robotics/stream` |
-
-The registration shapes for dynamic routes are `GET /v1/models/{model...}`, `GET /v1beta/models/{model...}`, `GET /v1/files/{file}`, `GET /v1/files/{file}/content`, `DELETE /v1/files/{file}`, `GET /v1/videos/{video}`, `GET /v1/videos/{video}/content`, `POST /v1beta/models/{action}`, and `GET /v1beta/operations/{operation}`; `{id}` in the endpoint tables denotes the corresponding resource identifier.
-
-Public `/v1` and `/v1beta` endpoints accept `Authorization: Bearer`, `X-API-Key`, `X-Goog-API-Key`, or `?key=`, with resolution precedence: `?key=`, `X-Goog-API-Key`, `X-API-Key`, `Authorization: Bearer`. When the configuration is empty, local API key validation is disabled; in this case, HTTP/HTTPS web page requests where `Origin` is `null` or a non-localhost, non-loopback address return 401, while clients without an `Origin` header and other URI schemes remain unrestricted. `/v1*` responses allow any origin, permitting `GET/POST/PUT/DELETE/OPTIONS` and headers: `Authorization`, `Content-Type`, `X-API-Key`, `X-Goog-API-Key`, `Anthropic-Version`, and `Anthropic-Beta`. The maximum `/v1*` request body size is approximately 684 MiB, accommodating Base64-encoded 512 MiB files.
+| OpenAI and Anthropic Files | `POST /v1/files`, `GET /v1/files`, `GET /v1/files/{id}`, `GET /v1/files/{id}/content`, `DELETE /v1/files/{id}` |
+| OpenAI Transcription & Translation | `POST /v1/audio/transcriptions`, `POST /v1/audio/translations` |
+| Realtime WebSocket | `GET /v1/live`, `GET /v1/robotics/stream` |
+| Gemini Interactions | `POST /v1/interactions`, `POST /v1beta/interactions` |
+| Gemini Files & Uploads | `POST /upload/v1beta/files`, `GET /v1beta/files`, `GET /v1beta/files/{id}`, `DELETE /v1beta/files/{id}` |
+| Gemini Models | `GET /v1beta/models`, `GET /v1beta/models/{model}` |
 
 When `ADMIN_AUTH_ENABLED=false`, the `/api` control plane requires the source address to be loopback and the `Host` to be localhost or a loopback address. Once authentication is enabled, access is granted via cookie-backed sessions issued upon providing the admin username and password. Administrative requests enforce same-origin validation and include `Cache-Control: no-store`. All responses include `X-Frame-Options: DENY`, `Content-Security-Policy: frame-ancestors 'none'`, `X-Content-Type-Options: nosniff`, and `Referrer-Policy: no-referrer`. `GET /health` returns `{"status":"ok"}`.
 
@@ -1094,14 +1061,13 @@ When `ADMIN_AUTH_ENABLED=false`, the `/api` control plane requires the source ad
 
 | Control Capability | Endpoints |
 | --- | --- |
-| Admin Authentication | `GET /api/auth/session`, `POST /api/auth/login`, `POST /api/auth/logout` |
+| Admin Auth | `GET /api/auth/session`, `POST /api/auth/login`, `POST /api/auth/logout` |
 | Status & Models | `GET /api/status`, `GET /api/models` |
-| Generation Service | `POST /api/control/start`, `POST /api/control/stop` |
-| Accounts | `GET /api/accounts`, `POST /api/accounts`, `GET/POST /api/accounts/import/chrome`, `PUT /api/accounts/{id}`, `DELETE /api/accounts/{id}` |
-| Account Authentication | `POST /api/accounts/{id}/login`, `POST /api/accounts/{id}/verify` |
-| Configuration | `GET /api/config` |
-| Cooldowns & Requests | `GET /api/cooldowns`, `GET /api/requests`, `POST /api/requests/{id}/cancel` |
-| Logs & Events | `DELETE /api/logs`, `GET /api/events` |
+| Service Controls | `POST /api/control/start`, `POST /api/control/stop` |
+| Accounts | `GET /api/accounts`, `POST /api/accounts`, `GET/POST /api/accounts/import/chrome`, `PUT /api/accounts/{id}`, `DELETE /api/accounts/{id}`, `POST /api/accounts/{id}/login`, `POST /api/accounts/{id}/verify` |
+| Remote Pairing | `POST /api/pairing`, `POST /api/pairing/accounts` |
+| Requests & Usage | `GET /api/requests`, `GET /api/requests/{id}`, `POST /api/requests/{id}/cancel`, `GET /api/requests/{id}/body`, `GET /api/usage`, `GET /api/usage/records`, `GET /api/usage/records.csv` |
+| Config & Logs | `GET /api/config`, `GET /api/logs/stream`, `DELETE /api/logs` |
 
 The admin API uses DTOs (Data Transfer Objects) to represent request, response, and event payloads. Endpoint responses:
 
@@ -1113,6 +1079,8 @@ The admin API uses DTOs (Data Transfer Objects) to represent request, response, 
 | `POST /api/accounts` | 201 | `{"account":AdminAccount}` |
 | `GET /api/accounts/import/chrome` | 200 | `{"profiles":[ChromeImportProfile,...]}` |
 | `POST /api/accounts/import/chrome` | 201 | `{"accounts":[AdminAccount,...]}` |
+| `POST /api/pairing` | 201 | `PairingToken` |
+| `POST /api/pairing/accounts` | 201 | `{"account":AdminAccount}` |
 | `PUT /api/accounts/{id}` | 200 | `{"account":AdminAccount}` |
 | `POST /api/accounts/{id}/login`, `verify` | 200 | `{"account":AdminAccount}` |
 | `DELETE /api/accounts/{id}` | 204 | Empty body |
@@ -1121,30 +1089,40 @@ The admin API uses DTOs (Data Transfer Objects) to represent request, response, 
 | `GET /api/cooldowns` | 200 | `{"cooldowns":[AdminCooldown,...]}` |
 | `GET /api/requests` | 200 | `{"requests":[AdminRequest,...]}` |
 | `POST /api/requests/{id}/cancel` | 204 | Empty body |
+| `GET /api/usage` | 200 | `UsageReport` |
+| `GET /api/usage/records` | 200 | `UsageRecordPage` |
+| `GET /api/usage/records.csv` | 200 | CSV attachment with UTF-8 BOM |
+| `GET /api/requests/{id}/body` | 200 | `RequestBody` |
 | `DELETE /api/logs` | 204 | Empty body |
-| `GET /api/events` | 200 SSE | `{"type":"<TYPE>","data":<DTO>}` |
-
-Admin DTO fields:
 
 | DTO | Fields |
 | --- | --- |
 | `AdminStatus` | `state`, `running`, `ready`, `version`, `active_requests`, `accounts` |
 | `AdminAccountCounts` | `total`, `ready`, `busy`, `cooldown`, `auth_required` |
 | `AdminAccount` | `id`, `label`, `enabled`, `state`, `proxy`, `locale`, `timezone`, `models`, `benefit_tier`, `message` |
-| `AccountCreateInput` | `proxy`, `locale`, `timezone` |
-| `AccountInput` | `label`, `enabled`, `proxy`, `locale`, `timezone` |
-| `ChromeImportProfile` | `id`, `profile`, `display_name`, `email`, `locale` |
+| `AccountCreateInput` | `label`, `storage_state`, `proxy`, `locale`, `timezone` |
+| `AccountUpdateInput` | `label`, `proxy`, `locale`, `timezone`, `enabled` |
 | `ChromeImportInput` | `account_ids`, `proxy`, `locale`, `timezone` |
-| `AdminCooldown` | `account_id`, `account_label`, `model_id`, `until`, optional `reason` |
-| `AdminRequest` | `id`, `model`, `account_id`, `account_label`, `state`, `started_at` |
-| `AdminLog` | `time`, `level`, `source`, `message`, `event`; request events include `request`, which contains `id`, `state`, HTTP `status`, `model`, `duration_ms`, `tool_calls`, `usage`, and diagnostic fields; field specifications are detailed in [logging.md](logging.md) |
-| `AdminEvent` | `type`, `data` |
+| `AccountStateInput` | `label`, `account`, `storage_state`, `runtime_state`, `fingerprint` |
+| `PairingCreated` | `token`, `origin`, `command`, `expires_at` |
+| `AdminModel` | `id`, `display_name`, `channels`, `input_token_limit`, `output_token_limit`, `methods`, `capabilities`, `capability_options`, `thinking_level`, `thinking_budget` |
+| `AdminRequest` | `id`, `path`, `method`, `model`, `account`, `channel`, `status`, `duration_ms`, `input_tokens`, `output_tokens`, `total_tokens`, `created_at` |
+| `RequestBody` | `request_id`, `path`, `method`, `model`, `time`, `request_content_type`, `response_content_type`, `request_body`, `response_body` |
 
 `AdminStatus.state` can be `STOPPED`, `LAUNCHING`, or `RUNNING`; `running` is true only when in `RUNNING` state; `ready` requires `RUNNING` and at least one account in ready or busy state; `version` is sourced from build metadata; `active_requests` represents the number of active requests in the current process registry. `AdminAccount.message` records the reason for the current state, and `models` lists the real-time catalog IDs available to that account. `until` and `started_at` use RFC 3339 JSON timestamps.
 
-The Chrome import list enumerates accounts individually based on the Gaia ID and email in `Preferences.account_info`. A single profile may contain multiple accounts, and each email is listed only once. `ChromeImportProfile.id` is formatted as `<Profile>/<Gaia ID>`; the import reads credentials from `token_service` where the service name is `AccountId-<Gaia ID>`. In the admin UI, all accounts in the list are unchecked by default, and a "Select All" option is provided. The CLI `--profile` flag imports all accounts under the specified profile, with interactive numbered options selecting individual accounts.
+`GET /api/usage` parameters:
 
-`AccountCreateInput` launches an isolated Camoufox instance for login, reading the email address directly from the AI Studio page. `ChromeImportInput.account_ids` allows selecting multiple accounts simultaneously. `AccountInput.label` must match the immutable Google email ID, `locale` and `timezone` must not be empty, and `proxy` must be an HTTP, HTTPS, or SOCKS5 origin without credentials, path, query, or fragment. Upon successful creation, import, login, or verification, the account's model catalog is immediately refreshed, and the latest account and model events are published.
+| Parameter | Meaning |
+| --- | --- |
+| `from`, `to` | Required RFC 3339 timestamps |
+| `tz` | IANA timezone, default UTC |
+| `bucket` | Bucket duration in seconds `60`, `300`, `900`, `3600`, `86400`, or `auto` |
+| `model`, `account`, `channel`, `protocol`, `state` | Dimensional filters, comma-separated values |
+| `stack` | Stacking dimension for series, default `model` |
+
+- The query window is `[from, to)`, max 90 days. `auto` selects buckets based on span duration.
+- `UsageReport` contains summary metrics, timeline time-series, rankings across dimensions, and model performance latency percentiles.
 
 The commit sequence for `PUT /api/accounts/{id}` is strictly ordered: validate the immutable email ID, acquire an exclusive lease on the account, create a new unpromoted egress, shut down the current worker and mark the new worker configuration as `pending` (unpromoted), atomically write `account.json` and update the account pool within a model catalog write lock, and subsequently promote the worker configuration, swap the egress, release the lease, and rebuild the model cache. Writing `account.json` is the sole point of durable commit. Any errors during egress creation, worker shutdown, or file write prior to commit discard the pending configuration and preserve the old configuration; any already-terminated worker is reconstructed according to the old configuration on subsequent requests. Once durably written, the new account configuration, worker configuration, and egress collectively transition to the committed state. A failure during lease release maintains this committed state while returning the original unlock error; a successful release logs completion and synchronizes the model cache.
 
@@ -1152,17 +1130,15 @@ The commit sequence for `PUT /api/accounts/{id}` is strictly ordered: validate t
 
 | Field | Read/Write & Effective Timing |
 | --- | --- |
-| `auth_states`, `proxy`, `init_timeout`, `request_timeout` | Persisted; takes effect on next generation service start |
-| `warm_worker_limit`, `max_active_workers`, `warm_startup_concurrency`, `per_account_concurrency` | Persisted; takes effect on next generation service start |
-| `temporary_chat` | Persisted; takes effect on next generation service start |
-| `build_native_nonstream` | Persisted; determines whether non-streaming requests prioritize Build on next generation service start |
-| `admin_auth_enabled`, `admin_username` | Persisted; takes effect on next management process start |
-| `admin_password` | Write-only; preserves current value if omitted, takes effect on next management process start |
-| `admin_password_set` | Response-only; indicates whether an admin password has been set |
-| `listen_addr`, `proxy_api_key` | Persisted; takes effect on next management process start |
-| `active_listen_addr`, `active_proxy_api_key` | Response-only; static value for current management process |
-| `management_restart_required` | Response-only; set when persisted listen address, API key, or admin credentials differ from the running management process |
-| `service_restart_required` | Response-only; set when persisted generation service config differs from the running generation service instance |
+| `auth_states`, `proxy`, `init_timeout`, `request_timeout` | Saved values; used upon next generation service startup |
+| `warm_worker_limit`, `max_active_workers`, `warm_startup_concurrency`, `per_account_concurrency` | Saved values; used upon next generation service startup |
+| `temporary_chat` | Saved value; used upon next generation service startup |
+| `build_native_nonstream` | Saved value; determines if non-streaming requests prioritize Build |
+| `upstream_channels` | Saved value; upstream channels for generation requests |
+| `waa_backend` | Saved value; WAA lifecycle backend |
+| `auto_start` | Auto-start generation service on application launch |
+| `request_body_log` | Store request and response bodies up to 64 KiB each, keeping latest 1000 |
+| `admin_auth_enabled`, `admin_username`, `admin_password_set` | Management auth settings; changes require application restart |
 
 `GET /api/config` returns the current runtime configuration (read-only). Configuration is loaded at startup from environment variables or `.env`, and runtime modification via the API is not supported.
 
@@ -1228,7 +1204,7 @@ POST /api/control/stop
   -> STOPPED
 ```
 
-Administrative status fields use uppercase service states: `STOPPED`, `LAUNCHING`, and `RUNNING`. Request states use `queued`, `running`, `completed`, `cancelled`, and `failed`. Video states use `queued`, `completed`, and `failed`, corresponding to progress values of `0` or `100`.
+Request status uses `queued`, `running`, `completed`, `cancelled`, and `failed`. Video operations use `queued`, `completed`, and `failed`, corresponding to progress `0` or `100`.
 
 The model catalog resides in memory for the duration of the current generation (`runtimeGeneration`, representing a single generation service instance); a new generation created by a clean Stop/Start sequence starts with an empty cache. At startup, the service establishes a public snapshot using `catalog.CachedModels()` from the current generation, immediately spawning a background `ListModels` task for each `enabled` account in `ready` or `busy` state. If the current generation's cache is non-empty, worker prewarming begins immediately. As each non-empty result arrives, it is merged into the public catalog from `CachedModels`, and updated `accounts` and `models` events are published; if the service is already `RUNNING`, this also triggers worker prewarming. The first non-empty result in a new generation unblocks the startup wait phase. When the full-account fan-out completes, an updated account and model snapshot is re-emitted if the `auth_required` set has changed, logging the number of successful syncs, non-empty responses, public models, pending retry accounts, and elapsed time. Once the first worker is ready, the current cache is re-evaluated, and the service transitions to `RUNNING` while holding the account and configuration mutation lock.
 
@@ -1236,29 +1212,34 @@ Account states:
 
 | State | Scheduling Semantics |
 | --- | --- |
-| `ready` | Credentials valid with available concurrency slots |
-| `busy` | Account is undergoing an exclusive operation, auth refresh, or has active requests; scheduling still evaluates remaining slots against `PER_ACCOUNT_CONCURRENCY` |
-| `cooldown` | Global `*` cooldown for the account is active; model-scoped cooldowns only affect candidate routing for the matching request |
+| `ready` | Valid authentication with available concurrency slots |
+| `busy` | Active exclusive operation, authentication refresh, or full request slots |
+| `cooldown` | Global `*` cooldown active |
 | `auth_required` | Account-level authentication failure |
-| `unavailable` | Currently unavailable in the runtime |
-| `disabled` | Disabled via configuration |
+| `unavailable` | Runtime currently unavailable |
+| `disabled` | Configured as disabled |
 
-Auth state updates carry `authGeneration` and `checkedAt`, applying only to results where the account object, `authGeneration` value, and timestamp match the current state; in the event of identical timestamps, `ready` takes precedence as the final state. Model access and cooldown updates carry `modelAccessGeneration` and `checked_at`, applying only when the `modelAccessGeneration` value matches and the timestamp is equal to or newer than the current state; for identical timestamps, `verified` takes precedence as the final state. `verified` indicates that the account has successfully invoked the corresponding model or capability.
+- `busy` accounts evaluate available slots per `PER_ACCOUNT_CONCURRENCY`
+- Model scope cooldowns do not alter account status, only affecting candidate routing
+
+State persistence carries `authGeneration` and `checkedAt`, applying account objects, storage states, and fingerprints to disk atomically.
 
 `ModelAccessKey(scope, model)` first strips the `models/` prefix; an empty scope returns the canonical model ID, whereas a non-empty scope returns `<scope>:<canonicalModelID>`. Capabilities map to the following keys:
 
 | Capability | Scope | Success Recording |
 | --- | --- | --- |
-| Standard Generation | `<modelID>` | Marked `verified` upon receiving the canonical `EventFinish` event |
+| Standard generation | `<modelID>` | Writes `verified` when canonical `EventFinish` arrives |
 | CountTokens | `count-tokens:<modelID>` | Clears scope cooldown, preserves standard generation eligibility |
-| Transcribe | `<modelID>` | Marked `verified` on non-empty text or segments |
-| Live Text | `<modelID>` | Marked `verified` on setup complete; each text input initiates a model qualification check |
-| Live Audio/Images | `bidi-media:<modelID>` | Media input initiates a media qualification check; Live text uses the standard model scope |
-| Robotics | `bidi-media:<modelID>` | Text input initiates a model qualification check |
+| Transcribe | `<modelID>` | Writes `verified` when text or segments are non-empty |
+| Live text | `<modelID>` | Writes `verified` on setup complete; begins model check on each text frame |
+| Live audio/image | `bidi-media:<modelID>` | Same as above |
+| Robotics | `bidi-media:<modelID>` | Same as above |
+| Veo creation | `veo` | Clears scope cooldown on operation ID |
+| Drive upload | `drive` | Clears scope cooldown on successful Drive upload |
 
 Code 7 retains the verified status of the current operation scope; authentication failures update the account-level state to `auth_required`. Non-generation failures, such as uploads or temp file cleanup errors, trigger a global `*` cooldown.
 
-Standard streaming generation writes `verified` status once the canonical `EventFinish` event is consumed. Content, reasoning, tool calls, usage, and time-to-first-token are used for output and latency metrics; stream drops, client cancellations, or errors occurring prior to a terminal state preserve the existing verification status.
+Text, reasoning, tools, usage, and first event metrics are recorded for diagnostics; mid-stream disconnects, client cancellations, or errors preserve existing verification states.
 
 A successful Bidi setup records the `checkedAt` timestamp of the lease (the account lease held for the session). Each subsequent turn that updates model qualification is assigned a strictly increasing attempt timestamp within the session; `turn_complete` consumes the corresponding attempt and records qualification. Code 7 does not update model qualification. Bidi auth successes and 401 errors follow the same attempt sequence; a late 401 returned after setup can still transition the account to `auth_required`.
 
@@ -1268,7 +1249,7 @@ The model catalog fan-out is bound to the context of the current generation serv
 
 On-demand hot replacement spawns a pending worker (a bootstrapping, unpromoted replacement worker) prior to shutting down the stale worker; the replacement becomes the active worker only after the old instance terminates cleanly. If shutting down the old instance and reclaiming the replacement worker fail simultaneously, both are retained for future cleanup, each occupying an active capacity slot; new worker creation halts once the capacity ceiling is reached. The sequence for a full generation service Stop/Start requires retrying the shutdown of the old instance before Start creates a new generation service; if the old PID fails to terminate, the stop error is returned and the original instance is preserved.
 
-Administrative status is set to `STOPPED`. In this state, generation and token-counting endpoints return `503 service_stopped`. Code 7 does not clear the success status of an account or operation scope. Worker process failures, worker replacements, and protocol Code 5 errors rebuild the current account worker and replay the request once on the same account. When candidate accounts are exhausted and no accounts match the requested method, capability, and entitlement tier, an HTTP 400 is returned: OpenAI code `account_required`, Anthropic type `invalid_request_error`, and Gemini status `INVALID_ARGUMENT`. When all accounts supporting the request require re-authentication, are unavailable, or are disabled, an HTTP 503 is returned listing each account, its state, and the root cause: OpenAI code `account_unavailable`, Anthropic type `api_error`, and Gemini status `UNAVAILABLE`.
+Worker process crashes, worker replacement, and protocol Code 5 rebuild the account worker and retry once on the same account.
 
 The pending retry set for the model catalog maintains account IDs awaiting re-synchronization. Accounts are added during the initial full-account fan-out at startup or during single-account syncs following creation, login, or verification if any error occurs or if an empty catalog is returned; they are removed once a non-empty catalog is retrieved or when the account is deleted. After background sync for all accounts completes, a single 30-second ticker is started. Each tick fans out concurrently to the sorted list of pending accounts, re-verifying at task initiation that the ID remains in the pending set. Accounts producing errors or empty catalogs remain in the set; each non-empty success immediately updates the account cache and public catalog snapshot, emits `accounts` and `models` events, and triggers worker prewarming if in `RUNNING` state. At batch completion, an updated account and model snapshot is emitted if the `auth_required` set changed; on-demand single-account synchronizations immediately emit snapshots regardless of success or failure.
 
@@ -1276,16 +1257,13 @@ Model catalog projections:
 
 | Rule | Result |
 | --- | --- |
-| OpenAI | `GET /v1/models` returns model list, `GET /v1/models/{model}` returns single matching model object |
-| Anthropic | Model list and single model lookup with `Anthropic-Version` header return Anthropic format; error responses use corresponding error format |
-| Gemini | Model names use the format `models/<ID>` |
-| Single Model Lookup | Canonical ID takes precedence over aliases; both endpoints accept `models/` prefix and live catalog aliases |
-| Multi-account identical models | Union of generation methods and capability options |
-| Multi-account token limits | Minimum positive value for input and output limits, respectively |
-| Model aliases | Sourced from `ListModels` field 57 |
-| Request matching | Candidate pool determined by model ID/alias, method, capability, AccessModes, account entitlements, and runtime state |
-| Candidate ordering | Ordered by `verified` status and time-to-first-token for the target model; unverified accounts remain eligible candidates |
-| Capability constraints | Satisfies both the endpoint-required capability and the account's real-time capabilities |
+| OpenAI | Model list and equivalent single model object |
+| Anthropic | Anthropic Models API format when `Anthropic-Version` is provided |
+| Gemini | Model name formatted as `models/<ID>` |
+| Single model lookup | Official canonical ID takes precedence over aliases |
+| Multi-account consolidation | Methods, capabilities, options, and access modes are merged as a union; `paid` is logical OR |
+| Multi-account token limits | Input and output token limits take the minimum positive values |
+| Model aliases | Derived from ListModels field 57, exposed as independent models |
 
 Complete admin model schema:
 
@@ -1332,45 +1310,51 @@ When requested with an `Anthropic-Version` header, the same route returns:
 
 ```json
 {
-  "data": [{"id":"gemini-example","type":"model","display_name":"Gemini Example","created_at":"1970-01-01T00:00:00Z"}],
+  "data": [{"type":"model","id":"gemini-example","display_name":"Gemini Example","created_at":"1970-01-01T00:00:00Z","max_input_tokens":1048576,"max_tokens":65536,"capabilities":null,"lifecycle":"active","line":null,"deprecated_at":null,"retires_at":null}],
   "has_more": false,
   "first_id": "gemini-example",
   "last_id": "gemini-example"
 }
 ```
 
-Gemini `GET /v1beta/models` returns `{"models":[...]}`, while the single-model route returns an individual object. Fields include `name`, `displayName`, `description`, `supportedGenerationMethods`, `inputTokenLimit`, `outputTokenLimit`, and optional `capabilities`, `capabilityOptions`, `accessModes`, `paid`, and `channels`.
-
-`GET /v1beta/models/{model}` resolves models strictly by canonical model ID; generation, token-counting, video, transcription, and Bidi endpoints accept both canonical IDs and aliases defined in `capability_options.aliases`. Aliases are resolved to their canonical ID prior to scheduling and upstream dispatch.
+`max_input_tokens` and `max_tokens` take live catalog limits (null when missing). `limit` is an integer 1-1000 (default all). `after_id` and `before_id` paginate with `has_more`, `first_id`, and `last_id`. `lifecycle` returns empty when active is excluded. Single model lookup matches list item formatting.
 
 In the admin model object, `description`, token limits, capabilities, capability options, access modes, and false `paid` flags use `omitempty`. OpenAI and Gemini responses always include model identity, methods, and token limits, appending extended fields when maps/slices are non-empty or when `paid=true`.
 
-The admin catalog aggregates the live upstream model sets across all accounts, sorted by ID. The public catalog exposes models for which at least one enabled account possesses access entitlements and whose call methods are supported by the public protocols. When the Build channel is enabled, it also includes Build-exclusive generative models, with `channels` listing the viable channels for invoking the model, as detailed in [Build Channel](build.md). Transient cooldowns and busy states are managed by request scheduling. When identical model IDs exist across multiple accounts, methods, capabilities, capability options, and access modes are merged as unions, `paid` uses logical OR, and positive token limits adopt the minimum value. Scheduling evaluates upstream methods, capabilities, access modes, account tiers, and the current runtime state.
+The management catalog merges live models across all accounts, sorted by ID. The public catalog contains models accessible by at least one enabled account with public protocol support; enabling Build includes Build-exclusive generatable models with `channels` indicating availability, see [Build Channel](build.md). Transient cooldowns are handled during request scheduling.
 
 Primary request formats:
 
 | Endpoint | Required Fields | Primary Result |
 | --- | --- | --- |
-| `/v1/chat/completions` | `model`, non-empty `messages` | Chat completion or incremental chunks |
-| `/v1/responses` | `model`, `input` | Response object or `response.*` events |
-| `/v1/files` | multipart `file`, `purpose` | OpenAI file object |
-| `/v1/messages` | `model`, non-empty `messages`, `max_tokens` | Anthropic message or message events |
-| `:generateContent` / `:streamGenerateContent` | non-empty `contents` | Gemini candidates, usage, and grounding metadata |
-| `/v1/images/generations` | `model`, `prompt`, fixed `n=1` | `b64_json` or data URL |
-| `/v1/audio/speech` | `model`, `input` | WAV, PCM, or MP3 payload |
-| `/v1/audio/transcriptions` | multipart `file`; `model` defaults to `gemini-3.5-transcribe` | Text or transcription JSON |
-| `/v1/videos` | `model`, `prompt` | Long-running operation object, followed by polling and content download |
-
-Anthropic assistant prefill is indicated by a trailing `assistant` text message. The adapter places the prefix into the continuation instruction, and the response body returns only the content following the prefix.
+| `/v1/chat/completions` | `model` | Chat completion or streaming delta chunks |
+| `/v1/responses` | `model` | Response object or `response.*` events |
+| `/v1/responses/input_tokens` | `model` or `previous_response_id` | `{"object":"response.input_tokens","input_tokens":<INT>}` |
+| `/v1/files` | multipart `file`, optional `purpose` | File object |
+| `/v1/files/{id}` | - | File object or deleted acknowledgment |
+| `/v1/files/{id}/content` | - | Raw binary content stream |
+| `/v1/audio/transcriptions` | multipart `file`, `model` | Transcription text or structured object |
+| `/v1/audio/translations` | multipart `file`, `model` | Translation text or structured object |
+| `/v1/audio/speech` | `model`, `input`, `voice` | Binary audio stream |
+| `/v1/images/generations` | `model`, `prompt`, `n`, `size` | Image generation data object |
+| `/v1/images/edits` | `model`, `prompt`, image/mask | Image generation data object |
+| `/v1/videos` | `model`, `prompt`, `seconds`, `size` | Video operation object |
+| `/v1/videos/{id}` | - | Video operation object or deleted acknowledgment |
+| `/v1/videos/{id}/content` | - | Raw MP4 video binary stream |
+| `/v1beta/models/{model}:predictLongRunning` | `instances` | Long-running operation object |
+| `/v1beta/operations/{id}` | - | Long-running operation object |
 
 The four generation entry points share a canonical request format, with input parameters mapped as follows:
 
 | Capability | OpenAI Chat | OpenAI Responses | Anthropic | Gemini |
 | --- | --- | --- | --- | --- |
 | system | `system` / `developer` messages | `instructions` and system/developer message items | `system` string or text blocks | `systemInstruction` text parts |
-| text | String or text content part | String, message item | String or text block | Part `text` |
-| image/document | Base64 data URL, `file_id` | `input_image`, `input_file` | Base64 source or URL source | `inlineData`, `fileData` |
-| audio input | `input_audio` Base64 | `input_audio` in message content | Base64 document source | `inlineData` |
+| text | string or text content part | string, message item | string or text block | Part `text` |
+| image/document | Base64 data URL, `file_id` | `input_image`, `input_file` | `image`, `document` source blocks | `inlineData`, `fileData` |
+| audio | `input_audio` | `input_audio` item | `audio` source blocks | `inlineData`, `fileData` |
+| video | `video_url`, YouTube URL, `file_id` | `input_video` item | `video` source blocks | `fileData` |
+| tool calls | `tool_calls` array | `function_call`, `custom_tool_call` items | `tool_use`, `server_tool_use` blocks | `functionCall` parts |
+| tool results | `tool` role message | `function_call_output`, `custom_tool_call_output` items | `tool_result`, `web_search_tool_result` blocks | `functionResponse` parts |
 | YouTube | `video_url` / `input_video` | `input_video` | URL source | `fileData.fileUri` |
 | function call | Assistant `tool_calls` | `function_call` item | `tool_use` block | `functionCall` Part |
 | function result | Tool message | `function_call_output` item | `tool_result` block | `functionResponse` Part |
@@ -1391,25 +1375,9 @@ Generation parameter mapping:
 | Anthropic max tokens | `max_tokens` maps to generation config field 4 |
 | Gemini max tokens | `maxOutputTokens` maps to generation config field 4 |
 | temperature / topP / topK / seed | Map to generation config fields 5 / 6 / 7 / 19 |
-| stop sequence | Maps to generation config field 2 |
-| stop sequence match | Core protocol matches against the content stream and returns the exact matched sequence |
-| structured output | MIME type maps to field 8, Schema maps to field 9 |
-| OpenAI Chat `n` | Accepts only omitted or `1` |
-| OpenAI Chat `parallel_tool_calls` | Omitted/`true` allows parallel; `false` requires at most one function call in this turn |
-| OpenAI Chat `logprobs` / `logit_bias` | Accepts only omitted or `false`, and omitted or empty object, respectively |
-| OpenAI Chat frequency / presence penalty | Accepts only `0` |
-| OpenAI Chat function `strict` | `true` validates returned arguments against JSON Schema |
-| Responses `parallel_tool_calls` | Written to response metadata; `false` requires at most one function call in this turn |
-| Responses `truncation` | `auto` removes earliest complete conversation turns according to upstream token count, preserving latest turn and paired tool calls/results; omitted/`disabled` retains full input |
-| Responses function `strict` | `true` validates returned arguments against JSON Schema |
-| Responses `store` | When omitted or `true`, persists the session node in the current process; `false` returns only the immediate result |
-| Gemini frequency / presence penalty | Accepts only `0` |
-| Gemini `candidateCount` | Accepts only omitted or `1` |
-| Gemini `responseLogprobs` / `logprobs` | Accepts only omitted or `false`, and omitted or `0`, respectively |
-| Gemini `googleSearchRetrieval` | Accepts only an empty object; `dynamicRetrievalConfig` returns `400 INVALID_ARGUMENT` |
-| Anthropic `thinking` | `enabled` supplies `budget_tokens`; models supporting thinking budgets map the budget directly, while models supporting only thinking levels map values <= 0, 1024, 8192, and above to minimal, low, medium, and high, respectively; `adaptive` applies default model thinking |
-| Anthropic thinking capability | Returns `invalid_request_error` if the model supports neither thinking budgets nor thinking levels; non-streaming calls return HTTP 400, streaming calls return an Anthropic error event |
-| Anthropic thinking type | `disabled` applies minimal thinking configuration and hides thought body while retaining thought signatures; unrecognized types return `400 invalid_request_error` |
+| stop sequences | Maps to generation config field 8 |
+| safety settings | Gemini `safetySettings` maps to root field 3; image routes omit defaults |
+| structured outputs | `response_format`, `output_format`, or `responseSchema` encoded as JSON Schema |
 
 ### OpenAI Chat Completions
 
@@ -1418,26 +1386,18 @@ Generation parameter mapping:
 | Field | Type and Semantics |
 | --- | --- |
 | `model` | Required model ID |
-| `messages` | Required non-empty message array |
+| `messages` | Array of message objects |
 | `stream` | boolean |
-| `stream_options.include_usage` | Send a usage-only chunk after the finish chunk |
-| `tools` | Array of functions or Google server tools |
-| `tool_choice` | Omitted / `auto` / `none` / `required`, or named function object |
-| `web_search_options` | Object; enables Google Search; search depth and approximate location written to search instructions |
-| `temperature`, `top_p` | Optional sampling parameters |
-| `max_tokens`, `max_completion_tokens` | The latter takes precedence |
-| `frequency_penalty`, `presence_penalty` | Omitted or `0` |
-| `n` | Omitted or `1` |
-| `parallel_tool_calls` | Omitted / `true` / `false` |
-| `logprobs` | Omitted or `false` |
-| `logit_bias` | Omitted, `null`, or empty object |
-| `stop` | string or string array; empty strings are removed from the conditions |
-| `response_format` | `{type:"text"}`, `{type:"json_object"}`, or `{type:"json_schema",json_schema:{schema}}` |
-| `reasoning_effort` | Thinking effort |
-| `reasoning.effort` | Nested thinking effort; maps to the same configuration as the top-level field |
-| `seed` | 64-bit integer |
-
-Message fields are `role`, `content`, optional `name`, `tool_call_id`, and `tool_calls`. Assistant tool call:
+| `stream_options.include_usage` | Emit usage-only chunk after finish chunk |
+| `tools` | Array of functions, custom tools, or Google server tools |
+| `tool_choice` | Omitted / `auto` / `none` / `required`, named function, or `allowed_tools` |
+| `web_search_options` | Search configuration parameters |
+| `response_format` | `text`, `json_object`, or `json_schema` |
+| `reasoning_effort` | `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max` |
+| `temperature`, `top_p`, `seed` | Sampling parameters |
+| `max_completion_tokens`, `max_tokens` | Output token limits |
+| `stop` | string or string array |
+| `media_resolution` | `low`, `medium`, `high` input resolution |
 
 ```json
 {
@@ -1453,14 +1413,11 @@ Message fields are `role`, `content`, optional `name`, `tool_call_id`, and `tool
 | `type` | Other Fields |
 | --- | --- |
 | `text`, `input_text`, `output_text` | `text` |
-| `image_url`, `input_image` | `image_url` string or `{"url":"..."}` |
+| `image_url`, `input_image` | `image_url` string or `{"url":"..."}`; or `file_id` |
 | `video_url`, `input_video` | `video_url` string or `{"url":"..."}` |
 | `input_file`, `file` | `file_id`, or `filename` + `file_data` |
-| `input_audio` | `input_audio.data`, `input_audio.format` |
-
-When the OpenAI `image_url` / `input_image` value is a Base64 data URL, it forms inline data; when it is a YouTube URL, it forms external media; other non-data strings are resolved as uploaded file IDs. The adapter does not download standard HTTP image URLs. `video_url` / `input_video` only accepts YouTube URLs. `file_data` accepts a Base64 data URL or an uploaded file ID.
-
-Function tools use `{"type":"function","function":{"name","description","parameters","strict"}}`. `strict: true` enables parameter contract validation. Google tool types are `web_search`, `web_search_preview`, `image_search`, `url_context`, `code_interpreter`, and `google_maps`.
+| `input_audio` | `input_audio: {data, format}` |
+| `refusal` | Text content part |
 
 Non-streaming response:
 
@@ -1480,6 +1437,7 @@ Non-streaming response:
       "tool_calls": [],
       "annotations": []
     },
+    "logprobs": null,
     "finish_reason": "stop",
     "provider_finish_reason": "provider_19"
   }],
@@ -1496,14 +1454,11 @@ Non-streaming response:
 
 Chat SSE sequence:
 
-1. Role chunk: `delta={"role":"assistant","content":""}`
-2. Body `delta.content`, reasoning `delta.reasoning_content`, tools `delta.tool_calls`, media or code rendering `delta.content`
-3. Citations `delta.annotations`
-4. Finish chunk: `finish_reason`, optional `provider_finish_reason`
-5. When `include_usage=true` and upstream usage is present, a usage-only chunk with `choices:[]` is sent
-6. `data: [DONE]`
-
-Each standard chunk is `{id,object:"chat.completion.chunk",created,model,choices:[{index,delta,finish_reason}],usage?}`. Failures occurring after response headers have been sent are emitted as `data: {"error":{"message","type","code"}}`.
+1. Role chunk for each choice: `delta={"role":"assistant","content":""}`
+2. Content in `delta.content`, reasoning in `delta.reasoning_content`, tool calls in `delta.tool_calls`
+3. Citations in `delta.annotations` at choice conclusion
+4. Finish chunk with `finish_reason` and optional `provider_finish_reason`
+5. Final chunk with `usage` when `include_usage=true`
 
 ### OpenAI Responses
 
@@ -1515,36 +1470,55 @@ Each standard chunk is `{id,object:"chat.completion.chunk",created,model,choices
 | `input` | string or array of input items |
 | `instructions` | Top-level system instructions |
 | `stream` | boolean |
-| `tools`, `tool_choice` | function, namespace, and Google tools; functions within a namespace are encoded with qualified names, outputs recover `namespace` and original function name, and distinct namespaces may declare identical function names; choice supports auto/none/required/named function |
-| `temperature`, `top_p`, `max_output_tokens` | Generation parameters |
+| `tools`, `tool_choice` | function, custom, namespace, local_shell, shell, apply_patch, and Google tools; choice supports auto/none/required, named tools, and managed types |
+| `temperature`, `top_p`, `max_output_tokens` | Sampling parameters |
+| `truncation` | Context truncation policy |
+| `media_resolution` | Media resolution specification |
 | `reasoning` | `{"effort":"..."}` |
 | `text` | `{"format":{"type":"text|json_object|json_schema","schema":...}}` |
 | `previous_response_id` | Previously saved response ID within current process |
 | `parallel_tool_calls` | Omitted / `true` / `false` |
 | `truncation` | Omitted / `disabled` / `auto` |
 | `metadata` | string-to-string object |
-| `store` | Omitted / `true` to persist the node; `false` to return the current result only |
+| `store` | Omitted / `true` / `false` |
+| `background` | boolean |
 
-Input item fields are `type`, `role`, `content`, `call_id`, `name`, `namespace`, `arguments`, `output`, and `encrypted_content`. Supports message, `function_call`, `function_call_output`, and reasoning items. Message content Parts:
+- Namespaced functions encode with qualified names, restored on output
+- `store` saves session nodes in-process when true or omitted; false returns one-off results
+- `background: true` executes within current connection and returns completed response, saved regardless of `store`
+
+Input items have `type`, `id`, `role` fields:
 
 | type | Fields |
 | --- | --- |
 | `input_text`, `output_text` | `text` |
-| `input_image` | `image_url` string or `{url}` |
-| `input_file` | `file_id`, or `filename` + `file_data` |
-| `input_audio` | `input_audio:{data,format}` |
+| `input_image` | `image_url` string or `{url}`; or `file_id` |
+| `input_file` | `file_id`, `file_url`, or `filename` + `file_data` |
+| `input_audio` | `input_audio: {data, format}` |
 | `input_video` | `video_url` string or `{url}` |
+| `refusal` | Text message content |
 
 Image, video, and file Parts in Responses reuse the data URL, file ID, and YouTube rules described above.
 
-Responses tool fields:
+Additional input item mappings:
+
+| item | Mapping |
+| --- | --- |
+| system/developer message | Text enters system instructions, images and files move to first user turn |
+| `custom_tool_call` | Function call with arguments `{"input": <INPUT>}` |
+| `local_shell_call` | `local_shell` call with action omitting `type` |
+| `shell_call` | `shell` call with action argument |
+| `apply_patch_call` | `apply_patch` call with patch argument |
+| `function_call_output` | Tool result with matching call ID |
+| `custom_tool_call_output` | Output string or object |
 
 | tool type | Fields |
 | --- | --- |
 | `function` | `name`, `description`, `parameters`, `strict` |
-| `web_search`, `web_search_2025_08_26`, `web_search_preview`, `web_search_preview_2025_03_11` | `search_context_size`, `user_location`, and `filters.allowed_domains` act as search instructions; domain restrictions use `site:` queries; upstream grounding queries and sources are returned verbatim |
+| `web_search*` | `search_context_size`, `user_location`, `filters.allowed_domains` |
 | `image_search`, `url_context`, `google_maps` | `type` |
-| `code_interpreter` | `container` can be omitted, `"auto"`, or `{"type":"auto","file_ids":[]}`; non-empty `file_ids` returns 400 |
+| `code_interpreter` | Container definition |
+| `local_shell`, `shell`, `apply_patch` | System developer tools |
 
 The response shell fields are always present:
 
@@ -1582,12 +1556,11 @@ Output item union types:
 
 | type | Fields |
 | --- | --- |
-| `reasoning` | `id`, `status`, `summary:[{type:"summary_text",text}]`, optional `encrypted_content` |
-| `message` | `id`, `status`, `role:"assistant"`, `content:[{type:"output_text",text,annotations}]` |
+| `reasoning` | `id`, `status`, `summary: [{type: "summary_text", text}]`, optional `encrypted_content` |
+| `message` | `id`, `status`, `role: "assistant"`, `content: [{type: "output_text", text, annotations}]` |
 | `function_call` | `id`, `status`, `call_id`, `name`, `arguments` |
-| `code_interpreter_call` | `id`, `status`, `code`, `container_id:"aistudio"`, `outputs:[{type:"logs",logs}]` |
-| `image_generation_call` | `id`, `status`, Base64 `result` |
-| `web_search_call` | `id`, `status`, `action` |
+| `custom_tool_call` | `id`, `status`, `call_id`, `name`, `input` |
+| `local_shell_call`, `shell_call`, `apply_patch_call` | Tool call output objects |
 
 `web_search_call.action` is `{"type":"search","query":"...","sources":[{"type":"url","url":"..."}]}`, where queries are deduplicated by their first appearance and sources are deduplicated by URI. `code_interpreter_call.status` is `incomplete` when there are no results, `completed` on success, and `failed` for non-`OUTCOME_OK` outcomes; stdout is written to `outputs[].logs`, and failure text is prefixed with `stderr:`. Streaming `output_item.added` uses `in_progress`, and the corresponding `output_item.done` uses the final status.
 
@@ -1609,23 +1582,11 @@ Every Responses SSE payload contains `type` and a monotonically increasing `sequ
 | --- | --- |
 | `response.created`, `response.in_progress` | `response` shell |
 | `response.output_item.added`, `response.output_item.done` | `output_index`, `item` |
-| `response.reasoning_summary_part.added`, `response.reasoning_summary_part.done` | `item_id`, `output_index`, `summary_index`, `part` |
-| `response.reasoning_summary_text.delta` | `item_id`, `output_index`, `summary_index`, `delta` |
-| `response.reasoning_summary_text.done` | Indices listed above and `text` |
-| `response.content_part.added`, `response.content_part.done` | `item_id`, `output_index`, `content_index`, `part` |
-| `response.output_text.delta` | `item_id`, `output_index`, `content_index`, `delta`, `logprobs:[]` |
-| `response.output_text.done` | Indices listed above, `text`, `logprobs:[]` |
-| `response.output_text.annotation.added` | `item_id`, `output_index`, `content_index`, `annotation_index`, `annotation` |
-| `response.function_call_arguments.delta` | `item_id`, `output_index`, `delta` |
-| `response.function_call_arguments.done` | `item_id`, `output_index`, `arguments`, `name` |
-| `response.image_generation_call.in_progress`, `response.image_generation_call.completed` | `item_id`, `output_index` |
-| `response.code_interpreter_call.in_progress`, `response.code_interpreter_call.interpreting`, `response.code_interpreter_call.completed` | `item_id`, `output_index` |
-| `response.code_interpreter_call_code.delta` | `item_id`, `output_index`, `delta` |
-| `response.code_interpreter_call_code.done` | `item_id`, `output_index`, `code` |
-| `response.web_search_call.in_progress`, `response.web_search_call.searching`, `response.web_search_call.completed` | `item_id`, `output_index` |
-| `response.completed`, `response.incomplete`, `response.failed` | Full `response` |
-
-When a web search occurs, the search call item precedes the message; if there is no grounding query, only the message is output. Deltas generated prior to `response.failed` retain their original ordering.
+| `response.reasoning_summary_part.added`, `done` | `item_id`, `output_index`, `summary_index`, `part` |
+| `response.reasoning_summary_text.delta` | Text delta in reasoning summary |
+| `response.output_text.delta` | Main output text delta |
+| `response.function_call_arguments.delta` | Function arguments streaming delta |
+| `response.completed` | Final completed response object |
 
 ### Anthropic Messages
 
@@ -1634,45 +1595,39 @@ When a web search occurs, the search call item precedes the message; if there is
 | Field | Type & Semantics |
 | --- | --- |
 | `model` | Required model ID |
-| `messages` | Required non-empty array of `{role,content}`; role can be `user`, `assistant`, or `system`; `system` messages are sent in-place as user content wrapped in `<system-reminder>` |
-| `system` | string or array of text blocks |
-| `max_tokens` | Required positive integer |
+| `messages` | `{role, content}` array (`user`, `assistant`, `system`) |
+| `system` | string or text block array |
+| `max_tokens` | Positive integer, defaults to model output limit |
 | `stop_sequences` | string array |
 | `stream` | boolean |
-| `temperature`, `top_p`, `top_k` | Generation parameters |
-| `tools`, `tool_choice` | custom/server tools and auto/none/any/named tool; custom tool accepts strict, client caching, and loader hints |
-| `thinking` | `{type:"enabled",budget_tokens:<INT>}`, `{type:"adaptive"}` or `{type:"disabled"}` |
-| `output_config` | `{effort:"..."}` |
-
-Message content can be a string or an array of blocks:
+| `temperature`, `top_p`, `top_k` | Sampling parameters |
+| `tools`, `tool_choice` | custom and managed tools |
+| `output_config.effort` | Reasoning effort |
+| `media_resolution` | Input media resolution |
 
 | Block Type | Fields |
 | --- | --- |
 | `text` | `text` |
 | `thinking` | `thinking`, `signature` |
 | `redacted_thinking` | `data` |
-| `image`, `document` | `source:{type,media_type,data,url}` |
+| `image`, `document` | `source: {type, media_type, data, url, file_id, content}` |
 | `tool_use` | `id`, `name`, object `input` |
 | `tool_result` | `tool_use_id`, `content`, `is_error` |
-| `server_tool_use` | `id`, `name:"web_search"`, `input:{query}` |
-| `web_search_tool_result` | `tool_use_id`, `content:[{type:"web_search_result",url,title,encrypted_content,page_age}]` |
-
-For `image` / `document`, Base64 sources use `type:"base64"`, `media_type`, and `data`; URL sources use `type:"url"` with a non-empty `url`. When media type is omitted, `image` defaults to `image/*` and `document` defaults to `application/pdf`. `tool_result.is_error=true` wraps valid JSON content into `{"error":<CONTENT>}`; plain scalar or array results are wrapped into `{"result":<CONTENT>}`.
+| `server_tool_use` | `id`, `name`, `input` |
+| `web_search_tool_result` | Web search citations and source blocks |
 
 A custom tool is defined as `{name,description,input_schema}`, with an optional `type:"custom"`. Server tool fields:
 
 | type | Required name |
 | --- | --- |
-| `web_search_20250305` | `web_search` |
+| `web_search_*` | `web_search` |
 | `image_search` | `image_search` |
-| `web_fetch_20250910` | `web_fetch` |
-| `code_execution_20250522`, `code_execution_20250825` | `code_execution` |
+| `web_fetch_*` | `web_fetch` |
+| `code_execution_*` | `code_execution` |
 | `url_context` | `url_context` |
 | `google_maps` | `google_maps` |
 
-`web_search_20250305` accepts `max_uses`, with the actual invocation count determined upstream.
-
-Server tools accept only their corresponding `type` and `name`. Providing `description`, `input_schema`, or extra options returns `invalid_request_error`. Tool choice accepts omitted, `{"type":"auto"}`, `{"type":"none"}`, `{"type":"any"}`, and `{"type":"tool","name":"FUNCTION_NAME"}`. Client hints such as `cache_control` on custom tools preserve generation capabilities, and `strict: true` validates complete returned parameters.
+`web_search_*` options map `allowed_domains` and `user_location` to search preferences. `bash_*`, `text_editor_*`, and `memory_*` declare functions using request names with standardized parameters.
 
 Non-streaming response:
 
@@ -1699,7 +1654,7 @@ Content output blocks can be `text`, `thinking`, `redacted_thinking`, `tool_use`
 
 Media in Anthropic responses is encoded as Markdown data URLs within text blocks, and code is encoded as fenced text. Each deduplicated Google Search query generates a pair of `server_tool_use` and `web_search_tool_result`; results are deduplicated by URL, with the sources covering all queries from this search. `usage.server_tool_use.web_search_requests` records the upstream-reported deduplicated query count, and `web_fetch_requests` is `0`. Other citations, such as URL Context, append a Markdown `Sources:` list at the end.
 
-The `encrypted_content` of search sources is generated by this service, preserving the upstream URL, title, and available snippets. The client passes back the two correlated search blocks as-is in the subsequent assistant message; the service uses the same `PROXY_API_KEY` to restore the source context. If the API key is changed, previous search contexts return `400 invalid_request_error`. This field is used for multi-turn sessions within this service and is managed separately from Anthropic's source tokens.
+Search sources generate `encrypted_content` containing upstream URLs, titles, and snippets. Client roundtrips reconstruct text continuation with queries formatted as `Web search: <query>`, results appended in the same text block, and snippets decrypted when matching `PROXY_API_KEY`. Failed searches format as `Web search failed: <error_code>`.
 
 Anthropic SSE:
 
@@ -1734,22 +1689,27 @@ The delta union type includes `text_delta{text}`, `thinking_delta{thinking}`, `s
 
 | Field | Mapping |
 | --- | --- |
-| `input` | String, single content block, array of content blocks, or array of steps; content types include `text`, `image`, `audio`, `video`, `document` |
-| Media content | Either `mime_type` with `data` (Base64) or `uri`, reusing Gemini file and inline media parsing |
-| Input steps | `user_input`, `model_output`, `thought`, `function_call`, `function_result`; function results match historical calls via `call_id` |
-| `system_instruction` | System instruction for the current request |
-| `generation_config` | `temperature`, `top_p`, `top_k`, `max_output_tokens`, `seed`, `stop_sequences`, `thinking_level`, `thinking_summaries`, `speech_config`, `tool_choice` |
-| `response_format` | Single object or array; text uses `{type:"text",mime_type:"application/json",schema:{...}}` to request structured output; image uses `{type:"image",aspect_ratio?,image_size?}` |
-| Voice config | `speech_config:[{voice}]`; multi-speaker uses `{speakers:[{speaker,voice}],mode?}`, where `mode` is `verbatim` or `conversational` |
-| Voice text | `{type:"speech_metadata",speaker?,style?}` in text block `annotations` preserves speaker and style |
-| Functions & tools | `tools:[{type:"function",name,description?,parameters?}]`; also accepts `google_search`, `url_context`, `code_execution`, `google_maps`; `tool_choice` is `auto` or `none` |
-| Continuation | Saved by default; `previous_interaction_id` reconstructs prior content, `store:false` returns only the current response; the current service instance retains up to 256 response nodes |
-
-Audio output is 24 kHz, 16-bit little-endian, mono. Non-streaming defaults to `audio/wav`, while streaming defaults to `audio/l16`; an explicit WAV stream sends a single valid WAV chunk once audio aggregation completes. `sample_rate` can be omitted or set to `24000`, and `delivery` can be omitted or set to `inline`. Creation requests execute within the current connection; `background` can be omitted or set to `false`.
+| `input` | string, content block, or step array (`text`, `image`, `audio`, `video`, `document`) |
+| media content | `data` (Base64) or `uri`, optional `mime_type` |
+| input steps | `user_input`, `model_output`, `thought`, `function_call`, `function_result`, `code_execution_call`, `code_execution_result` |
+| `system_instruction` | System prompt string or block |
+| `generation_config` | Sampling, thinking, and modal options |
+| `tools`, `tool_choice` | Function declarations and tool choices |
+| `response_format` | Response modal formats (type and MIME) |
 
 Non-streaming responses contain `id`, `object:"interaction"`, `model`, `created`, `updated`, `status`, `steps`, and `usage`. `model_output.content` in `steps` stores text or media, with audio located in `{type:"audio",data,mime_type,sample_rate,channels}`; SDK `output_audio` and `output_text` are read from these steps. Function calls are returned as `function_call` steps with status `requires_action`; normal generation yields `completed`, while early termination like output limit exhaustion yields `incomplete`.
 
 SSE uses matching event names and JSON `event_type`: `interaction.created` → `step.start` → `step.delta` → `step.stop` → `interaction.completed`. Steps correlate by `index`, and audio deltas are `{type:"audio",data,mime_type,sample_rate,channels}`. If no semantic events occur for 10 seconds, `: ping` is sent. Upstream errors or a missing terminal state trigger an `error` event and terminate the stream; client disconnections cancel upstream generation. Errors occurring prior to stream initiation use Gemini HTTP error objects.
+
+`GET /v1beta/interactions/{id}` 返回创建时的完整 interaction；`include_input=true` 时 `steps` 先列出请求输入，字符串与连续的内容块合并为 `user_input` 步骤；`stream=true` 时按创建流的事件格式重放保存的 interaction，每个事件带递增的 `event_id`，查询参数 `last_event_id` 从其后的事件继续，无法识别时返回 `400 INVALID_ARGUMENT`。`POST /v1beta/interactions/{id}/cancel` 返回该 interaction 的终态对象。`DELETE /v1beta/interactions/{id}` 返回 `{}`，之后检索返回 404 `NOT_FOUND`，作为 `previous_interaction_id` 或 Responses 的 `previous_response_id` 返回 400。`/v1` 前缀行为相同。
+
+### Embeddings
+
+`POST /v1/embeddings` 请求字段为 `model`、`input`，可选 `dimensions`、`encoding_format`。`input` 是字符串或字符串数组，token 数组与空数组返回 400；`dimensions` 为正整数，写入每条请求的 `outputDimensionality`；`encoding_format` 为 `float`（默认）或 `base64`，`base64` 为小端 float32。响应为 `{"object":"list","data":[{"object":"embedding","index":0,"embedding":[...]}],"model":"<MODEL>","usage":{"prompt_tokens":N,"total_tokens":N}}`。
+
+`:embedContent` 接受 `content`、`taskType`、`title`、`outputDimensionality`，返回 `{"embedding":{"values":[...]}}`。`:batchEmbedContents` 接受 `requests[]`，每项字段相同并可带与路径一致的 `model`，返回 `{"embeddings":[...]}`。字段同时接受 snake_case；缺 `content` 或 `model` 与路径不一致时返回 400 `INVALID_ARGUMENT`。
+
+三个端点都经 Build 通道调用上游 `batchEmbedContents`，超过 100 条时按顺序分批并合并结果，上游 `tokenCount` 计为输入 token。Build 未启用或没有可调用账户时返回 404 `model_not_found` / `NOT_FOUND`。
 
 ### Gemini GenerateContent
 
@@ -1761,37 +1721,43 @@ SSE uses matching event names and JSON `event_type`: `interaction.created` → `
   "systemInstruction": {"role":"user","parts":[{"text":"Be concise"}]},
   "generationConfig": {},
   "tools": [],
-  "toolConfig": {}
+  "toolConfig": {},
+  "safetySettings": [{"category":"HARM_CATEGORY_HARASSMENT","threshold":"BLOCK_ONLY_HIGH"}]
 }
 ```
 
-The Content fields are `role` and `parts`. Part oneof:
+Request message fields accept both snake_case proto names and lowerCamelCase names (e.g. `system_instruction`, `generation_config.response_mime_type`, `tools[].function_declarations`). When both co-exist, camelCase takes precedence. Function arguments and schemas accept raw JSON objects.
 
 | Part | Fields |
 | --- | --- |
 | text/thought | `text`, optional `thought`, `thoughtSignature` |
 | inline data | `inlineData:{mimeType,data}` |
-| file data | `fileData:{mimeType,fileUri,displayName}` |
+| file data | `fileData:{mimeType?,fileUri,displayName}` |
 | function call | `functionCall:{id,name,args}` |
 | function response | `functionResponse:{id,name,response}` |
 | executable code | `executableCode:{language,code}` |
 | code result | `codeExecutionResult:{outcome,output,error}` |
 
-All `generationConfig` fields:
+Parts lacking data fields and `thoughtSignature` are omitted; parts with multiple data fields return `400 INVALID_ARGUMENT`. `fileData.fileUri` supports YouTube URLs as external videos, `/upload/v1beta/files` or `/v1/files` as file references, and other http(s) URLs downloaded as inline media up to 512 MiB.
 
 | Category | Fields |
 | --- | --- |
 | sampling | `temperature`, `topP`, `topK`, `frequencyPenalty`, `presencePenalty`, `seed` |
+| media | `mediaResolution`: `MEDIA_RESOLUTION_LOW`, `MEDIUM`, `HIGH` |
 | output limits | `candidateCount`, `maxOutputTokens`, `stopSequences` |
 | log probabilities | `responseLogprobs`, `logprobs` |
-| structured output | `responseMimeType`, `responseSchema`, `responseJsonSchema` |
+| modalities | `responseModalities`: `["TEXT"]`, `["AUDIO"]`, `["IMAGE"]` |
+| speech config | `speechConfig` and `multiSpeakerVoiceConfig` |
+| thinking config | `thinkingConfig.thinkingLevel` or `thinkingBudget` |
 | modalities | `responseModalities` |
 | image | `imageConfig:{aspectRatio,imageSize}` |
 | thinking | `thinkingConfig:{thinkingBudget,thinkingLevel}` |
 | transcription | `transcriptionConfig:{languageCodes,customVocabulary,wordTimestamps,speakerLabels,smartTranscription}` |
 | speech | `speechConfig` |
 
-`responseModalities` only accepts `TEXT`, `IMAGE`, and `AUDIO`; `AUDIO` is mutually exclusive with other modalities. When an image model omits modalities or requests only `IMAGE`, `[IMAGE,TEXT]` is sent; `imageConfig` preserves explicit aspect ratios and sizes, and models supporting output resolutions default to `1K` when the image config is omitted.
+`candidateCount` accepts 0 to 8; values > 1 generate separate candidates concurrently, candidate 0 keeping the original request ID and candidate i using `<id>-<i>`. `:streamGenerateContent` begins output once the first candidate is ready, aggregating total usage across all candidates.
+
+`responseMimeType` and `responseJsonSchema` map structured output constraints.
 
 `speechConfig.voiceConfig` and `multiSpeakerVoiceConfig` are mutually exclusive; single-voice configurations must provide `prebuiltVoiceConfig.voiceName`, and each multi-speaker entry must provide a non-empty `speaker` and `voiceConfig.prebuiltVoiceConfig.voiceName`; `multiSpeakerVoiceConfig.mode` can be `VERBATIM` or `CONVERSATIONAL`. The `speechMetadata` (or `speech_metadata`) `{speaker,style}` of a text part is written to Part field 41. Models with capability code 85 split text without a speaker line by line, starting a new segment on lines prefixed with a configured speaker name and colon, merging continuation lines into the previous segment, and dropping any text prior to the first speaker line; text without matching lines is sent as-is. Legacy TTS models write `speechMetadata` back as a `speaker: line` prefix and a `style\n\n` instruction paragraph. `transcriptionConfig.smartTranscription=true` is mutually exclusive with explicitly set true for `wordTimestamps` or `speakerLabels`; the language code `detect` is normalized to empty for auto-detection.
 
@@ -1825,7 +1791,7 @@ tool group fields:
 | maps | `googleMaps` |
 | image search | `imageSearch` |
 
-`googleSearch.searchTypes` can contain empty `webSearch` and `imageSearch` objects; defaults to web search if not provided or if neither is enabled. `timeRangeFilter.startTime/endTime` uses RFC 3339 Nano. `googleSearchRetrieval` only accepts an empty object. Tool choice resides in `toolConfig.functionCallingConfig:{mode,allowedFunctionNames}`, accepting `AUTO`, `NONE`, `ANY`, and `VALIDATED`; `allowedFunctionNames` uses a subset of declared functions.
+`googleSearch.searchTypes` supports `webSearch` and `imageSearch` (defaulting to web search). `timeRangeFilter.startTime/endTime` uses RFC 3339 Nano. Tool choices support `AUTO`, `ANY`, `NONE`, or `VALIDATED` mode with allowed function names.
 
 `:countTokens` returns:
 
@@ -1857,7 +1823,7 @@ Non-streaming generation response:
 }
 ```
 
-Output Parts use the same `text`, `thought`, `thoughtSignature`, `inlineData`, `fileData`, `functionCall`, `executableCode`, and `codeExecutionResult` as inputs. Transcribed text can include:
+`finishMessage` conveys upstream termination explanations (e.g. content filtering reasons). When `candidateCount` > 1, candidates are indexed 0 to n-1 with individual finish reasons. Streaming blocks emit candidates as they arrive, with final blocks listing all finish reasons and aggregated usageMetadata.
 
 ```json
 {
@@ -1880,7 +1846,7 @@ Non-streaming results merge adjacent, homogeneous body or thought fragments that
 
 ### Files, Transcribe, and Media
 
-`POST /v1/files` accepts multipart `file` and `purpose`, which may arrive in any order. File limit is 512 MiB, with an additional 1 MiB allowed for multipart overhead per request; normal scalar parts are capped at 64 KiB. `filename`, non-empty `file`, and non-empty `purpose` are required. When `Content-Type` is empty or `application/octet-stream`, MIME is detected from the file prefix.
+`POST /v1/files` accepts multipart `file` and optional `purpose` in any field order. Max file size is 512 MiB with 1 MiB multipart overhead. Content-Type is auto-detected from binary magic bytes when missing or generic octet-stream.
 
 File object:
 
@@ -1902,24 +1868,20 @@ File object:
 {"id":"file_...","object":"file","deleted":true}
 ```
 
-Unknown files return 404 `file_not_found`; exceeding the size limit returns 413 `file_too_large`. Drive files are bound to the creating account; cross-account generations temporarily copy the file and clean up the replica once the current attempt completes.
+Unknown files return 404 `file_not_found`, oversized files return 413 `file_too_large`. Drive bindings and cross-account file cloning are detailed in "Drive Upload and File Part".
+
+`GET /v1/files` returns a paginated list ordered newest-to-oldest with `has_more`, `first_id`, and `last_id`.
 
 `POST /v1/audio/transcriptions` multipart fields:
 
 | Field | Values and Handling |
 | --- | --- |
-| `file` | Required, non-empty; `audio/*`, `video/mp4`, `video/webm`; maximum 512 MiB |
-| `model` | Default `gemini-3.5-transcribe`; accepts optional `models/` prefix |
-| `response_format` | `json`, `text`, `verbose_json`, `diarized_json`; default `json` |
-| `language` | Language code; `detect` and `auto` map to empty for auto-detection |
-| `temperature` | `0..2` |
-| `custom_vocabulary` | Repeatable text field or JSON string array |
-| `word_timestamps`, `speaker_labels`, `smart_transcription` | `true` or `false` |
-| `prompt` | Currently has no corresponding wire field; non-empty values return 400 |
-
-`smart_transcription=true` is mutually exclusive with explicitly set true for word timestamps or speaker labels; custom vocabulary is mutually exclusive with word timestamps. Each account attempt creates a temporary Drive file, which is cleaned up under the same account once generation finishes, fails, or is canceled.
-
-`text` format returns `text/plain; charset=utf-8`. `json` returns `{"text":"...","usage":...}`. Verbose format:
+| `file` | Required non-empty; `audio/*`, `video/mp4`, `video/webm`; max 512 MiB |
+| `model` | Default `gemini-3.5-transcribe` |
+| `response_format` | `json`, `text`, `srt`, `verbose_json`, `vtt`, `diarized_json` (default `json`) |
+| `language` | Language code; `detect` and `auto` map to automatic detection |
+| `prompt` | Preceding text context |
+| `temperature` | 0-2 (default 0) |
 
 ```json
 {
@@ -1935,29 +1897,27 @@ Unknown files return 404 `file_not_found`; exceeding the size limit returns 413 
 
 `verbose_json` and `diarized_json` use the same verbose object shape. `language` is the normalized request language; it is empty and omitted when `detect` / `auto`. `segments` originates from response Part field 23; `words` is generated when the word count matches the timestamp span count.
 
-`POST /v1/images/generations`:
+`POST /v1/audio/translations` transcribes input audio then translates transcription text to English: when `model` is a transcribe model or omitted, translation is performed by `gemini-flash-latest`; otherwise transcription runs on `gemini-3.5-transcribe` and translation on the specified model.
 
 | Field | Values and Handling |
 | --- | --- |
-| `model`, `prompt` | Required |
-| `n` | Default and only allowed value is `1` |
-| `size` | `auto`, `1024x1024`, `1536x1024`, `1024x1536` |
-| `quality` | `auto`; `low/standard=1K`, `medium/hd=2K`, `high=4K` |
-| `response_format` | `b64_json` returns Base64; other values return a data URL |
-
-The response is `{"created":<UNIX>,"data":[{"b64_json":"...","revised_prompt":"..."}]}` or `{"created":<UNIX>,"data":[{"url":"data:<MIME>;base64,...","revised_prompt":"..."}]}`. `revised_prompt` appears only when upstream returns text concurrently. If upstream fails to return a final image, HTTP 502 `upstream_error` is returned; when the finish reason is abnormal, it is written to the error message, such as `image_recitation`.
+| `model` | Defaults to first generatable `image_route` model |
+| `prompt` | Required text prompt |
+| `n` | Number of images (default 1, range 1-10) |
+| `size` | `auto` or `WIDTHxHEIGHT` |
+| `quality` | `auto`, `low/standard=1K`, `medium/hd=2K`, `high/xhigh/max=4K` |
+| `response_format` | `b64_json` returns Base64; other returns data URL |
+| `stream` | Streaming support |
 
 `POST /v1/audio/speech`:
 
 | Field | Values and Handling |
 | --- | --- |
-| `model`, `input` | Required |
-| `voice` | Default `Zephyr` |
-| `response_format` | Default `wav`; supports `wav`, `pcm`, and `mp3` when upstream already returns `audio/mpeg` |
-| `speed` | Omitted/`0` or `1` |
-| `instructions` | Passed as `speechMetadata.style` on the text part; legacy TTS models form the prompt via `instructions + "\n\n" + input` |
-
-`pcm` returns the PCM body along with sampling parameters; audio data is extracted first when upstream returns PCM16 WAV. `wav` wraps upstream `audio/l16` into a 16-bit WAV according to effective rate and channels; native WAV preserves the respective audio format, with multiple chunks having their PCM data concatenated before encapsulation. Responses set `Content-Type` and `Content-Length`.
+| `model`, `input` | Required model ID and input text |
+| `voice` | Voice name (default `Zephyr`) |
+| `response_format` | Audio format (default `wav`; supports `mp3`, `opus`, `aac`, `flac`, `wav`, `pcm`) |
+| `speed` | Speed multiplier `0.25..4.0` |
+| `instructions` | Speech style instructions in `speechMetadata.style` |
 
 Voice requests for legacy TTS models prepend `## Transcript:\n` before the first text in accordance with the official wire format; AUDIO-only generation configs omit the default `maxOutputTokens`; `responseModalities` and `speechConfig` are written to their officially confirmed slots respectively.
 
@@ -1967,12 +1927,11 @@ OpenAI `POST /v1/videos` accepts JSON or multipart:
 
 | Field | Values and Handling |
 | --- | --- |
-| `model`, `prompt` | Required |
-| `seconds` | Integer string; default 4 |
-| `size` | `1280x720`, `720x1280`, `1792x1024`, `1920x1080`, `1024x1792`, `1080x1920` |
-| `input_reference` | File ID/data URL in JSON; file in multipart |
-
-OpenAI video object:
+| `model` | Defaults to first model supporting `predictLongRunning` |
+| `prompt` | Required generation prompt |
+| `seconds` | Video duration in seconds (default 4; snaps to nearest option) |
+| `size` | Aspect ratio and resolution string (e.g. `1280x720`, `1920x1080`) |
+| `input_reference` | Image file ID, data URL, or multipart upload for image-to-video |
 
 ```json
 {
@@ -1987,7 +1946,7 @@ OpenAI video object:
 }
 ```
 
-`GET /v1/videos/{id}` returns the current object. Upon completion, status is `completed` and progress is `100`; when upstream is done but produces no file, status is `failed`. `GET /v1/videos/{id}/content` accepts an omitted parameter or `variant=video`, returning 409 `video_not_ready` when incomplete; successful downloads set media `Content-Type`, `attachment; filename="video.mp4"`, and `Content-Length` when known.
+`GET /v1/videos/{id}` returns video operation status (`queued`, `completed`, `failed`) and progress. `GET /v1/videos/{id}/content` downloads the completed video stream, returning 409 `video_not_ready` while in progress and 404 when deleted.
 
 Upon successful video creation, the following resource binding is written keyed by operation ID:
 
@@ -2003,7 +1962,7 @@ Upon successful video creation, the following resource binding is written keyed 
 }
 ```
 
-`model`, `seconds`, `size`, and UTC `created_at` are persisted with the creating account, and subsequent polling restores them from the resource binding; OpenAI POST and GET continue returning identical fields even after the generation service or process restarts. When an OpenAI request explicitly provides `size`, that public value is saved verbatim; when omitted, `1280x720` is saved based on the default 16:9, 720p. Gemini requests save normalized output dimensions: 720p is `1280x720` or `720x1280`, 1080p is `1920x1080` or `1080x1920`, and 4k is `3840x2160` or `2160x3840`. The public object's `created_at` is the binding creation time in Unix seconds.
+Model parameters, actual `seconds`, `size`, and UTC timestamps are persisted in resource bindings, enabling consistent polling across application restarts. Public timestamps use Unix seconds.
 
 Gemini `:predictLongRunning` request:
 
@@ -2025,7 +1984,7 @@ Gemini `:predictLongRunning` request:
 }
 ```
 
-`instances` must contain exactly one non-empty prompt; `image` must choose between `inlineData` and `fileData:{mimeType,fileUri}`. When `numberOfVideos` is 0, `sampleCount` is read; if both are 0, it defaults to 1, and ultimately only one result is accepted. `durationSeconds` accepts a JSON integer or a decimal string. When omitted, duration, aspect ratio, and resolution default to `4`, `16:9`, and `720p` respectively, and are validated against the live model's `video_durations_seconds`, `video_aspect_ratios`, and `video_output_resolutions`. Creation returns `{"name":"operations/<ID>"}`. Gemini operations use the same persisted metadata to restore the creating account and polling context; Gemini responses only contain `name`, `done`, and, upon completion, `response.generateVideoResponse.generatedSamples`.
+`instances` requires a single prompt; image inputs select between `inlineData` and `fileData`. `numberOfVideos` defaults to 1 (range 1-4). Duration, aspect ratio, and resolution snap to catalog capabilities.
 
 `GET /v1beta/operations/{id}`:
 
@@ -2043,7 +2002,7 @@ Gemini `:predictLongRunning` request:
 }
 ```
 
-`response` appears only when done; `generatedSamples` is empty when done without artifacts. Both operation and result file are bound to the creating account.
+`response` appears when all video tasks complete, listing `generatedSamples` with URIs pointing to `/v1/videos/<ID>/content`.
 
 ### Live and Robotics Public Frames
 
@@ -2060,20 +2019,17 @@ Send setup within 10 seconds after connection upgrade:
 }
 ```
 
-Live input modalities must be a non-empty subset of `text`/`audio`/`image`, and output must be `["audio"]` or `["text"]`. Real-time translation models require output `["audio"]` along with `"translation":{"target_language_code":"es","echo_target_language":false}`; source text of the input audio is returned via `input_transcription`, while translated text is returned via `output_transcription` and `media`. Real-time transcription models require output `["text"]`, optionally with `"transcription":{"language_codes":["en"]}`; transcripts are returned via `interim_input_transcription` (current cumulative text) and `input_transcription` (final text). Neither model type accepts `tools`. Robotics input and output must be `["text"]` and `["text"]` respectively, and do not accept `translation` or `transcription`. Arrays do not accept empty strings or duplicate items.
-
-Client objects following `setup` have standardized fields: `type`, optional `text`, `mime_type`, Base64 `data`, and `tool_responses`. Fields for each frame:
+Live input modalities are non-empty subsets of text/audio/image. Standard Live models output `["audio"]`; realtime translation models (capability 46) output audio with translated transcripts; realtime transcription models (capability 77) output text.
 
 | type | Fields |
 | --- | --- |
-| `text` | `text`, and setup must declare text |
-| `audio` | `mime_type:"audio/pcm"`, `data`; this default is used when MIME is omitted |
-| `image` | `mime_type:"image/jpeg"`, `data`; this default is used when MIME is omitted |
-| `media_end` | No additional fields |
-| `tool_response` | `tool_responses:[{id,name,content}]`, setup must declare tools |
-| `close` | No additional fields |
-
-Complete set of server object fields:
+| `text` | `text` |
+| `audio` | `mime_type: "audio/pcm"`, `data` |
+| `image` | `mime_type: "image/jpeg"`, `data` |
+| `media_end` | No extra fields |
+| `tool_response` | `tool_responses: [{id, name, content}]` |
+| `music_prompts` | `weighted_prompts: [{text, weight}]` |
+| `music_config` | Realtime music configuration object |
 
 ```json
 {
@@ -2109,8 +2065,6 @@ Streaming endpoints uniformly use `text/event-stream`, with each SSE frame termi
 
 When the interval between upstream semantic events reaches 10 seconds, all four streaming protocols send an SSE comment frame `: ping` and flush immediately. OpenAI Chat sends the assistant role chunk first, Responses sends `response.created` and `response.in_progress` first, and Anthropic sends `message_start` first; these initial events can reach the client during account scheduling. Gemini's first frame originates from an upstream semantic event or `: ping`.
 
-The `web_search_call` in Responses is triggered by an actual grounding query. When a search occurs, SSE first outputs the search call at index 0, followed by the message at index 1; when the model does not invoke a search, only the message is output and sent chunk-by-chunk via body events. If the upstream fails after the body, previously received body deltas precede `response.failed`.
-
 Public adaptation rules:
 
 | Canonical Event | OpenAI Chat | Responses | Anthropic | Gemini |
@@ -2124,15 +2078,13 @@ Public adaptation rules:
 | media | data URL / media endpoint | output content | content block | inlineData Part |
 | usage | prompt/completion/total | input/output/total | input/output | prompt/candidates/thoughts/total |
 
-Responses media uses image generation items; Anthropic media uses data URL Markdown within a text block. Anthropic sources use a `Sources:` Markdown list at the end of the text block.
+Responses media uses image generation item objects.
 
 OpenAI Chat carries generated images via Markdown data URLs; when the client passes assistant `message.content` back in the next turn, the adapter restores images within it to inline data Parts, preserving multi-turn image context. Image Base64 supports standard and URL-safe alphabets, optional padding, and CR/LF line breaks; text before and after images maintains its original order.
 
 In user text, `youtu.be/<ID>`, `youtube.com/watch?v=<ID>`, `/shorts/<ID>`, `/live/<ID>`, and `/embed/<ID>` are converted into `video/*` external media parts and removed from the user text part; duplicate URLs are deduplicated into a single attachment. OpenAI `video_url`/`input_video`, Anthropic URL sources, and Gemini `fileData.fileUri` use the same external media encoding.
 
-OpenAI Responses `previous_response_id` preserves up to 256 response nodes in-process and reconstructs the full contents; after a restart, the client must resubmit the complete context. Drive and Veo resource bindings are persisted to disk.
-
-When `store` is omitted or set to `true`, a response node is created; `store=false` returns the current response while preserving the existing continuation chain.
+OpenAI Responses `previous_response_id` and Interactions `previous_interaction_id` maintain up to 256 in-process nodes to reconstruct conversation history; upon server restart clients submit full context. Drive and Veo bindings persist to disk.
 
 Model, parameter, account, and upstream errors are projected according to the status table below. Client cancellation closes the upstream reader and releases the account lease.
 
@@ -2157,7 +2109,11 @@ Error objects and status semantics:
 | Request deadline exceeded | 504 | `upstream_error` | `api_error` | `DEADLINE_EXCEEDED` |
 | Transport, Content-Type, decoding, or missing terminal state | 502 | `upstream_error` | `api_error` | `INTERNAL` |
 
-An upstream RPC HTTP 404 indicates a transport or upstream failure and maps to 502 by default; a public 404 corresponds to a local model directory or local resource lookup failure. When the client disconnects on its own, access logs record 499 and response writes are terminated.
+- "no eligible account": no account matches the requested method, capabilities, and benefit tiers
+- "accounts supporting request cannot be scheduled": matching accounts require re-login, are unavailable, or disabled
+- Generation service `STOPPED`: generation and token counting endpoints return `service_stopped`
+
+Upstream HTTP 404 maps to 502 Bad Gateway; public 404 indicates missing local models or resources. Client disconnects record 499 in access logs.
 
 Error object raw body:
 

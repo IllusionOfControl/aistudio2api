@@ -76,6 +76,10 @@ type Program struct {
 	src         *file.File
 	srcMap      []srcMapItem
 	calleeText  map[int]string
+	// regexps indicates regular expression literal objects need instantiation for this code block including compiled IIFEs
+	regexps bool
+	// generators indicates this code block and nested functions contain synchronous generator functions
+	generators bool
 }
 
 type compiler struct {
@@ -96,6 +100,11 @@ type compiler struct {
 	codeScratchpad []instruction
 
 	stringCache map[unistring.String]Value
+
+	// lazy indicates currently compiled code belongs to functions compiled lazily on first invocation in SpiderMonkey
+	lazy bool
+	// inFunc indicates currently compiled code resides inside a function body
+	inFunc bool
 }
 
 type binding struct {
@@ -1359,15 +1368,27 @@ func (c *compiler) enterDummyMode() (leaveFunc func()) {
 	c.p = &Program{
 		src: c.p.src,
 	}
+	dummy := c.p
 	c.newScope()
 	return func() {
 		c.block, c.p = savedBlock, savedProgram
+		c.p.generators = c.p.generators || dummy.generators
 		c.popScope()
 	}
 }
 
-func (c *compiler) compileStatementDummy(statement ast.Statement) {
+// enterUnreachableMode compiles unreachable code not folded by SpiderMonkey, preserving regex literal markers
+func (c *compiler) enterUnreachableMode() (leaveFunc func()) {
 	leave := c.enterDummyMode()
+	dummy := c.p
+	return func() {
+		leave()
+		c.p.regexps = c.p.regexps || dummy.regexps
+	}
+}
+
+func (c *compiler) compileStatementDummy(statement ast.Statement) {
+	leave := c.enterUnreachableMode()
 	c.compileStatement(statement, false)
 	leave()
 }
