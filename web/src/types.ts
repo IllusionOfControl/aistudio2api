@@ -1,6 +1,7 @@
 export type Locale = 'zh-CN' | 'zh-TW' | 'en' | 'ja' | 'ko' | 'fr' | 'de'
 
-export type TabID = 'logs' | 'accounts' | 'models' | 'requests' | 'settings' | 'playground'
+export type TabID =
+  'logs' | 'accounts' | 'models' | 'requests' | 'usage' | 'settings' | 'playground'
 
 export type AccountState =
   'ready' | 'busy' | 'cooldown' | 'auth_required' | 'unavailable' | 'disabled'
@@ -38,6 +39,11 @@ export interface ChromeImportProfile {
   display_name: string
   email: string
   locale: string
+}
+
+export interface PairingToken {
+  token: string
+  expires_at: string
 }
 
 export interface ChromeImportInput extends AccountLoginInput {
@@ -139,6 +145,8 @@ export interface RequestSummary {
 }
 
 export interface ServiceConfig {
+  auto_start: boolean
+  request_body_log: boolean
   admin_auth_enabled: boolean
   admin_username: string
   admin_password?: string
@@ -163,7 +171,114 @@ export interface ServiceConfig {
   waa_backend: 'camoufox' | 'go'
   temporary_chat: boolean
   headless: boolean
-  auto_start: boolean
+}
+
+export type UsageDimension = 'model' | 'account' | 'channel' | 'protocol' | 'state'
+
+export type UsageFilters = Partial<Record<UsageDimension, string[]>>
+
+export interface UsageLatency {
+  avg_ms: number
+  p50_ms: number
+  p95_ms: number
+  p99_ms: number
+}
+
+export interface UsageStats {
+  requests: number
+  succeeded: number
+  failed: number
+  canceled: number
+  rate_limited: number
+  input_tokens: number
+  reasoning_tokens: number
+  reply_tokens: number
+  total_tokens: number
+  duration: UsageLatency
+  first_event: UsageLatency
+  queue_avg_ms: number
+  last_at?: string
+}
+
+export interface UsageBucket extends UsageStats {
+  at: string
+}
+
+export interface UsageGroup extends UsageStats {
+  key: string
+}
+
+export interface UsagePair extends UsageStats {
+  account: string
+  model: string
+}
+
+export interface UsageSeries {
+  key: string
+  other?: boolean
+  requests: number[]
+  tokens: number[]
+}
+
+export interface UsageReport {
+  from: string
+  to: string
+  bucket_seconds: number
+  generated_at: string
+  latest_at?: string
+  totals: UsageStats
+  previous: UsageStats
+  recent: { minutes: number; requests: number; tokens: number }
+  buckets: UsageBucket[]
+  stack_by: UsageDimension
+  series: UsageSeries[]
+  groups: Record<UsageDimension | 'status', UsageGroup[]>
+  pairs: UsagePair[]
+  options: Record<UsageDimension, string[]>
+}
+
+export interface RequestAttempt {
+  account: string
+  channel: string
+  error: string
+  duration_ms: number
+}
+
+export interface UsageRecord {
+  id: string
+  time: string
+  protocol: string
+  path: string
+  model: string
+  account: string
+  channel: string
+  status: number
+  state: string
+  duration_ms: number
+  first_event_ms: number
+  queue_ms: number
+  input_tokens: number
+  reasoning_tokens: number
+  reply_tokens: number
+  total_tokens: number
+  tool_calls: number
+  error: string
+  attempts: RequestAttempt[]
+  has_body: boolean
+}
+
+export interface UsageRecordPage {
+  items: UsageRecord[]
+  next_cursor?: string
+}
+
+export interface RequestBody {
+  id: string
+  time: string
+  request: string
+  request_size: number
+  response: string
+  response_size: number
 }
 
 export type AdminEvent =
@@ -174,15 +289,30 @@ export type AdminEvent =
   | { type: 'cooldowns'; data: Cooldown[] }
   | { type: 'request'; data: RequestSummary }
 
-export type PlaygroundProtocol = 'openai-chat' | 'openai-responses' | 'anthropic' | 'gemini'
+// PlaygroundProtocol represents public endpoint protocol used for playground requests
+export type PlaygroundProtocol =
+  | 'openai-chat'
+  | 'openai-responses'
+  | 'anthropic'
+  | 'gemini'
+  | 'openai-images'
+  | 'openai-speech'
+  | 'openai-videos'
 
 export type PlaygroundMode = 'text' | 'image' | 'speech' | 'music' | 'video'
 
-export type PlaygroundReasoning = '' | 'low' | 'medium' | 'high'
+export type PlaygroundReasoning = '' | 'minimal' | 'low' | 'medium' | 'high'
 
 export type PlaygroundTool =
-  '' | 'web_search' | 'image_search' | 'code_interpreter' | 'url_context' | 'google_maps'
+  'web_search' | 'image_search' | 'code_interpreter' | 'url_context' | 'google_maps'
 
+// PlaygroundSpeaker represents speaker name and voice in multi-speaker speech
+export interface PlaygroundSpeaker {
+  name: string
+  voice: string
+}
+
+// PlaygroundInput represents playground request parameters; null values use model defaults
 export interface PlaygroundInput {
   mode: PlaygroundMode
   protocol: PlaygroundProtocol
@@ -191,10 +321,27 @@ export interface PlaygroundInput {
   system: string
   stream: boolean
   reasoning: PlaygroundReasoning
-  tool: PlaygroundTool
+  tools: PlaygroundTool[]
+  temperature: number | null
+  topP: number | null
+  topK: number | null
+  maxOutputTokens: number | null
+  seed: number | null
+  stopSequences: string[]
+  structuredOutput: boolean
+  jsonSchema: string
+  functionCalling: boolean
+  functions: string
   imageSize: 'auto' | '1024x1024' | '1536x1024' | '1024x1536'
   imageQuality: 'auto' | 'low' | 'medium' | 'high'
+  aspectRatio: string
+  resolution: string
+  videoSeconds: string
   voice: string
+  speakers: PlaygroundSpeaker[]
+  safety: Record<string, string>
+  mediaResolution: string
+  imageOnly: boolean
   apiKey: string
 }
 

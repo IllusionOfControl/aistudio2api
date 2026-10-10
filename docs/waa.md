@@ -35,11 +35,8 @@ Both backends expose a unified set of worker capabilities to the request encoder
 | --- | ---: | --- | --- |
 | `GenerateContent` | 5 | All content parts joined by spaces | Worker `SendProtected` |
 | `CreateInteractionStream` | 5 | All transmitted text joined by spaces | Worker `SendProtected` |
-| `ProxyStreamedCall`, `ProxyUnaryCall` | 3 | `<path> <body_json>` | Worker `SendProtected` |
-| `GenerateVideo` | 8 | Video prompt string | MakerSuite Go HTTP transport |
-| Bidi setup | 6 | `models/<model>` and each function's `name description`, joined by spaces | WebChannel |
-| Bidi text, audio, image, media end | 6 | Empty string | WebChannel |
-| Bidi tool response | 6 | First function response call ID | WebChannel |
+| Build embedding `ProxyUnaryCall` | 3 | `<path> <body>`, with path `:batchEmbedContents` | Worker `SendProtected` |
+| Build WebChannel messages | 3 | `<path> <JSON>` | WebChannel |
 
 `GenerateContent` part binding values:
 
@@ -113,7 +110,7 @@ Worker startup logs share 7 phase numbers with the Camoufox backend; pure-Go out
 
 #### Cookies
 
-On worker launch, cookies from `storage-state.json` load into runtime memory. Outbound requests filter by expiration, domain, path, and Secure attributes to construct the `Cookie` header; response `Set-Cookie` headers merge back into runtime memory upon header arrival. `document.cookie` within the simulated DOM provides non-HttpOnly cookies matching domain `aistudio.google.com` joined by `; `. Page `localStorage` uses an in-memory map per VM, initially empty.
+On worker launch, cookies from `storage-state.json` load into runtime memory. Outbound requests filter by expiration, domain, path, and Secure conditions to assemble the `Cookie` header; response `Set-Cookie` headers are merged back into runtime immediately upon arrival. In-page `document.cookie` reads only non-HttpOnly cookies for the current page; updates parse and set a single cookie, preserving HttpOnly and non-page domain cookies. When updating storage state, only cookies with non-empty values are persisted to disk.
 
 #### Fingerprints and Host Runtime Values
 
@@ -137,7 +134,7 @@ When `camoufox-fingerprint.json` is missing, it is generated based on Firefox 15
 
 #### Network Shape
 
-All outbound traffic routes through the account proxy (or global `PROXY`), adhering to Firefox 152 TLS ClientHello, HTTP/2 settings, pseudo-header order, and disabling automatic redirects. Headers are dispatched in the following sequence:
+All outbound traffic routes through the account proxy (or global `PROXY`), adhering to Firefox 152 TLS ClientHello, HTTP/2 settings, and pseudo-header ordering without automatically following redirects. Matching Firefox default `network.http.http2.ping-threshold` and `ping-timeout`, connections send HTTP/2 PING frames when idle, maintaining connections and preventing timeouts. Request headers are sent in the following order, with unlisted headers placed afterwards:
 
 ```text
 user-agent, accept, accept-language, accept-encoding, referer, content-type,
@@ -298,7 +295,7 @@ Following initialization, the runtime writes the bootstrap prompt (`AIStudio2API
 
 ## 4. Firefox Host Simulation & Key Ordering
 
-`internal/waa/dom.js` constructs Window, WebIDL interface prototypes, and instances in each Realm according to `firefox152.json`. Host scripts execute under origin `\x00waa-host`, omitting their frames from `Error.stack` and avoiding triggering lazy global property resolution during host setup.
+`internal/waa/dom.js` constructs Window, WebIDL interface prototypes, and instances in each Realm according to the shape table `firefox152.json.gz`. Host script frames are named `\x00waa-host`, excluded from `Error.stack`, and do not trigger lazy global resolution during execution.
 
 ### Shape Table Schema
 
@@ -398,21 +395,22 @@ Singletons instantiate upon first access according to `topSingletons` or `single
 | Object | Behavior |
 | --- | --- |
 | Node, Element | Insertion, removal, replacement, cloning, containment, parent/child/sibling traversal, `isConnected` |
-| Attributes & Selectors | `id`, `class`, arbitrary attributes; selectors support tags, `#id`, `.class`, `*`, and comma-separated lists |
-| Document | `createElement` resolves via `tagMap` (tags with `-` yield `HTMLElement`, unknown tags yield `HTMLUnknownElement`); `createTextNode`, `createComment`, `createDocumentFragment`, `createEvent`, `createRange`, `getElementById` |
-| Events | Capture, target, bubble phases; `once`, `capture`, listener deduplication, `on<type>` properties, `stopPropagation`, `stopImmediatePropagation`, `preventDefault` |
-| Layout | Top-level `html` and `body` return viewport dimensions, others return 0; `offsetHeight` computes from inline styles, children, and line heights |
-| `IntersectionObserver` | Dispatches single callback 16ms post-`observe`, timestamp aligned to 60Hz frame |
-| `getComputedStyle`, `matchMedia` | Returns default metrics and media query tables; unlisted `min/max-width/height` compute against viewport |
-| Storage | `getItem`, `setItem`, `removeItem`, `key`, `clear` backed by in-memory map |
-| Location | `toString` returns `href`; `assign`, `replace`, `reload` do not navigate |
-| Performance | `now`, `timeOrigin`, `toJSON`; `getEntries*` returns navigation entries only |
-| Navigator | `javaEnabled` is `false`, `sendBeacon` returns `true`, `getGamepads` is empty, `permissions.query` returns `prompt` |
-| Canvas, GPU | `getContext('2d')` returns `CanvasRenderingContext2D` instance; `requestAdapter` returns `null` |
-| Trusted Types | `createPolicy`, `createHTML`, `createScript`, `createScriptURL`; `TrustedScript` unboxes to source in `eval` |
-| Images | Setting `src` initiates network fetch, dispatching `load` or `error` on completion |
+| Attributes & Selectors | `id`, `class`, and arbitrary attributes; selectors support tags, `#id`, `.class`, `*`, and comma-separated lists |
+| HTML Elements | HTMLElement, HTMLHtmlElement, HTMLHeadElement, HTMLBodyElement, HTMLIFrameElement, HTMLTextAreaElement, HTMLButtonElement |
+| Properties | `innerHTML`, `textContent`, `value`, `style`, `dataset`, `classList`, `title` |
+| Window & Document | `window`, `self`, `top`, `parent`, `document`, `location`, `history`, `navigator`, `screen` |
+| Dimensions | `innerWidth`, `innerHeight`, `outerWidth`, `outerHeight`, `clientWidth`, `clientHeight`, `offsetWidth`, `offsetHeight`, `getBoundingClientRect` |
+| Events | EventTarget, CustomEvent, Event, UIEvent, MouseEvent, addEventListener, removeEventListener, dispatchEvent |
+| Timers | `setTimeout`, `clearTimeout`, `setInterval`, `clearInterval`, `requestAnimationFrame`, `cancelAnimationFrame` |
+| Network | `fetch`, `Headers`, `Request`, `Response` |
+| Storage | Shared storage areas, named properties, and key ordering (see below) |
+| System | Performance, Crypto (`getRandomValues`, `subtle.digest`), Base64 (`btoa`, `atob`) |
 
-### Realm Primitives
+`localStorage` and `sessionStorage` each provide one storage area, shared between the top-level and iframe Realms. Storage instances implement WebIDL legacy platform objects:
+- Named properties: keys present in storage and not shadowed by prototype properties are exposed as enumerable data properties; methods like `getItem` and `length` shadow storage keys of the same name.
+- Assignments and `Object.defineProperty` data descriptors write entries converted to DOMString; accessor descriptors throw `TypeError: can't define a getter/setter for element '"<key>"' of Storage object`.
+- `delete` removes entries; `Object.freeze`, `seal`, and `preventExtensions` throw `TypeError: can't prevent extensions on this object`.
+- Missing method arguments throw `TypeError: Storage.<method>: At least N argument(s) required, but only M passed`.
 
 | Primitive | Behavior |
 | --- | --- |
@@ -435,6 +433,18 @@ Date local time evaluates against fingerprint `timezone`. `Date.prototype.toStri
 2. Single name in table: used unconditionally.
 3. Two names in table: uses January name if current daylight saving status matches Jan 15 12:00, July name otherwise.
 4. Unlisted timezones format as `GMT±HH:MM` (`GMT` for zero offset).
+
+### Intl
+
+`intl.js` installs all `Intl` constructors, `getCanonicalLocales`, and `supportedValuesOf` in each Realm before shape alignment, and replaces `Date.prototype.toLocaleString`, `toLocaleDateString`, and `toLocaleTimeString`:
+
+| Section | Implementation |
+| --- | --- |
+| Supported Locales | 21 canonical locales matching the browser profile |
+| `supportedValuesOf` | `calendar`, `collation`, `currency`, `numberingSystem`, `timeZone`, `unit` matching Firefox 152 |
+| DateTimeFormat | Exact formatting for numeric, 2-digit, short, long, full representations, localized names from `timezones.json.gz` |
+| NumberFormat | Currency, percentage, unit, notation, numbering systems matching CLDR data |
+| PluralRules, ListFormat, RelativeTimeFormat | Canonical plural forms, list separators, and relative time expressions |
 
 ### Lazy Global Resolution & Built-in Key Ordering
 
@@ -514,7 +524,7 @@ Before generating proofs and during bootstrap, the runtime executes the prompt i
 })
 ```
 
-The textarea normalizes CRLF and CR to LF; the return value must match the normalized prompt string, otherwise proof generation fails.
+The textarea normalizes CRLF and CR to LF; the return value must match the normalized prompt string, otherwise proof generation fails. The first invocation creates the input textarea and Run button under `body`, which are reused subsequently. Requests outside the Build channel write the prompt used by binding; Build channel requests write user text from the request: generation takes contents text, embedding takes the first request text, and Live takes an empty prompt.
 
 ### Event Propagation Semantics
 
@@ -602,14 +612,10 @@ A single worker services all standard generation models on an account. Real loca
 
 | Signal | Remediation |
 | --- | --- |
-| Proof failure: snapshot exception, desynced prompt, missing `!` prefix, VM refresh failure | Worker transitions to `failed`; rebuilds worker on same account and replays request once |
+| Proof failure: snapshot exception, desynced prompt, missing `!` prefix, VM refresh failure | Worker transitions to `failed`; rebuilds worker on same account and retries once |
 | Protected request network error | Same as above |
-| HTTP 404 Code 5 with `Ambiguous request for service ''` | Rebuilds worker on same account and replays request once |
-| HTTP 403 or Code 7 | Preserves account and model eligibility; switches to untried account prior to first semantic event; does not rebuild worker |
-| HTTP 429 | Cooldown recorded by minute/daily quota (`build:<model>` for Build); retries on alternate channel of same account if available |
-| HTTP 401 | Refreshes Chrome credentials via same egress, rebuilds runtime, replays once; enters `auth_required` if refresh fails |
-| Worker startup failure | Logs failure; request switches candidate accounts |
-| Runtime lease held by another process | Suspends scheduling for account, retrying after 5s with backoff up to 1m |
+| `GenerateContent` stream break or truncation | Same as above |
+| Request HTTP 401 | Refreshes cookies via OAuth/DBSC renewal materials; resets worker and retries once |
 
 Code 7 represents upstream rejection. It can be account- or model-specific: the same worker can return Code 7 on one model and 200 on another. A single Code 7 does not signify WAA host invalidation.
 
@@ -629,9 +635,8 @@ Files in `internal/waa` are generated from live Firefox captures:
 
 | File | Content | Format |
 | --- | --- | --- |
-| `firefox152.json` | Firefox shape table | Single-line JSON, UTF-8, LF |
-| `timezones.json.gz` | Firefox Intl long timezone names | Gzip-compressed JSON, sorted keys, mtime=0 |
-| `dom.js` | Host generation script | JavaScript source |
+| `firefox152.json.gz` | Firefox shape table | Gzip-compressed single-line JSON, UTF-8, LF, gzip timestamp 0 |
+| `timezones.json.gz` | Firefox Intl long timezone names | Gzip-compressed table by locale and timezone |
 
 #### Capture Procedure
 
@@ -688,29 +693,16 @@ Browser 200 with Go 403 isolates divergence to the pure-Go host or Goja; mutual 
 - **Own Key Ordering**: `Object.OrderOwnKeys` reorders own string keys.
 - **Date Timezones**: `SetTimeLocation` and `SetTimeZoneName` supply localized timezone strings for `toString` and `toTimeString`.
 
+#### Intl Data
+
+In the same browser page, capture `Intl.supportedValuesOf` across all types, available locales, default `resolvedOptions()`, and DateTimeFormat output combinations across the 21 locales. Compress with gzip (timestamp 0) to `timezones.json.gz`.
+
 ## 8. Implementation Architecture
 
 | Path | Responsibility |
 | --- | --- |
 | `internal/config/config.go` | `WAA_BACKEND` parsing and validation |
-| `internal/app/waa_backend.go` | Camoufox preparation or on-demand login driver setup based on backend |
-| `internal/app/runtime.go` | Warm pool management, startup logging, leases, rebuilding, and rotation |
-| `internal/app/auth_retry.go` | HTTP 401 credential renewal, runtime recreation, and replay |
-| `internal/aistudio/runtime_go.go` | Pure-Go runtime: homepage, `GetLoggingContext`, `Waa/Create`, cache, VM refresh, proofs, cookies |
-| `internal/aistudio/runtime_native.go` | `NativeWorker`: proof injection and state management |
-| `internal/aistudio/service.go` | `WorkerProtectedTransport`, binding assembly, failure classification |
-| `internal/aistudio/build.go` | Build binding and proof field specification |
-| `internal/aistudio/transport_browser.go` | Firefox 152 TLS and header ordering |
-| `internal/aistudio/transport_http.go` | Visit ID, page API key extraction, default user agents |
-| `internal/camoufoxnative/` | Camoufox backend, browser automation, and isolated login |
-| `internal/waa/challenge.go` | Challenge decoding and interpreter verification |
-| `internal/waa/runtime.go` | VM initialization, client experiments, prompt injection, snapshots, settle, shutdown |
-| `internal/waa/host.go` | Realm host setup, Profiles, `Function.prototype.toString`, timers |
-| `internal/waa/realm.go` | iframe Realm, `Math.random`, `atob`/`btoa`, `queueMicrotask`, eval transforms, stack limits |
-| `internal/waa/loop.go` | VM event loop |
-| `internal/waa/global_order.go` | Lazy global property resolution and enumeration order |
-| `internal/waa/timezone.go` | Timezone and display name resolution |
-| `internal/waa/dom.js` | Generates Window, interfaces, and host objects from shape table |
-| `internal/waa/firefox152.json` | Firefox shape table |
-| `internal/waa/timezones.json.gz` | Timezone display names table |
-| `internal/waa/goja/` | Patched Goja JavaScript engine fork |
+| `internal/app/runtime.go` | Unified worker lifecycle coordination and account leasing |
+| `internal/camoufoxnative/` | Camoufox WebDriver BiDi client and browser process management |
+| `internal/waa/` | Pure-Go BotGuard VM runtime, Firefox DOM simulation, Goja JavaScript VM |
+| `internal/waa/goja/` | Embedded SpiderMonkey-compatible ECMAScript runtime |

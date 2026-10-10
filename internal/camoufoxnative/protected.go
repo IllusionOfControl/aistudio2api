@@ -34,39 +34,17 @@ type protectedChunk struct {
 	Error string   `json:"error"`
 }
 
-// SendProtected sends a request via the fixed-fingerprint Camoufox page, preserving native TLS, HTTP/2, headers, cookies, and page fingerprint.
-func (worker *Worker) SendProtected(ctx context.Context, rawURL string, headers http.Header, body []byte) (*ProtectedResponse, error) {
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	worker.mu.Lock()
-	if worker.closed {
-		worker.mu.Unlock()
-		return nil, errors.New("Camoufox runtime is closed")
-	}
-	client := worker.client
-	contextID := worker.contextID
-	worker.mu.Unlock()
-
-	encodedURL, _ := json.Marshal(rawURL)
-	encodedHeaders, err := json.Marshal(browserRequestHeaders(headers))
-	if err != nil {
-		return nil, fmt.Errorf("encoding browser request headers: %w", err)
-	}
-	encodedBody, _ := json.Marshal(string(body))
-	requestID := rand.Text()
-	encodedID, _ := json.Marshal(requestID)
-	expression := fmt.Sprintf(`(() => {
-  const id = %s;
+// protectedFetch is the in-page function declaration that initiates protected requests and buffers responses in chunks; parameters: id, url, headers JSON, and body.
+const protectedFetch = `(id, url, headers, body) => {
   const requests = window.__aistudioProtectedRequests ||= new Map();
   const state = {controller: new AbortController(), status: 0, headers: [], chunks: [], done: false, error: ""};
   requests.set(id, state);
   (async () => {
     try {
-      const response = await fetch(%s, {
+      const response = await fetch(url, {
         method: "POST",
-        headers: %s,
-        body: %s,
+        headers: JSON.parse(headers),
+        body,
         credentials: "include",
         signal: state.controller.signal
       });
@@ -94,9 +72,29 @@ func (worker *Worker) SendProtected(ctx context.Context, rawURL string, headers 
     }
   })();
   return true;
-})()`, encodedID, encodedURL, encodedHeaders, encodedBody)
+}`
+
+// SendProtected sends a request via the fixed-fingerprint Camoufox page, preserving native TLS, HTTP/2, headers, cookies, and page fingerprint.
+func (worker *Worker) SendProtected(ctx context.Context, rawURL string, headers http.Header, body []byte) (*ProtectedResponse, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	worker.mu.Lock()
+	if worker.closed {
+		worker.mu.Unlock()
+		return nil, errors.New("Camoufox runtime is closed")
+	}
+	client := worker.client
+	contextID := worker.contextID
+	worker.mu.Unlock()
+
+	encodedHeaders, err := json.Marshal(browserRequestHeaders(headers))
+	if err != nil {
+		return nil, fmt.Errorf("encoding browser request headers: %w", err)
+	}
+	requestID := rand.Text()
 	startCtx, cancelStart := context.WithTimeout(context.Background(), 5*time.Second)
-	_, err = client.evaluateBool(startCtx, contextID, expression)
+	err = client.callFunction(startCtx, contextID, protectedFetch, requestID, rawURL, string(encodedHeaders), string(body))
 	cancelStart()
 	if err != nil {
 		return nil, errors.Join(fmt.Errorf("sending protected request via browser: %w", err), worker.cancelProtectedRequest(requestID))

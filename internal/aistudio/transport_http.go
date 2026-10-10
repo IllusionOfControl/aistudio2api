@@ -346,6 +346,9 @@ func validateLeaseSelection(lease *AccountLease, selection AccountSelection) err
 			return fmt.Errorf("resource %s is bound to account %s", resourceID, owner)
 		}
 	}
+	if selection.Channel != "" && generationChannelSelection(selection) && lease.Channel() != selection.Channel {
+		return fmt.Errorf("context leased account %s channel %s does not satisfy requested channel %s", account.ID, lease.Channel(), selection.Channel)
+	}
 	modelID := strings.TrimPrefix(strings.TrimSpace(selection.ModelID), "models/")
 	if lease.Channel() == ChannelBuild {
 		if modelID != "" && !lease.pool.channelSupportsLocked(account, ChannelBuild, selection) {

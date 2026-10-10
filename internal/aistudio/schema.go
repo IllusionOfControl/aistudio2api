@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"math"
 	"sort"
 	"strconv"
 	"strings"
@@ -409,6 +410,15 @@ func cleanSchemaInput(raw json.RawMessage, preserveCombinations bool) (json.RawM
 			delete(schema, name)
 		}
 	}
+	var typeName string
+	if json.Unmarshal(schema["type"], &typeName) == nil && strings.EqualFold(typeName, "TYPE_UNSPECIFIED") {
+		delete(schema, "type")
+	}
+	for _, name := range []string{"minItems", "maxItems", "minProperties", "maxProperties", "minLength", "maxLength"} {
+		if value, ok := schema[name]; ok {
+			schema[name] = canonicalSchemaInteger(value)
+		}
+	}
 	for _, name := range []string{"items", "not"} {
 		if nested := bytes.TrimSpace(schema[name]); len(nested) > 0 && nested[0] == '{' {
 			cleaned, err := cleanSchemaInput(nested, preserveCombinations)
@@ -587,6 +597,23 @@ func schemaType(schema map[string]json.RawMessage) (string, error) {
 	return "", nil
 }
 
+// canonicalSchemaInteger normalizes string int64 and zero-fraction numbers in Gemini Schema to integer literals
+func canonicalSchemaInteger(raw json.RawMessage) json.RawMessage {
+	value := string(bytes.TrimSpace(raw))
+	var text string
+	if json.Unmarshal(raw, &text) == nil {
+		value = text
+	}
+	if integer, err := strconv.ParseInt(value, 10, 64); err == nil {
+		return json.RawMessage(strconv.FormatInt(integer, 10))
+	}
+	number, err := strconv.ParseFloat(value, 64)
+	if err != nil || number != math.Trunc(number) || math.Abs(number) > 1<<53 {
+		return raw
+	}
+	return json.RawMessage(strconv.FormatInt(int64(number), 10))
+}
+
 func schemaInteger(raw json.RawMessage, name string) (int64, error) {
 	value, err := strconv.ParseInt(string(raw), 10, 64)
 	if err != nil || value < 0 {
@@ -652,12 +679,65 @@ func normalizeFunctionParameters(raw json.RawMessage) (json.RawMessage, error) {
 	return cleaned, err
 }
 
-// requestNeedsBuildSchema selects native channel for open nodes in structured output
-func requestNeedsBuildSchema(request GenerateRequest) bool {
+// responseSchemaNote is the prefix for full JSON Schema appended to structured output root description.
+const responseSchemaNote = "The response must follow this JSON Schema: "
+
+// encodeResponseSchema encodes structured output schema; schemas that cannot be directly expressed are encoded by hierarchy and type with full schema attached in root description.
+func encodeResponseSchema(raw json.RawMessage) ([]any, error) {
+	wire, err := encodeJSONSchema(raw)
+	if err == nil {
+		return wire, nil
+	}
+	var schema any
+	if json.Unmarshal(raw, &schema) != nil {
+		return nil, err
+	}
+	if _, ok := schema.(map[string]any); !ok {
+		return nil, err
+	}
+	shape, shapeErr := json.Marshal(toolSchemaShape(schema))
+	if shapeErr != nil {
+		return nil, err
+	}
+	wire, shapeErr = encodeJSONSchema(shape)
+	if shapeErr != nil {
+		return nil, err
+	}
+	return describeResponseSchema(wire, raw), nil
+}
+
+// describeResponseSchema appends full JSON Schema to root node description.
+func describeResponseSchema(wire []any, raw json.RawMessage) []any {
+	description := ""
+	if len(wire) > 2 {
+		description, _ = wire[2].(string)
+	}
+	if strings.Contains(description, responseSchemaNote) {
+		return wire
+	}
+	var compact bytes.Buffer
+	if json.Compact(&compact, raw) != nil {
+		compact.Reset()
+		compact.Write(raw)
+	}
+	return setWireField(wire, 2, strings.TrimSpace(description+"\n"+responseSchemaNote+compact.String()))
+}
+
+// projectPlaygroundResponseSchema fills in carrier types for open nodes in Playground and appends full schema.
+func projectPlaygroundResponseSchema(wire []any, raw json.RawMessage) []any {
+	if !schemaWireNeedsBuild(wire) {
+		return wire
+	}
+	projectToolSchema(wire)
+	return describeResponseSchema(wire, raw)
+}
+
+// RequestNeedsBuildSchema checks whether structured output schema contains open nodes requiring carrier types in Playground.
+func RequestNeedsBuildSchema(request GenerateRequest) bool {
 	if len(request.Config.ResponseSchema) == 0 {
 		return false
 	}
-	wire, err := encodeJSONSchema(request.Config.ResponseSchema)
+	wire, err := encodeResponseSchema(request.Config.ResponseSchema)
 	return err == nil && schemaWireNeedsBuild(wire)
 }
 

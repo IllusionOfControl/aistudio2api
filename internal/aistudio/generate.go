@@ -36,6 +36,9 @@ func EncodeGenerateContentRequest(request GenerateRequest, defaults GenerationDe
 	if err != nil {
 		return nil, err
 	}
+	if len(config) > 8 && config[8] != nil {
+		config[8] = projectPlaygroundResponseSchema(config[8].([]any), request.Config.ResponseSchema)
+	}
 	serverSideTools := explicitTools && len(request.Tools.Functions) > 0 && (len(request.Tools.Google) > 0 || request.Tools.GoogleSearch != nil)
 	length := 11
 	if runtime.Timezone != "" || serverSideTools {
@@ -44,8 +47,12 @@ func EncodeGenerateContentRequest(request GenerateRequest, defaults GenerationDe
 	wire := make([]any, length)
 	wire[0] = wireModelName(request.Model)
 	wire[1] = contents
-	if !defaults.ImageRoute {
-		wire[2] = observedSafetySettings()
+	safety, err := resolveSafetySettings(request.SafetySettings, defaults.ImageRoute)
+	if err != nil {
+		return nil, err
+	}
+	if len(safety) > 0 {
+		wire[2] = encodeSafetySettings(safety)
 	}
 	wire[3] = config
 	if request.System != "" {
@@ -77,15 +84,16 @@ func encodeGenerationConfig(config GenerationConfig, defaults GenerationDefaults
 	var responseSchema []any
 	var err error
 	if len(config.ResponseSchema) > 0 {
-		responseSchema, err = encodeJSONSchema(config.ResponseSchema)
+		responseSchema, err = encodeResponseSchema(config.ResponseSchema)
 		if err != nil {
 			return nil, fmt.Errorf("response schema: %w", err)
 		}
 	}
 	thinkingLevel := defaults.DefaultThinkingLevel
-	hasReasoningEffort := strings.TrimSpace(config.ReasoningEffort) != ""
+	effort := normalizedReasoningEffort(config.ReasoningEffort)
+	hasReasoningEffort := effort != ""
 	thinkingBudget := config.ThinkingBudget
-	switch strings.ToLower(strings.TrimSpace(config.ReasoningEffort)) {
+	switch effort {
 	case "":
 	case "low":
 		thinkingLevel = 1
@@ -97,30 +105,21 @@ func encodeGenerationConfig(config GenerationConfig, defaults GenerationDefaults
 		thinkingLevel = 4
 	case "none":
 		thinkingLevel = 4
-		if !defaults.ThinkingLevel {
-			hasReasoningEffort = false
-			if defaults.ThinkingBudget && thinkingBudget == nil {
-				zero := int64(0)
-				thinkingBudget = &zero
-			}
+		if !defaults.ThinkingLevel && defaults.ThinkingBudget && thinkingBudget == nil {
+			zero := int64(0)
+			thinkingBudget = &zero
 		}
 	default:
-		return nil, fmt.Errorf("reasoning effort must be none, minimal, low, medium, or high")
+		return nil, fmt.Errorf("reasoning effort must be none, minimal, low, medium, high, xhigh, or max")
 	}
 	if hasReasoningEffort && defaults.ThinkingLevel {
 		thinkingLevel = closestSupportedThinkingLevel(thinkingLevel, defaults.ThinkingLevels)
 	}
-	if hasReasoningEffort && !defaults.ThinkingLevel {
-		if thinkingBudget == nil || !defaults.ThinkingBudget {
-			return nil, fmt.Errorf("model does not support thinking level")
-		}
+	if !defaults.ThinkingLevel {
 		hasReasoningEffort = false
 	}
 	if thinkingBudget != nil && !defaults.ThinkingBudget {
-		if !defaults.ThinkingLevel {
-			return nil, fmt.Errorf("model does not support thinking budget")
-		}
-		if !hasReasoningEffort {
+		if defaults.ThinkingLevel && !hasReasoningEffort {
 			thinkingLevel = closestSupportedThinkingLevel(thinkingLevelForBudget(*thinkingBudget), defaults.ThinkingLevels)
 		}
 		thinkingBudget = nil
@@ -130,12 +129,13 @@ func encodeGenerationConfig(config GenerationConfig, defaults GenerationDefaults
 	if config.MaxOutputTokens != nil {
 		maxOutput = *config.MaxOutputTokens
 	}
+	if includeMaxOutput && maxOutput > defaults.MaxOutputTokens {
+		maxOutput = defaults.MaxOutputTokens
+	}
 	if includeMaxOutput && maxOutput <= 0 {
 		return nil, fmt.Errorf("model catalog missing valid output token limit")
 	}
-	if includeMaxOutput && maxOutput > defaults.MaxOutputTokens {
-		return nil, fmt.Errorf("max output tokens %d exceeds model limit %d", maxOutput, defaults.MaxOutputTokens)
-	}
+
 	temperature := defaults.Temperature
 	if config.Temperature != nil {
 		temperature = config.Temperature
@@ -174,6 +174,10 @@ func encodeGenerationConfig(config GenerationConfig, defaults GenerationDefaults
 	if err != nil {
 		return nil, err
 	}
+	mediaResolution, err := encodeMediaResolution(config.MediaResolution)
+	if err != nil {
+		return nil, err
+	}
 	includeThinking := defaults.Thinking || defaults.ThinkingBudget || defaults.ThinkingLevel || thinkingBudget != nil || hasReasoningEffort
 	length := 14
 	if responseModalities != nil {
@@ -186,6 +190,9 @@ func encodeGenerationConfig(config GenerationConfig, defaults GenerationDefaults
 		if length < 17 {
 			length = 17
 		}
+	}
+	if mediaResolution != nil && length < 18 {
+		length = 18
 	}
 	if config.Seed != nil {
 		if length < 19 {
@@ -240,6 +247,9 @@ func encodeGenerationConfig(config GenerationConfig, defaults GenerationDefaults
 		}
 		wire[16] = thinking
 	}
+	if mediaResolution != nil {
+		wire[17] = mediaResolution
+	}
 	if config.Seed != nil {
 		wire[18] = *config.Seed
 	}
@@ -253,6 +263,18 @@ func encodeGenerationConfig(config GenerationConfig, defaults GenerationDefaults
 }
 
 var thinkingLevelsByEffort = []int64{4, 1, 2, 3}
+
+// normalizedReasoningEffort normalizes reasoning effort across protocols to none, minimal, low, medium, or high (xhigh and max map to high; empty when unset).
+func normalizedReasoningEffort(value string) string {
+	effort := strings.ToLower(strings.TrimSpace(value))
+	switch effort {
+	case "thinking_level_unspecified":
+		return ""
+	case "xhigh", "max":
+		return "high"
+	}
+	return effort
+}
 
 // thinkingLevelForBudget converts thinking budget to thinking level based on Gemini OpenAI compatibility tiers (1024, 8192, 24576)
 func thinkingLevelForBudget(budget int64) int64 {
@@ -387,42 +409,64 @@ func encodeSpeechConfig(config *SpeechConfig) ([]any, error) {
 	return wire, nil
 }
 
+// mediaResolutions maps Gemini API input media resolution names to generation config field 18 wire codes
+var mediaResolutions = map[string]int64{"MEDIA_RESOLUTION_LOW": 1, "MEDIA_RESOLUTION_MEDIUM": 2, "MEDIA_RESOLUTION_HIGH": 3}
+
+// encodeMediaResolution validates input media resolution and returns wire code, nil when unset
+func encodeMediaResolution(value string) (any, error) {
+	name := strings.ToUpper(strings.TrimSpace(value))
+	if name == "" || name == "MEDIA_RESOLUTION_UNSPECIFIED" {
+		return nil, nil
+	}
+	code, ok := mediaResolutions[name]
+	if !ok {
+		return nil, fmt.Errorf("mediaResolution %q is not supported", value)
+	}
+	return code, nil
+}
+
+// defaultSpeechVoice is the official default single-speaker voice.
+const defaultSpeechVoice = "Zephyr"
+
+// applyModelMediaDefaults sets response modalities using EffectiveResponseModalities, defaulting to Zephyr for TTS models when unset.
 func applyModelMediaDefaults(config GenerationConfig, model Model) GenerationConfig {
-	if model.Capabilities["image_route"] && imageModalityNeedsText(config.ResponseModalities) {
-		// Image output requires requesting text modality as well
-		config.ResponseModalities = []ResponseModality{ResponseModalityImage, ResponseModalityText}
-		return config
-	}
-	if config.ResponseModalities != nil {
-		return config
-	}
-	switch {
-	case model.Capabilities["speech_route"], model.Capabilities["music_route"]:
-		config.ResponseModalities = []ResponseModality{ResponseModalityAudio}
-	case model.Capabilities["image_route"]:
-		config.ResponseModalities = []ResponseModality{ResponseModalityImage, ResponseModalityText}
+	config.ResponseModalities = EffectiveResponseModalities(config.ResponseModalities, model)
+	if speech := config.SpeechConfig; model.Capabilities["speech_route"] && (speech == nil || strings.TrimSpace(speech.VoiceName) == "" && len(speech.Speakers) == 0) {
+		config.SpeechConfig = &SpeechConfig{VoiceName: defaultSpeechVoice}
 	}
 	return config
 }
 
-// imageModalityNeedsText checks whether an image model request lacks TEXT modality
-func imageModalityNeedsText(modalities []ResponseModality) bool {
+// EffectiveResponseModalities returns output modalities that actually take effect for the model: defaults to media model defaults when unspecified, strips unsupported modalities when specified, or preserves original if no intersection.
+func EffectiveResponseModalities(modalities []ResponseModality, model Model) []ResponseModality {
+	supported := []ResponseModality{ResponseModalityText}
+	switch {
+	case model.Capabilities["speech_route"], model.Capabilities["music_route"]:
+		supported = []ResponseModality{ResponseModalityAudio}
+	case model.Capabilities["image_route"]:
+		supported = []ResponseModality{ResponseModalityImage, ResponseModalityText}
+	}
 	if modalities == nil {
-		return true
-	}
-	hasImage := false
-	hasText := false
-	for _, modality := range modalities {
-		switch ResponseModality(strings.ToUpper(strings.TrimSpace(string(modality)))) {
-		case ResponseModalityImage:
-			hasImage = true
-		case ResponseModalityText:
-			hasText = true
-		default:
-			return false
+		if !slices.Equal(supported, []ResponseModality{ResponseModalityText}) {
+			return supported
 		}
+		return nil
 	}
-	return hasImage && !hasText
+	kept := make([]ResponseModality, 0, len(modalities))
+	matched := false
+	for _, modality := range modalities {
+		switch name := ResponseModality(strings.ToUpper(strings.TrimSpace(string(modality)))); {
+		case slices.Contains(supported, name):
+			matched = true
+		case name == ResponseModalityText || name == ResponseModalityImage || name == ResponseModalityAudio:
+			continue
+		}
+		kept = append(kept, modality)
+	}
+	if matched {
+		return kept
+	}
+	return modalities
 }
 
 func applySpeechTranscript(contents []Content, model Model, config GenerationConfig) []Content {
@@ -535,12 +579,39 @@ func speakerSegments(part Part, pattern *regexp.Regexp) []Part {
 	return result
 }
 
-func observedSafetySettings() []any {
-	settings := make([]any, 0, 4)
-	for category := int64(7); category <= 10; category++ {
-		settings = append(settings, []any{nil, nil, category, int64(5)})
+// validateGenerateRequest validates request against loaded model catalog entries, passing if accepted by any entry or deferring to generation path
+func (c *Client) validateGenerateRequest(request GenerateRequest) error {
+	var first error
+	for _, entry := range c.cachedModelEntries(request.Model) {
+		err := validateGenerateEntry(request, entry)
+		if err == nil {
+			return nil
+		}
+		if first == nil {
+			first = err
+		}
 	}
-	return settings
+	return first
+}
+
+// validateGenerateEntry validates tools, transcription, generation config, and safety settings in Generate execution order
+func validateGenerateEntry(request GenerateRequest, entry modelEntry) error {
+	if _, err := supportedTools(request.Tools, entry.model); err != nil {
+		return fmt.Errorf("%w: %v", ErrInvalidArgument, err)
+	}
+	if err := validateTranscriptionConfig(request.Config.TranscriptionConfig, entry.model); err != nil {
+		return fmt.Errorf("%w: %v", ErrInvalidArgument, err)
+	}
+	if entry.defaults.InteractionStream {
+		return nil
+	}
+	if _, err := encodeGenerationConfig(applyModelMediaDefaults(request.Config, entry.model), entry.defaults); err != nil {
+		return fmt.Errorf("%w: %v", ErrInvalidArgument, err)
+	}
+	if _, err := resolveSafetySettings(request.SafetySettings, entry.defaults.ImageRoute); err != nil {
+		return fmt.Errorf("%w: %v", ErrInvalidArgument, err)
+	}
+	return nil
 }
 
 func (c *Client) Generate(ctx context.Context, request GenerateRequest) (<-chan Event, error) {
@@ -556,7 +627,22 @@ func (c *Client) Generate(ctx context.Context, request GenerateRequest) (<-chan 
 	if err != nil {
 		return nil, err
 	}
-	if err := validateRequestedTools(request.Tools, entry.model); err != nil {
+	request.Tools, err = supportedTools(request.Tools, entry.model)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrInvalidArgument, err)
+	}
+	if !entry.model.Capabilities["function_declarations"] {
+		request.Contents, err = transcribeFunctionParts(request.Contents)
+		if err != nil {
+			return nil, fmt.Errorf("%w: %v", ErrInvalidArgument, err)
+		}
+	}
+	interaction := entry.defaults.InteractionStream && !build
+	if interaction {
+		request.Tools = Tools{}
+	}
+	request, contract, err := prepareToolRequest(request)
+	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrInvalidArgument, err)
 	}
 	if err := validateTranscriptionConfig(request.Config.TranscriptionConfig, entry.model); err != nil {
@@ -568,7 +654,7 @@ func (c *Client) Generate(ctx context.Context, request GenerateRequest) (<-chan 
 			return nil, err
 		}
 	}
-	if entry.defaults.InteractionStream && !build {
+	if interaction {
 		return c.generateInteraction(ctx, request, entry)
 	}
 	request.Config = applyModelMediaDefaults(request.Config, entry.model)
@@ -589,20 +675,9 @@ func (c *Client) Generate(ctx context.Context, request GenerateRequest) (<-chan 
 	}
 	matcher := newStopSequenceMatcher(request.Config.StopSequences)
 	var stopTokenCount <-chan tokenCountResult
-	cancelTokenCount := func() {}
+	cancelTokenCount := context.CancelFunc(func() {})
 	if matcher != nil {
-		countContext, cancel := context.WithCancel(ctx)
-		cancelTokenCount = cancel
-		results := make(chan tokenCountResult, 1)
-		stopTokenCount = results
-		countRequest := TokenCountRequest{
-			Model: request.Model, System: request.System, Contents: request.Contents, Tools: request.Tools,
-		}
-		go func() {
-			count, countErr := c.CountTokensForAccount(countContext, request.AccountID, countRequest)
-			results <- tokenCountResult{count: count, err: countErr}
-			close(results)
-		}()
+		stopTokenCount, cancelTokenCount = c.countStopInput(ctx, request)
 	}
 	events := make(chan Event, 8)
 	go func() {
@@ -648,46 +723,11 @@ func (c *Client) Generate(ctx context.Context, request GenerateRequest) (<-chan 
 				return send(event)
 			}
 		}
-		emit := func(event Event) error {
-			if matcher == nil {
-				return emitEvent(event)
-			}
-			if pending := matcher.boundary(event.Kind); pending != "" {
-				if err := emitEvent(Event{Kind: EventText, Text: pending, ProviderModel: event.ProviderModel}); err != nil {
-					return err
-				}
-			}
-			if event.Kind != EventText {
-				return emitEvent(event)
-			}
-			text, matched := matcher.write(event.Text)
-			if text != "" {
-				event.Text = text
-				if err := emitEvent(event); err != nil {
-					return err
-				}
-			}
-			if matched != "" {
-				matchedStopSequence = matched
-				return errStopSequenceMatched
-			}
-			return nil
-		}
+		emit := stopSequenceEmitter(matcher, emitEvent, &matchedStopSequence)
 		err := decodeStream(observeStreamActivity(ctx, response.Body), emit)
 		if errors.Is(err, errStopSequenceMatched) {
 			_ = response.Body.Close()
-			select {
-			case result := <-stopTokenCount:
-				if result.err == nil {
-					usage = countedCompleteUsage(request, output, result.count)
-					if err := send(Event{Kind: EventUsage, Usage: usage}); err != nil {
-						return
-					}
-				}
-			case <-ctx.Done():
-				return
-			}
-			_ = send(Event{Kind: EventFinish, FinishReason: "stop_sequence", StopSequence: matchedStopSequence})
+			finishAtStopSequence(ctx, request, output, stopTokenCount, matchedStopSequence, send)
 			return
 		}
 		if closeErr := response.Body.Close(); err == nil {
@@ -723,27 +763,117 @@ func (c *Client) Generate(ctx context.Context, request GenerateRequest) (<-chan 
 			_ = send(*finish)
 		}
 	}()
-	return events, nil
+	return contract.forward(ctx, events), nil
 }
 
-// truncateRequest drops the earliest complete conversation turns according to authoritative token count
+// countStopInput concurrently counts request input tokens to complete usage after local stop sequence match.
+func (c *Client) countStopInput(ctx context.Context, request GenerateRequest) (<-chan tokenCountResult, context.CancelFunc) {
+	countContext, cancel := context.WithCancel(ctx)
+	results := make(chan tokenCountResult, 1)
+	countRequest := TokenCountRequest{
+		Model: request.Model, System: request.System, Contents: request.Contents, Tools: request.Tools,
+	}
+	go func() {
+		count, err := c.CountTokensForAccount(countContext, request.AccountID, countRequest)
+		results <- tokenCountResult{count: count, err: err}
+		close(results)
+	}()
+	return results, cancel
+}
+
+// stopSequenceEmitter truncates text at stop sequences, flushing pending text before non-text events and returning errStopSequenceMatched upon match.
+func stopSequenceEmitter(matcher *stopSequenceMatcher, forward func(Event) error, matched *string) func(Event) error {
+	return func(event Event) error {
+		if matcher == nil {
+			return forward(event)
+		}
+		if pending := matcher.boundary(event.Kind); pending != "" {
+			if err := forward(Event{Kind: EventText, Text: pending, ProviderModel: event.ProviderModel}); err != nil {
+				return err
+			}
+		}
+		if event.Kind != EventText {
+			return forward(event)
+		}
+		text, sequence := matcher.write(event.Text)
+		if text != "" {
+			event.Text = text
+			if err := forward(event); err != nil {
+				return err
+			}
+		}
+		if sequence != "" {
+			*matched = sequence
+			return errStopSequenceMatched
+		}
+		return nil
+	}
+}
+
+// finishAtStopSequence sends token usage with authoritative input count before sending stop_sequence finish event; sends finish only if count fails.
+func finishAtStopSequence(ctx context.Context, request GenerateRequest, output generatedOutputParts, counts <-chan tokenCountResult, sequence string, send func(Event) error) {
+	select {
+	case result := <-counts:
+		if result.err == nil {
+			if err := send(Event{Kind: EventUsage, Usage: countedCompleteUsage(request, output, result.count)}); err != nil {
+				return
+			}
+		}
+	case <-ctx.Done():
+		return
+	}
+	_ = send(Event{Kind: EventFinish, FinishReason: "stop_sequence", StopSequence: sequence})
+}
+
+// truncateRequest drops earliest complete conversation turns according to authoritative token count, using exponential search then binary search.
 func (c *Client) truncateRequest(ctx context.Context, request GenerateRequest, limit int64) (GenerateRequest, error) {
-	for {
+	starts := []int{0}
+	for start := 0; ; {
+		next := nextConversationTurn(request.Contents[start:])
+		if next < 0 {
+			break
+		}
+		start += next
+		starts = append(starts, start)
+	}
+	fits := func(index int) (bool, error) {
 		count, err := c.CountTokensForAccount(ctx, request.AccountID, TokenCountRequest{
-			Model: request.Model, System: request.System, Contents: request.Contents, Tools: request.Tools,
+			Model: request.Model, System: request.System, Contents: request.Contents[starts[index]:], Tools: request.Tools,
 		})
+		return err == nil && count.InputTokens <= limit, err
+	}
+	if ok, err := fits(0); err != nil || ok {
+		return request, err
+	}
+	failed, fitted := 0, 1
+	for {
+		fitted = min(fitted, len(starts)-1)
+		if fitted == failed {
+			return request, fmt.Errorf("%w: latest conversation turn exceeds model context window %d", ErrInvalidArgument, limit)
+		}
+		ok, err := fits(fitted)
 		if err != nil {
 			return request, err
 		}
-		if count.InputTokens <= limit {
-			return request, nil
+		if ok {
+			break
 		}
-		start := nextConversationTurn(request.Contents)
-		if start < 0 {
-			return request, fmt.Errorf("%w: latest conversation turn exceeds model context window %d", ErrInvalidArgument, limit)
-		}
-		request.Contents = request.Contents[start:]
+		failed, fitted = fitted, fitted*2
 	}
+	for fitted-failed > 1 {
+		middle := (failed + fitted) / 2
+		ok, err := fits(middle)
+		if err != nil {
+			return request, err
+		}
+		if ok {
+			fitted = middle
+		} else {
+			failed = middle
+		}
+	}
+	request.Contents = request.Contents[starts[fitted]:]
+	return request, nil
 }
 
 // nextConversationTurn finds the next user turn while preserving tool call and result pairs

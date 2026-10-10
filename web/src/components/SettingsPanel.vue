@@ -206,11 +206,11 @@ async function copyApiKey(): Promise<void> {
             </span>
           </div>
 
-          <!-- WAA Auto-start -->
+          <!-- Auto-start -->
           <div class="flex items-center justify-between px-4 py-3">
             <div>
               <span class="text-sm text-gray-300">{{ t('settings.autoStart') }}</span>
-              <p class="text-xs text-gray-500">{{ t('settings.autoStartDesc') }}</p>
+              <p class="text-xs text-gray-500">{{ t('settings.autoStartHelp') }}</p>
             </div>
             <span
               class="rounded px-2 py-0.5 text-xs font-medium"
@@ -221,6 +221,24 @@ async function copyApiKey(): Promise<void> {
               "
             >
               {{ config.auto_start ? t('settings.enabled') : t('settings.disabled') }}
+            </span>
+          </div>
+
+          <!-- Request Body Log -->
+          <div class="flex items-center justify-between px-4 py-3">
+            <div>
+              <span class="text-sm text-gray-300">{{ t('settings.requestBodyLog') }}</span>
+              <p class="text-xs text-gray-500">{{ t('settings.requestBodyLogHelp') }}</p>
+            </div>
+            <span
+              class="rounded px-2 py-0.5 text-xs font-medium"
+              :class="
+                config.request_body_log
+                  ? 'bg-emerald-500/20 text-emerald-300'
+                  : 'bg-gray-500/20 text-gray-400'
+              "
+            >
+              {{ config.request_body_log ? t('settings.enabled') : t('settings.disabled') }}
             </span>
           </div>
 

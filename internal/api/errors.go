@@ -57,12 +57,12 @@ func writeSSE(w http.ResponseWriter, event string, payload any) error {
 	if err != nil {
 		return err
 	}
+	frame := make([]byte, 0, len(event)+len(data)+16)
 	if event != "" {
-		if _, err := fmt.Fprintf(w, "event: %s\n", event); err != nil {
-			return err
-		}
+		frame = append(append(append(frame, "event: "...), event...), '\n')
 	}
-	if _, err := fmt.Fprintf(w, "data: %s\n\n", data); err != nil {
+	frame = append(append(append(frame, "data: "...), data...), "\n\n"...)
+	if _, err := w.Write(frame); err != nil {
 		return err
 	}
 	return http.NewResponseController(w).Flush()
@@ -248,7 +248,12 @@ func anthropicErrorType(err error) string {
 	if isUnverifiedProtocolError(err) {
 		return "invalid_request_error"
 	}
-	switch statusFromError(err) {
+	return anthropicStatusErrorType(statusFromError(err))
+}
+
+// anthropicStatusErrorType returns Anthropic error type corresponding to HTTP status code
+func anthropicStatusErrorType(status int) string {
+	switch status {
 	case http.StatusBadRequest:
 		return "invalid_request_error"
 	case http.StatusUnauthorized:

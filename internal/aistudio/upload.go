@@ -226,6 +226,7 @@ func (err *fileReferenceNotFoundError) ErrorCode() string {
 type FileService interface {
 	UploadFile(context.Context, UploadRequest) (FileRef, error)
 	FileMetadata(context.Context, string) (FileMetadata, error)
+	ListFiles(context.Context) ([]FileMetadata, error)
 	DownloadFile(context.Context, string) (MediaStream, error)
 	DeleteFile(context.Context, string) error
 }
@@ -496,7 +497,55 @@ func (p *AccountPool) FileMetadata(ctx context.Context, fileID string) (FileMeta
 	}, nil
 }
 
-// DownloadFile downloads a Drive file using the resource creator account
+// ListFiles returns persistent metadata for all public uploaded files.
+func (s *PooledService) ListFiles(ctx context.Context) ([]FileMetadata, error) {
+	return s.pool.ListFiles(ctx)
+}
+
+// refreshAllRuntimes refreshes runtime-state for all accounts, marking accounts with deleted directories as unavailable.
+func (p *AccountPool) refreshAllRuntimes(ctx context.Context) error {
+	p.mu.Lock()
+	accounts := append([]*Account(nil), p.accounts...)
+	p.mu.Unlock()
+	var failures []error
+	for _, result := range p.refreshAccountRuntimes(ctx, accounts) {
+		if errors.Is(result.err, ErrAccountNotFound) {
+			p.markStaleAccountUnavailable(result.account)
+		} else if result.err != nil {
+			failures = append(failures, result.err)
+		}
+	}
+	return errors.Join(failures...)
+}
+
+// ListFiles returns public uploaded files ordered newest-to-oldest after refreshing all account runtime-states.
+func (p *AccountPool) ListFiles(ctx context.Context) ([]FileMetadata, error) {
+	if err := p.refreshAllRuntimes(ctx); err != nil {
+		return nil, err
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	files := []FileMetadata{}
+	for fileID, accountID := range p.resources {
+		binding := p.byID[accountID].runtime.Resources[fileID]
+		if binding.Kind != "drive-file" || binding.Name == "" || binding.MIME == "" || binding.Size <= 0 || binding.Purpose == "" {
+			continue
+		}
+		files = append(files, FileMetadata{
+			ID: fileID, Name: binding.Name, MIME: binding.MIME, Purpose: binding.Purpose,
+			Size: binding.Size, CreatedAt: binding.CreatedAt,
+		})
+	}
+	sort.Slice(files, func(i, j int) bool {
+		if !files[i].CreatedAt.Equal(files[j].CreatedAt) {
+			return files[i].CreatedAt.After(files[j].CreatedAt)
+		}
+		return files[i].ID < files[j].ID
+	})
+	return files, nil
+}
+
+// DownloadFile downloads a Drive file using the resource creator account.
 func (s *PooledService) DownloadFile(ctx context.Context, fileID string) (MediaStream, error) {
 	lease, owned, err := resolveAccountLease(ctx, s.pool, AccountSelection{ResourceID: strings.TrimSpace(fileID)})
 	if err != nil {
@@ -544,6 +593,11 @@ func (s *PooledService) DeleteFile(ctx context.Context, fileID string) error {
 	if _, err := s.pool.FileMetadata(ctx, fileID); err != nil {
 		return err
 	}
+	return s.deleteDriveResource(ctx, fileID)
+}
+
+// deleteDriveResource deletes bound Drive file using resource creator account, unbinding and returning ErrResourceNotFound if upstream file is gone
+func (s *PooledService) deleteDriveResource(ctx context.Context, fileID string) error {
 	lease, owned, err := resolveAccountLease(ctx, s.pool, AccountSelection{ResourceID: fileID})
 	if err != nil {
 		return err

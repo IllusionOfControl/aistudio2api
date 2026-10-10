@@ -151,6 +151,8 @@ type (
 		DeclarationList []*VariableDeclaration
 
 		Async, Generator bool
+		// Invoked indicates function is leftmost expression in parenthesized expression, predicted as IIFE by SpiderMonkey
+		Invoked bool
 	}
 
 	ClassLiteral struct {

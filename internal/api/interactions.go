@@ -1,9 +1,14 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"image"
+	"image/jpeg"
+	_ "image/png"
 	"net/http"
+	"slices"
 	"strings"
 	"time"
 
@@ -22,48 +27,74 @@ func (s *server) handleInteraction(w http.ResponseWriter, r *http.Request) {
 		writeGeminiError(w, http.StatusBadRequest, "INVALID_ARGUMENT", err.Error())
 		return
 	}
+	if err := inlineRemoteMedia(r.Context(), generate.Contents); err != nil {
+		if shouldWriteRequestError(r, err) {
+			writeGeminiError(w, http.StatusBadRequest, "INVALID_ARGUMENT", err.Error())
+		}
+		return
+	}
 	generate.Unary = !request.Stream
 	current := cloneResponseContents(generate.Contents)
+	var previous responseHistory
 	if request.PreviousID != "" {
-		previous, _, ok := s.responseStates.Load(request.PreviousID)
-		if !ok || !strings.HasPrefix(request.PreviousID, "int_") {
+		var ok bool
+		previous, ok = s.responseStates.Load(request.PreviousID)
+		if !ok || !previous.Interaction {
 			writeGeminiError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "previous_interaction_id was not found")
 			return
 		}
-		generate.Contents = append(previous, generate.Contents...)
+		generate.Contents = append(cloneResponseContents(previous.Contents), generate.Contents...)
 	}
 	if err := resolveInteractionResults(generate.Contents); err != nil {
 		writeGeminiError(w, http.StatusBadRequest, "INVALID_ARGUMENT", err.Error())
 		return
 	}
+	audioExpected := false
+	if slices.Contains(generate.Config.ResponseModalities, aistudio.ResponseModalityAudio) {
+		models, err := s.service.Models(r.Context())
+		if err != nil {
+			if shouldWriteRequestError(r, err) {
+				writeGeminiError(w, statusFromError(err), geminiErrorStatus(err), err.Error())
+			}
+			return
+		}
+		model, _ := lookupPublicModel(models, generate.Model)
+		audioExpected = interactionAudioExpected(generate.Config.ResponseModalities, model)
+	}
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
 	r = r.WithContext(ctx)
 	events, err := s.service.Generate(ctx, generate)
+	if err == nil && request.Stream {
+		events, err = awaitStreamStart(ctx, events)
+	}
 	if err != nil {
 		if shouldWriteRequestError(r, err) {
 			writeGeminiError(w, statusFromError(err), geminiErrorStatus(err), err.Error())
 		}
 		return
 	}
+	if request.imageMIME() == "image/jpeg" {
+		events = jpegImageEvents(ctx, events)
+	}
 	created := time.Now().UTC().Format(time.RFC3339)
 	if request.Stream {
-		s.streamInteraction(w, r, request, generate, current, created, events)
+		s.streamInteraction(w, r, request, generate, audioExpected, previous, current, created, events)
 		return
 	}
 	result, err := consumeEvents(ctx, events, nil)
 	if err == nil {
-		err = validateInteractionResult(generate, result)
+		err = validateInteractionResult(audioExpected, result)
 	}
 	if err == nil {
 		var steps []map[string]any
 		steps, err = interactionSteps(result, request.audioFormat(), request.Generation.ThinkingSummaries != "none")
 		if err == nil {
-			if request.Store == nil || *request.Store {
-				s.storeResponseState(generate.ID, request.PreviousID, current, nil, result)
-			}
 			response := interactionObject(generate, created, interactionStatus(result), result.usage)
 			response["steps"] = steps
+			if request.Store == nil || *request.Store {
+				s.storeInteraction(request, previous, current, result, response)
+			}
 			writeJSON(w, http.StatusOK, response)
 			return
 		}
@@ -73,15 +104,48 @@ func (s *server) handleInteraction(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// validateInteractionResult verifies audio content was received when audio was requested.
-func validateInteractionResult(request aistudio.GenerateRequest, result generationResult) error {
-	for _, modality := range request.Config.ResponseModalities {
-		if modality == aistudio.ResponseModalityAudio {
-			_, err := joinedAudio(result.media)
-			return err
+// jpegImageEvents transcodes non-JPEG image outputs to JPEG.
+func jpegImageEvents(ctx context.Context, events <-chan aistudio.Event) <-chan aistudio.Event {
+	converted := make(chan aistudio.Event)
+	go func() {
+		defer close(converted)
+		for event := range events {
+			if media := event.Media; event.Kind == aistudio.EventMedia && media != nil && len(media.Data) > 0 && strings.HasPrefix(media.MIME, "image/") && !strings.HasPrefix(media.MIME, "image/jpeg") {
+				decoded, _, err := image.Decode(bytes.NewReader(media.Data))
+				var encoded bytes.Buffer
+				if err == nil {
+					err = jpeg.Encode(&encoded, decoded, nil)
+				}
+				if err != nil {
+					event = aistudio.Event{Kind: aistudio.EventError, Err: fmt.Errorf("convert %s output to image/jpeg: %w", media.MIME, err)}
+				} else {
+					jpegMedia := *media
+					jpegMedia.MIME, jpegMedia.Data = "image/jpeg", encoded.Bytes()
+					event.Media = &jpegMedia
+				}
+			}
+			select {
+			case converted <- event:
+			case <-ctx.Done():
+				return
+			}
 		}
+	}()
+	return converted
+}
+
+// validateInteractionResult verifies available audio content was received when audio output was expected.
+func validateInteractionResult(audioExpected bool, result generationResult) error {
+	if !audioExpected {
+		return nil
 	}
-	return nil
+	_, err := joinedAudio(result.media)
+	return err
+}
+
+// interactionAudioExpected determines whether requested AUDIO modality takes effect for the given model.
+func interactionAudioExpected(modalities []aistudio.ResponseModality, model aistudio.Model) bool {
+	return slices.Contains(aistudio.EffectiveResponseModalities(modalities, model), aistudio.ResponseModalityAudio)
 }
 
 // resolveInteractionResults resolves function result names from full call history.
@@ -94,6 +158,9 @@ func resolveInteractionResults(contents []aistudio.Content) error {
 			}
 			if result := part.FunctionResult; result != nil {
 				name := calls[result.ID]
+				if name == "" {
+					name = result.Name
+				}
 				if name == "" || result.Name != "" && result.Name != name {
 					return fmt.Errorf("function result %q must match a preceding function call", result.ID)
 				}

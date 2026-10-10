@@ -215,6 +215,28 @@ func (client *bidiClient) evaluate(ctx context.Context, contextID, expression st
 	return remote, nil
 }
 
+// callFunction invokes function declaration in page default main realm with string arguments
+func (client *bidiClient) callFunction(ctx context.Context, contextID, declaration string, arguments ...string) error {
+	values := make([]map[string]any, len(arguments))
+	for index, argument := range arguments {
+		values[index] = map[string]any{"type": "string", "value": argument}
+	}
+	result, err := client.command(ctx, "script.callFunction", map[string]any{
+		"functionDeclaration": declaration,
+		"arguments":           values,
+		"target":              map[string]any{"context": contextID},
+		"awaitPromise":        true,
+	})
+	if err != nil {
+		return err
+	}
+	if result["type"] == "exception" {
+		encoded, _ := json.Marshal(result)
+		return fmt.Errorf("page function exception: %s", encoded)
+	}
+	return nil
+}
+
 func (client *bidiClient) evaluateString(ctx context.Context, contextID, expression string) (string, error) {
 	result, err := client.evaluate(ctx, contextID, expression)
 	if err != nil {

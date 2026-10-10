@@ -42,7 +42,20 @@ func (r *Runtime) resolveBuiltin(name string) {
 	}
 }
 
-// inHostScript checks whether the nearest script frame belongs to a host script
+// instantiate resolves built-in classes used by code according to SpiderMonkey bytecode instantiation timing; top is for scripts, eval code, and Function bodies, otherwise lazy compiled function calls.
+func (r *Runtime) instantiate(p *Program, top bool) {
+	if !p.regexps && !(top && p.generators) || r.globalObserver == nil || r.resolveMuted != 0 || p.src != nil && strings.HasPrefix(p.src.Name(), hostSourcePrefix) {
+		return
+	}
+	if top && p.generators {
+		r.globalObserver.Resolve("Iterator")
+	}
+	if p.regexps {
+		r.globalObserver.Resolve("RegExp")
+	}
+}
+
+// inHostScript checks whether the nearest script frame belongs to a host script.
 func (vm *vm) inHostScript() bool {
 	prg := vm.prg
 	for index := len(vm.callStack) - 1; prg == nil && index >= 0; index-- {

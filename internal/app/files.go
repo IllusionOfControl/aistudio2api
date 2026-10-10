@@ -46,6 +46,22 @@ func (service *trackedService) FileMetadata(ctx context.Context, fileID string) 
 	return metadata, requestErr
 }
 
+// ListFiles lists uploaded files.
+func (service *trackedService) ListFiles(ctx context.Context) ([]aistudio.FileMetadata, error) {
+	requestCtx, cancel, err := service.observedDataRequestContext(ctx, "")
+	if err != nil {
+		return nil, err
+	}
+	defer cancel()
+	files, ok := service.service.(aistudio.FileService)
+	if !ok {
+		return nil, fmt.Errorf("file service unavailable")
+	}
+	list, requestErr := files.ListFiles(requestCtx)
+	api.SetAccessLogError(requestCtx, requestErr)
+	return list, requestErr
+}
+
 // DeleteFile deletes an uploaded file and logs the outcome.
 func (service *trackedService) DeleteFile(ctx context.Context, fileID string) error {
 	requestCtx, cancel, err := service.observedDataRequestContext(ctx, "")

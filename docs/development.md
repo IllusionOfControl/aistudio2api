@@ -9,8 +9,7 @@ The management listener, public APIs, account pool, protocol runtime, and embedd
 | Scenario | Required Components | Description |
 | --- | --- | --- |
 | Release execution | `aistudio2api` | Automatically prepares Camoufox on first run; does not require Python, Node.js, or Playwright |
-| Source execution | Go 1.25.0+, Node.js 22.13+ or 24+, accompanying npm | Node.js is only used to build the Vue management frontend |
-| Windows Chrome import | Windows amd64, stable Chrome release | The Go application directly reads OAuth/DBSC materials from local Chrome profiles |
+| Source execution | Go 1.26.0+, Node.js 22.13+ or 24+, accompanying npm | Node.js is only used to build the Vue management interface |
 
 Windows users can directly run `aistudio2api.exe` from a release package or build from source using Go and Node.js. Once started, the program automatically opens the management dashboard while the generation service remains stopped initially; account login, log inspection, and starting/stopping the generation service are all performed in this interface.
 
@@ -26,7 +25,7 @@ cd ..
 go run ./cmd/aistudio2api
 ```
 
-The "Accounts" page in the management dashboard provides bulk Chrome import and browser login, as well as re-login, verification, editing, enabling/disabling, and deletion of accounts. Browser login is completed in an isolated Camoufox instance and automatically captures the email address. The `setup` subcommand retains four CLI import entry points:
+The "Accounts" page in the management dashboard provides bulk Chrome import, browser login, and remote pairing, as well as re-login, verification, editing, enabling/disabling, and deletion. Browser login is completed in isolated Camoufox and automatically detects the email. `setup` provides the following command-line import entries:
 
 | Entry Point | Command | Use Case |
 | --- | --- | --- |
@@ -40,13 +39,15 @@ The "Accounts" page in the management dashboard provides bulk Chrome import and 
 | Flag | Purpose |
 | --- | --- |
 | `--chrome-root <DIR>` | Specify Chrome User Data root directory |
-| `--proxy <URL>` | Pin to account initialization, WAA, and operational requests |
-| `--locale <LOCALE>` | Configure account language |
-| `--timezone <IANA_ZONE>` | Configure account timezone |
+| `--proxy <URL>` | Pin to account initialization, WAA, and request traffic |
+| `--locale <LOCALE>` | Set account locale, defaults to current machine |
+| `--timezone <TIMEZONE>` | Set account timezone, defaults to current machine |
+| `--remote <ORIGIN>` | Upload accounts to remote instance (HTTPS required for non-loopback) |
+| `--token <TOKEN>` | Pairing token for remote instance; read from stdin if omitted |
 
-`--storage-state`, `--login`, and Chrome import parameters constitute file import, isolated login, and browser import modes respectively. Isolated login uses `--login`. `setup` requires `AISTUDIO_AUTH_STATES` to point to an account directory.
+`--storage-state`, `--login`, and Chrome import parameters define file import, isolated login, and browser import modes respectively. Isolated login uses `--login`. `setup` requires `AISTUDIO_AUTH_STATES` to point to an account directory when saving locally.
 
-`--proxy` pins the proxy URL for initialization, WAA, and operational requests of new accounts, accepting an unauthenticated HTTP, HTTPS, or SOCKS5 URL. `--locale` and `--timezone` configure the account environment; when Chrome import does not explicitly specify a language, it reads the profile's preferred language. Camoufox is located in the following order: process environment variable `CAMOUFOX_PATH`, `runtime/camoufox/`, a directory with the same name beside the executable, and local Windows Camoufox cache. If none exists, it automatically downloads the pinned version for the current platform.
+When `--remote` is specified, Chrome import, isolated login, and file import are performed locally as usual, and results are uploaded one by one using the pairing token generated from "Add remotely" on the remote instance Accounts page; isolated login also uploads the Camoufox fingerprint. Remotely added accounts use the remote instance default proxy; `--proxy` is only used for local import and login.
 
 Routine startup only requires running the binary or Go entry point, then starting the generation service from the management dashboard:
 
@@ -70,19 +71,19 @@ The management dashboard and `/api` control plane continue running even when the
 
 ```text
 cmd/aistudio2api/        Thin entry point, calls app.Run in internal/app
-internal/app/            Configuration, account assembly, auth refresh, signals, generation instances, scheduling, lifecycle
-internal/setup/          Chrome import, storage-state import, and isolated login commands
-internal/aistudio/       Accounts, MakerSuite, WAA, models, tools, uploads, media, and canonical events
-internal/api/            OpenAI, Responses, Anthropic, Gemini, and management HTTP routes
-internal/camoufoxnative/ Native WebDriver BiDi, WAA bootstrap, and isolated login
-internal/waa/            Pure-Go WAA: BotGuard VM, Firefox-shaped host, and goja fork
-internal/chromeauth/     Windows Chrome OAuth/DBSC discovery, import, and renewal
-internal/config/         Global configuration reading, validation, and atomic persistence
-internal/webui/          Embeds and serves Vue production assets
+internal/app/            Configuration, account assembly, auth refresh, signals, generation service instances, scheduling, lifecycle
+internal/aistudio/       Accounts, MakerSuite, WAA, models, tools, uploads, RPC client, protocol encoding
+internal/api/            Protocol routing, request decoding, SSE conversion, admin endpoints
+internal/camoufoxnative/ Camoufox WebDriver BiDi, process lifecycle, profile isolation, and login
+internal/chromeauth/     Chrome profile discovery, DBSC renewal material, DPAPI and app-bound decryption
+internal/config/         Configuration loading, validation, and immutable settings
+internal/proxydial/      Upstream proxy dialing and local SOCKS5 relay for authenticated proxies
+internal/requestdb/      Request usage ledger and optional body SQLite storage
+internal/setup/          CLI setup execution for Chrome, file, and browser login
+internal/waa/            Pure-Go BotGuard VM runtime, Firefox DOM simulation, Goja JavaScript VM
+internal/webui/          Static frontend embedding and SPA fallback routing
 web/                     Vue 3, TypeScript, Vite, and Tailwind CSS source code
-docs/                    Development workflows and private protocol specifications
-auth/                    Per-account configuration, authentication state, and recoverable runtime state
-runtime/camoufox/        Camoufox browser runtime used in releases
+runtime/requests.db      Request usage ledger and optional captured bodies
 ```
 
 Primary dependency direction:
@@ -133,40 +134,35 @@ The application reads optional `.env` configuration from the current working dir
 | --- | --- | --- |
 | `AISTUDIO_AUTH_STATES` | Account file, directory, or comma-separated multiple paths | `auth` |
 | `LISTEN_ADDR` | HTTP service listen address | `127.0.0.1:2048` |
-| `PROXY_API_KEY` | Public API access key | Empty |
-| `ADMIN_AUTH_ENABLED` | Toggle for admin username/password login | `false` |
-| `ADMIN_USERNAME` | Admin login username | `admin` |
-| `ADMIN_PASSWORD` | Admin password, required when login is enabled | Empty |
-| `PROXY` | Fixed egress proxy used by setup and accounts without a custom proxy | Empty |
-| `INIT_TIMEOUT` | Single account initialization timeout | `2m` |
-| `REQUEST_TIMEOUT` | Maximum execution time for a single request | `5m` |
-| `WARM_WORKER_LIMIT` | Target resident pre-warmed account pool size | `5` |
-| `MAX_ACTIVE_WORKERS` | Maximum active worker capacity limit, must be >= warm pool target | `10` |
-| `WARM_STARTUP_CONCURRENCY` | Number of accounts initialized concurrently during startup | `2` |
-| `PER_ACCOUNT_CONCURRENCY` | Concurrency limit per account | `2` |
-| `ROUTING_STRATEGY` | Account routing strategy: `round-robin` or sticky `fill-first` | `round-robin` |
-| `UPSTREAM_CHANNELS` | Upstream generation channels: `playground`, `build` (comma-separated) | `playground,build` |
-| `BUILD_NATIVE_NONSTREAM` | Prefer Build native unary calls for non-streaming requests | `true` |
-| `WAA_BACKEND` | WAA backend: `camoufox` or `go` | `camoufox` |
-| `TEMPORARY_CHAT` | Whether WAA warm-up pages use temporary chat mode | `false` |
-| `HEADLESS` | Whether Camoufox runs in headless mode (`true` silent background; `false` visible window) | `true` |
-| `CAMOUFOX_PATH` | Custom Camoufox browser executable path (optional) | Empty |
-
-`LISTEN_ADDR` uses `host:port` syntax with a port range of `1..65535`. Duration and capacity fields must be positive values; the valid range for `WARM_STARTUP_CONCURRENCY` is `1..WARM_WORKER_LIMIT`. Global proxy URLs use `http`, `https`, or `socks5` pure origin shapes. Command-line flags `--auth` and `--proxy` override saved values read when launching generation service instances.
+| `PROXY_API_KEY` | Public API key; when empty, only local loopback pages can call APIs | empty |
+| `AUTO_START` | Automatically start generation service once manager process is ready; logs ERROR on failure, manager keeps running | `false` |
+| `REQUEST_BODY_LOG` | Save public API POST request and response bodies, truncated to 64 KiB each, keeping latest 1000 | `false` |
+| `ADMIN_AUTH_ENABLED` | Enable admin console username/password authentication | `false` |
+| `ADMIN_USERNAME` | Admin console username | `admin` |
+| `ADMIN_PASSWORD` | Admin console password; required when authentication is enabled | empty |
+| `PROXY` | HTTP, HTTPS, or SOCKS5 proxy shared across setup and accounts without a dedicated proxy | empty |
+| `INIT_TIMEOUT` | Per-account initialization timeout | `2m` |
+| `REQUEST_TIMEOUT` | Request execution timeout | `5m` |
+| `WARM_WORKER_LIMIT` | Resident prewarmed accounts | `5` |
+| `MAX_ACTIVE_WORKERS` | Maximum concurrent workers during peak load | `10` |
+| `WARM_STARTUP_CONCURRENCY` | Concurrently cold-started Camoufox workers, shared by prewarming and scaling; unlimited when `WAA_BACKEND=go` | `5` |
+| `PER_ACCOUNT_CONCURRENCY` | Concurrent request slots per account | `2` |
+| `ROUTING_STRATEGY` | `round-robin` or `fill-first` | `round-robin` |
+| `UPSTREAM_CHANNELS` | `playground,build` comma-separated | `playground,build` |
+| `BUILD_NATIVE_NONSTREAM` | Prioritize native Build unary calls for non-streaming requests | `true` |
+| `WAA_BACKEND` | `camoufox` or `go` | `camoufox` |
+| `TEMPORARY_CHAT` | Use temporary chat for WAA prewarm page | `false` |
+| `HEADLESS` | Whether Camoufox browser runs in headless mode | `true` |
+| `CAMOUFOX_PATH` | Explicit Camoufox executable path | empty |
 
 `GET /api/config` exposes the active runtime configuration (read-only). Configuration is loaded once at startup from environment variables or `.env` and does not support runtime mutation via the API:
 
 | Field | Meaning |
 | --- | --- |
 | `auth_states`, `proxy`, `init_timeout`, `request_timeout` | Saved values used upon next generation service startup |
-| `warm_worker_limit`, `max_active_workers`, `warm_startup_concurrency`, `per_account_concurrency` | Capacity parameters used upon next generation service startup |
-| `temporary_chat`, `waa_backend`, `upstream_channels`, `build_native_nonstream` | WAA and upstream channel configuration used upon next generation service startup |
-| `admin_auth_enabled`, `admin_username`, `admin_password` | Saved admin authentication settings; omitting password retains current value, password is write-only |
-| `admin_password_set` | Whether an admin password has been configured |
-| `listen_addr`, `proxy_api_key` | Saved management listener configuration |
-| `active_listen_addr`, `active_proxy_api_key` | Immutable values bound to current management process |
-| `management_restart_required` | Saved listen address, API key, or admin auth differs from current management process |
-| `service_restart_required` | Saved generation service configuration differs from active generation service instance |
+| `warm_worker_limit`, `max_active_workers`, `warm_startup_concurrency`, `per_account_concurrency` | Saved values used upon next generation service startup |
+| `temporary_chat`, `upstream_channels`, `build_native_nonstream`, `waa_backend` | Saved values used upon next generation service startup |
+| `routing_strategy` | Takes effect immediately upon configuration update |
 
 Configuration persistence uses temporary files, `Sync`, and atomic replacement. Listen address, local API key, and admin authentication settings are held by the management process and applied after process restart; other configurations take effect after stopping and restarting the generation service.
 
@@ -257,30 +253,26 @@ Public endpoints uniformly consume the same real-time model catalog and canonica
 | Protocol | Endpoints |
 | --- | --- |
 | OpenAI Chat | `GET /v1/models`, `GET /v1/models/{model}`, `POST /v1/chat/completions` |
-| OpenAI Responses | `POST /v1/responses` |
-| Gemini Interactions | `POST /v1beta/interactions`, `POST /v1/interactions` |
-| OpenAI Files | `POST /v1/files`, `GET/DELETE /v1/files/{file}`, `GET /v1/files/{file}/content` |
-| OpenAI Media | `POST /v1/images/generations`, `POST /v1/audio/speech`, `POST /v1/videos`, `GET /v1/videos/{id}`, `GET /v1/videos/{id}/content` |
-| OpenAI Transcribe | `POST /v1/audio/transcriptions` |
-| Anthropic | `POST /v1/messages`, `POST /v1/messages/count_tokens` |
-| Gemini | `GET /v1beta/models`, `GET /v1beta/models/{model}`, `POST /v1beta/models/{model}:generateContent`, `:streamGenerateContent`, `:countTokens`, `:predictLongRunning`, `GET /v1beta/operations/{id}` |
-| Realtime | `GET /v1/live`, `GET /v1/robotics/stream` |
+| OpenAI Responses | `POST /v1/responses`, `POST /v1/responses/input_tokens`, `GET`/`DELETE /v1/responses/{id}`, `GET /v1/responses/{id}/input_items`, `POST /v1/responses/{id}/cancel` |
+| OpenAI Files | `POST /v1/files`, `GET /v1/files`, `GET /v1/files/{id}`, `GET /v1/files/{id}/content`, `DELETE /v1/files/{id}` |
+| Anthropic Messages | `POST /v1/messages`, `POST /v1/messages/count_tokens` |
+| Gemini | `POST /v1beta/models/{model}:generateContent`, `:streamGenerateContent`, `:countTokens` |
+| Embeddings | `POST /v1/embeddings`, `POST /v1beta/models/{model}:embedContent`, `:batchEmbedContents` |
+| Images | `POST /v1/images/generations`, `POST /v1/images/edits` |
+| Audio | `POST /v1/audio/speech`, `POST /v1/audio/transcriptions`, `POST /v1/audio/translations` |
+| Videos | `POST /v1/videos`, `GET /v1/videos`, `GET`/`DELETE /v1/videos/{id}`, `GET /v1/videos/{id}/content` |
+| Gemini Videos | `POST /v1beta/models/{model}:predictLongRunning`, `GET /v1beta/operations/{id}` |
+| Live & Robotics | `GET /v1/live`, `GET /v1/robotics/stream` |
 
 Management dashboard routes:
 
 | Capability | Route |
 | --- | --- |
 | Health & Status | `GET /health`, `GET /api/status` |
-| Models & Accounts | `GET /api/models`, `GET/POST /api/accounts`, `GET/POST /api/accounts/import/chrome`, `PUT/DELETE /api/accounts/{id}` |
-| Login & Verification | `POST /api/accounts/{id}/login`, `POST /api/accounts/{id}/verify` |
-| Generation Service | `POST /api/control/start`, `POST /api/control/stop` |
-| Configuration | `GET /api/config` |
-| Cooldowns & Requests | `GET /api/cooldowns`, `GET /api/requests`, `POST /api/requests/{id}/cancel` |
-| Logs & Events | `DELETE /api/logs`, `GET /api/events` |
-
-`/api` accepts loopback requests and performs same-origin validation when requests include an `Origin` header. `/v1` and `/v1beta` use public API key authorization and CORS headers.
-
-`previous_response_id` in OpenAI Responses and `previous_interaction_id` in Gemini Interactions share an in-memory cache of up to 256 response nodes within the active service instance, used to reconstruct full context for subsequent turns; clients should re-submit complete context after service restarts. Account bindings for Drive files, Veo operations, and artifact files are persisted to `runtime-state.json`, allowing continued polling and downloads across restarts.
+| Models & Accounts | `GET /api/models`, `GET/POST /api/accounts`, `GET/POST /api/accounts/chrome`, `POST /api/pairing`, `POST /api/pairing/accounts` |
+| Account Operations | `PUT/DELETE /api/accounts/{id}`, `POST /api/accounts/{id}/login`, `POST /api/accounts/{id}/verify` |
+| Service Controls | `POST /api/service/start`, `POST /api/service/stop` |
+| Config & Logs | `GET /api/config`, `GET /api/logs/stream`, `GET /api/usage`, `GET /api/requests/{id}/body` |
 
 Adding upstream capabilities starts in `internal/aistudio`: encoding actual array slots, decoding server events, and projecting them to public protocols in `internal/api`. Model methods, contexts, output limits, tools, voices, image specifications, and video formats all derive from real-time `ListModels`.
 
@@ -301,7 +293,7 @@ Vite writes production assets to `internal/webui/dist`. The management dashboard
 
 `internal/webui/embed.go` uses `//go:embed dist`, requiring built frontend assets before building Go binaries. The dashboard receives `status`, `models`, `accounts`, `log`, `cooldowns`, and `request` events from `/api/events`.
 
-The API playground consumes SSE via `eventsource-parser`, completing requests on respective protocol finish events; mid-stream errors and premature disconnections are displayed as failures. Flushed errors on headers, bodies, and heartbeats propagate along the HTTP write path, and event forwarding releases account leases upon cancellation. The playground executes one request at a time, allowing subsequent submissions once stopped.
+The API playground consumes SSE via `eventsource-parser`, completing requests on respective protocol finish events; mid-stream errors and premature disconnections are displayed as failures. Flushing errors in response headers, bodies, and heartbeats propagate along the HTTP write path, and event forwarding releases account leases upon cancellation. The playground executes one request at a time, and switching tabs does not interrupt ongoing requests.
 
 ## 5. Protocol Implementation Workflow
 

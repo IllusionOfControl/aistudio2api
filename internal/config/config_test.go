@@ -65,3 +65,15 @@ func TestAutoStartFromOSLookup(t *testing.T) {
 		t.Fatalf("expected AutoStart to be true when overridden by OS env")
 	}
 }
+
+// TestValidateProxyCredentials validates that proxy URLs accept username/password and reject empty usernames
+func TestValidateProxyCredentials(t *testing.T) {
+	for _, value := range []string{"http://user:secret@127.0.0.1:8080", "socks5://user:secret@127.0.0.1:1080"} {
+		if err := ValidateProxy(value); err != nil {
+			t.Errorf("ValidateProxy(%q) = %v", value, err)
+		}
+	}
+	if err := ValidateProxy("http://:secret@127.0.0.1:8080"); err == nil {
+		t.Error("expected empty username to be rejected")
+	}
+}

@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"path/filepath"
 	"runtime/debug"
 	"sort"
 	"strings"
@@ -335,6 +336,57 @@ func (admin *runtimeAdmin) ImportChromeAccounts(ctx context.Context, input api.C
 	return accounts, nil
 }
 
+// ImportAccountState imports authentication state and Camoufox fingerprint uploaded via remote pairing
+func (admin *runtimeAdmin) ImportAccountState(ctx context.Context, input api.AccountStateInput) (api.AdminAccount, error) {
+	accountConfig := aistudio.DefaultAccountConfig(strings.TrimSpace(input.Label))
+	if locale := strings.TrimSpace(input.Locale); locale != "" {
+		accountConfig.Locale = locale
+	}
+	if timezone := strings.TrimSpace(input.Timezone); timezone != "" {
+		accountConfig.Timezone = timezone
+	}
+	if err := accountConfig.Validate(); err != nil {
+		return api.AdminAccount{}, invalidAccount(err)
+	}
+	if err := input.StorageState.Validate(); err != nil {
+		return api.AdminAccount{}, invalidAccount(err)
+	}
+	if _, err := aistudio.NewSigner().Sign(input.StorageState); err != nil {
+		return api.AdminAccount{}, invalidAccount(fmt.Errorf("authentication state cannot be used for AI Studio: %w", err))
+	}
+	email := accountConfig.Label
+	if extension, exists, err := input.StorageState.AuthExtension(); err != nil {
+		return api.AdminAccount{}, invalidAccount(err)
+	} else if exists && strings.TrimSpace(extension.Source.Email) != "" {
+		email = extension.Source.Email
+	}
+	for _, status := range admin.pool.Status() {
+		if strings.EqualFold(status.ID, strings.TrimSpace(email)) {
+			return api.AdminAccount{}, &adminOperationError{
+				status: http.StatusConflict, code: "account_exists", message: "account already exists: " + status.ID,
+			}
+		}
+	}
+	fingerprintDirectory := ""
+	if len(input.Fingerprint) != 0 {
+		directory, err := os.MkdirTemp("", "aistudio2api-pairing-*")
+		if err != nil {
+			return api.AdminAccount{}, fmt.Errorf("create pairing fingerprint directory: %w", err)
+		}
+		defer os.RemoveAll(directory)
+		if err := os.WriteFile(filepath.Join(directory, "camoufox-fingerprint.json"), input.Fingerprint, 0o600); err != nil {
+			return api.AdminAccount{}, fmt.Errorf("write pairing fingerprint: %w", err)
+		}
+		fingerprintDirectory = directory
+	}
+	account, err := admin.addAccount(ctx, accountConfig, input.StorageState, fingerprintDirectory)
+	if err != nil {
+		return api.AdminAccount{}, err
+	}
+	admin.requests.log("auth", "INFO", "Remotely paired account imported | account="+account.Label)
+	return account, nil
+}
+
 func (admin *runtimeAdmin) addAccount(
 	ctx context.Context,
 	accountConfig aistudio.AccountConfig,
@@ -518,8 +570,11 @@ func (admin *runtimeAdmin) LoginAccount(ctx context.Context, accountID string) (
 	if err := camoufoxnative.PersistAccountFingerprint(directory, account.Directory); err != nil {
 		return api.AdminAccount{}, errors.Join(err, lease.Release())
 	}
-
-	if err := lease.SaveStorageState(result.StorageState); err != nil {
+	state := result.StorageState
+	if err := keepAuthExtension(&state, account.StorageState); err != nil {
+		return api.AdminAccount{}, errors.Join(err, lease.Release())
+	}
+	if err := lease.SaveStorageState(state); err != nil {
 		return api.AdminAccount{}, errors.Join(err, lease.Release())
 	}
 
@@ -546,6 +601,18 @@ func (admin *runtimeAdmin) LoginAccount(ctx context.Context, accountID string) (
 	return admin.account(account.ID)
 }
 
+// keepAuthExtension preserves existing Chrome origin and OAuth material when new login state lacks renewal material.
+func keepAuthExtension(next *aistudio.StorageState, current aistudio.StorageState) error {
+	if _, exists, err := next.AuthExtension(); err != nil || exists {
+		return err
+	}
+	extension, exists, err := current.AuthExtension()
+	if err != nil || !exists {
+		return err
+	}
+	return next.SetAuthExtension(extension)
+}
+
 func (admin *runtimeAdmin) VerifyAccount(ctx context.Context, accountID string) (api.AdminAccount, error) {
 	lease, err := admin.pool.AcquireAccount(ctx, accountID)
 	if err != nil {
@@ -557,6 +624,13 @@ func (admin *runtimeAdmin) VerifyAccount(ctx context.Context, accountID string) 
 	admin.requests.log(account.Config.Label, "INFO", "Account verification | Visiting AI Studio")
 
 	verification, err := admin.login.Verify(ctx, admin.loginRequest(account, account.Directory), account.StorageState)
+	if err == nil && !verification.Authenticated && admin.workers != nil && admin.workers.refresher != nil {
+		renewCtx := aistudio.ContextWithAccountLease(ctx, lease)
+		if admin.workers.refresher.Available(renewCtx) && admin.workers.refresher.Refresh(renewCtx) == nil {
+			admin.requests.log(account.Config.Label, "INFO", "Account verification | Re-visiting AI Studio after renewal")
+			verification, err = admin.login.Verify(ctx, admin.loginRequest(account, account.Directory), account.StorageState)
+		}
+	}
 	if err != nil {
 		admin.requests.log(account.Config.Label, "ERROR", fmt.Sprintf(
 			"Account verification failed | duration=%s | error=%s",
@@ -1490,6 +1564,8 @@ func buildVersion() string {
 
 func runtimeConfigDTO(cfg config.Config) api.RuntimeConfig {
 	return api.RuntimeConfig{
+		AutoStart:              cfg.AutoStart,
+		RequestBodyLog:         cfg.RequestBodyLog,
 		AdminAuthEnabled:       cfg.AdminAuthEnabled,
 		AdminUsername:          cfg.AdminUsername,
 		AdminPasswordSet:       cfg.AdminPassword != "",
@@ -1512,7 +1588,6 @@ func runtimeConfigDTO(cfg config.Config) api.RuntimeConfig {
 		TemporaryChat:          cfg.TemporaryChat,
 		Headless:               cfg.Headless,
 		WAABackend:             cfg.WAABackend,
-		AutoStart:              cfg.AutoStart,
 	}
 }
 

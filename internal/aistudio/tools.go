@@ -303,12 +303,13 @@ func decodeFunctionCall(raw json.RawMessage, path string, evidence json.RawMessa
 	return call, nil
 }
 
+// encodeWireStructJSON encodes JSON value as Struct matching Build, placing non-object values in result field
 func encodeWireStructJSON(raw json.RawMessage) ([]any, error) {
-	var object map[string]any
-	if err := json.Unmarshal(raw, &object); err != nil || object == nil {
-		return nil, fmt.Errorf("must be a JSON object")
+	object, err := buildJSONObject(raw)
+	if err != nil {
+		return nil, fmt.Errorf("must be a JSON object: %w", err)
 	}
-	return encodeWireStruct(object), nil
+	return encodeWireStruct(object.(map[string]any)), nil
 }
 
 func encodeWireStruct(object map[string]any) []any {

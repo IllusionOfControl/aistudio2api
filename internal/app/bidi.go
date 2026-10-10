@@ -88,7 +88,7 @@ func (service *trackedService) OpenBidi(ctx context.Context, request aistudio.Bi
 		cancel()
 		return nil, err
 	}
-
+	api.SetAccessLogChannel(ctx, string(session.Channel()))
 	return session, nil
 }
 
@@ -105,7 +105,7 @@ func (service *trackedService) bidiCandidates(ctx context.Context, model string,
 		aistudio.AccountSelection{
 			ModelID:          modelID,
 			ModelAccessScope: modelAccessScope,
-			Method:           "bidiGenerateContent",
+			Method:           service.pool.BidiMethod(modelID),
 		},
 		service.workers.WarmAccountIDs(),
 	)

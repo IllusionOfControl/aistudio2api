@@ -3,9 +3,9 @@
 # AI Studio to OpenAI, Anthropic & Gemini Compatible API
 
 <p align="center">
-<a href="README.md"><b>English</b></a>
-&nbsp;|&nbsp;
-<a href="README_ch.md">中文</a>
+  <a href="README.md">中文</a>
+  &nbsp;|&nbsp;
+  <a href="README_en.md"><b>English</b></a>
 </p>
 
 <p>
@@ -46,44 +46,45 @@
 - **Files and Transcribe**: File upload, metadata, content, deletion, and audio transcription
 - **Live and Robotics**: WebSocket text, audio, JPEG images, media end, tool calls, resumption, and interruption
 - **Anti-Fingerprinting**: Camoufox holds the official WAA lifecycle with a stable browser fingerprint and network exit per account
-- **GUI Launcher**: Manage accounts, service controls, live logs, models, requests, and configuration in the web UI
+- **GUI Launcher**: Manage accounts, service controls, live logs, models, requests, usage statistics, and configuration in the web UI
 - **Modular Architecture**: Go handles protocols, scheduling, APIs, and management; Camoufox hosts WAA and isolated login
 
 ## System Requirements
 
-- **Windows Release Runtime**: Windows 10 or later and `aistudio2api.exe`
+- **Windows Release Runtime**: Windows 10 or later, `aistudio2api.exe`
 - **Linux Release Runtime**: Extract `linux-amd64.tar.gz` and run `./aistudio2api`; Camoufox needs the Firefox system libraries, on Debian/Ubuntu run `sudo apt install libgtk-3-0 libasound2 libnss3 libdbus-glib-1-2 libxtst6 libxrandr2 libgbm1 libxkbcommon0 libpango-1.0-0 libcairo2 libxcomposite1 libxdamage1 libxfixes3 fonts-liberation`
-- **Source Build**: Go 1.25.0+, Node.js 22.13+ or 24+, and its bundled npm
+- **Source Build**: Go 1.26.0+, Node.js 22.13+ or 24+, and its bundled npm
 - **Operating System**: Windows, macOS, Linux
 - **Memory**: 2GB+ available memory for one account; each resident prewarmed account adds about 0.6GB
 - **Network**: Stable internet connection to Google AI Studio
 
 ## Installation
 
-### Method 1: Windows Release Package
+### Method 1: Windows One-Click Start (Recommended)
 
-Download the `windows-amd64.zip` package from [Releases](https://github.com/Mag1cFall/AIStudio2API/releases), extract it, and run `aistudio2api.exe`. The package includes the management interface and is ready to run.
+Download the `windows-amd64.zip` package from [Releases](https://github.com/Mag1cFall/AIStudio2API/releases), extract it, and run `.\aistudio2api.exe`. The package includes the management interface and is ready to run.
 
-To start from source on Windows:
+To start from source:
 
 ```powershell
 git clone https://github.com/Mag1cFall/AIStudio2API.git
 cd AIStudio2API
 copy .env.example .env
-cd web
-npm ci
-npm run build
-cd ..
-go build -o aistudio2api.exe ./cmd/aistudio2api
+```
+
+Run the executable directly from PowerShell or terminal:
+
+```powershell
 .\aistudio2api.exe
 ```
 
 The first launch downloads Camoufox for the current platform to `runtime/camoufox/`. Set `CAMOUFOX_PATH` to use an existing executable instead.
+
 ### Method 2: Linux and macOS Source Build
 
 #### 1. Install Dependencies
 
-- Go 1.25.0 or later
+- Go 1.26.0 or later
 - Node.js 22.13+ or 24+, with its bundled npm
 
 #### 2. Clone the Project
@@ -129,8 +130,7 @@ The first Linux or macOS launch also prepares the matching Camoufox build automa
    The Google email is read from AI Studio after login, and Google Drive is authorized for the account. The account is saved under the path configured by `AISTUDIO_AUTH_STATES` in `.env`. Locale and timezone default to the current computer and can be set with `--locale` and `--timezone`.
 
 2. **Start the management UI**:
-   - Run `.\aistudio2api.exe` on Windows
-   - Run `./aistudio2api` on Linux or macOS
+   - Run `.\aistudio2api.exe` on Windows or `./aistudio2api` on Linux/macOS
    - The browser opens `http://127.0.0.1:2048`
    - The initial state is `STOPPED`, with Logs open by default
 
@@ -158,22 +158,23 @@ Account actions depend on state:
 ### Daily Use (With Existing Authentication)
 
 1. Run `.\aistudio2api.exe` on Windows; run `./aistudio2api` on Linux or macOS
-2. Click "Start service" to enable the APIs
+2. Click "Start service" to enable the APIs; with `AUTO_START=true`, the service starts together with the manager
 3. "Stop service" cancels an in-progress launch or active requests and closes WAA workers while the management UI and Logs remain available
 4. Click "Start service" again to resume the APIs
 
-Starting again loads the latest data-plane settings from `.env`. Changes to `LISTEN_ADDR` or `PROXY_API_KEY` require restarting the management process.
+Starting again loads the latest data-plane settings from `.env`; the account selection strategy applies as soon as it is saved. Changes to `LISTEN_ADDR` or `PROXY_API_KEY` require restarting the management process.
 
 Press `Ctrl+C` in the launch window or close that window to exit the manager. Closing the browser tab does not stop the manager.
 
 ### Quick Start
-### CLI Quick Reference
 
-`./aistudio2api`: Starts the manager and opens the web UI.
+`aistudio2api`: Starts the manager and opens the web UI.
 
-`./aistudio2api --open-ui=false`: Starts the manager without opening the web UI.
+`aistudio2api -open-ui=false`: Starts the manager without opening the web UI.
 
-`./aistudio2api setup`: Scans local Chrome accounts (Windows). Use `--email` or `--profile` to select a Chrome account. Run `./aistudio2api setup --login` for an isolated login, or `./aistudio2api setup --storage-state <file>` to import a file.
+`.\aistudio2api.exe setup`: Scans local Chrome accounts. Use `--email` or `--profile` to select a Chrome account. Run `.\aistudio2api.exe setup --login` for an isolated login, or `.\aistudio2api.exe setup --storage-state <file>` to import a file.
+
+`.\aistudio2api.exe setup --remote https://<remote-instance>`: Adds accounts to a remote instance. Click "Add remotely" on the remote instance's Accounts page to get a pairing token, then run the command on a computer that can sign in to Google and paste the token. It combines with options such as `--login`.
 
 ## API Usage
 
@@ -234,13 +235,23 @@ env_key = "AISTUDIO2API_KEY"
 wire_api = "responses"
 ```
 
-[omp](https://github.com/can1357/oh-my-pi) runs its `web_search` tool through its own provider order. Set `GOOGLE_GEMINI_BASE_URL=http://127.0.0.1:2048` and `GEMINI_API_KEY=<PROXY_API_KEY>`, and put the Gemini provider first in the omp config:
+[omp](https://github.com/can1357/oh-my-pi) runs its `web_search` tool with the model of the `web` role. Add a Gemini provider that points to this service in omp's `models.yml` (`apiKey` is the name of the environment variable holding `PROXY_API_KEY`), then set the `web` role to that model in `config.yml`:
 
 ```yaml
+# models.yml
 providers:
-  webSearchOrder:
-    - gemini
-  webSearchGeminiModel: gemini-3.8-flash
+  aistudio-gemini:
+    baseUrl: http://127.0.0.1:2048/v1beta
+    api: google-generative-ai
+    apiKey: AISTUDIO2API_KEY
+    models:
+      - id: gemini-3.8-flash
+```
+
+```yaml
+# config.yml
+modelRoles:
+  web: aistudio-gemini/gemini-3.8-flash
 ```
 
 Main endpoints:
@@ -249,17 +260,18 @@ Main endpoints:
 | --- | --- |
 | Models | `GET /v1/models`, `GET /v1/models/{model}`, `GET /v1beta/models`, `GET /v1beta/models/{model}` |
 | OpenAI Chat | `POST /v1/chat/completions` |
-| OpenAI Responses | `POST /v1/responses` |
-| Files | `POST /v1/files`, `GET /v1/files/{id}`, `GET /v1/files/{id}/content`, `DELETE /v1/files/{id}` |
+| OpenAI Responses | `POST /v1/responses`, `POST /v1/responses/input_tokens`, `GET`/`DELETE /v1/responses/{id}`, `GET /v1/responses/{id}/input_items`, `POST /v1/responses/{id}/cancel` |
+| Files | `POST /v1/files`, `GET /v1/files`, `GET /v1/files/{id}`, `GET /v1/files/{id}/content`, `DELETE /v1/files/{id}` (OpenAI and Anthropic formats); `POST /upload/v1beta/files`, `GET /v1beta/files`, `GET`/`DELETE /v1beta/files/{id}` |
 | Anthropic | `POST /v1/messages`, `POST /v1/messages/count_tokens` |
 | Gemini | `POST /v1beta/models/{model}:generateContent`, `:streamGenerateContent`, `:countTokens` |
-| Images | `POST /v1/images/generations` |
+| Embeddings | `POST /v1/embeddings`, `POST /v1beta/models/{model}:embedContent`, `:batchEmbedContents` |
+| Images | `POST /v1/images/generations`, `POST /v1/images/edits` |
 | Speech | `POST /v1/audio/speech` |
-| Transcription | `POST /v1/audio/transcriptions` |
+| Transcription and translation | `POST /v1/audio/transcriptions`, `POST /v1/audio/translations` |
 | Music | Gemini `generateContent` with `responseModalities: ["AUDIO"]` |
-| Video | `POST /v1/videos`, `GET /v1/videos/{id}`, `GET /v1/videos/{id}/content` |
+| Video | `POST /v1/videos`, `GET /v1/videos`, `GET`/`DELETE /v1/videos/{id}`, `GET /v1/videos/{id}/content` |
 | Gemini Video | `POST /v1beta/models/{model}:predictLongRunning`, `GET /v1beta/operations/{id}` |
-| Live (including live translation and live transcription) / Robotics | `GET /v1/live`, `GET /v1/robotics/stream` |
+| Live (including live translation, live transcription, and live music) / Robotics | `GET /v1/live`, `GET /v1/robotics/stream` |
 
 All four generation APIs can enable Search, Image Search, URL Context, Code Execution, and Maps through their protocol fields. Request and event formats for Files, Transcribe, Live, and Robotics are documented in the [Google AI Studio protocol specification](docs/protocol.md).
 
@@ -380,6 +392,7 @@ The model catalog follows AI Studio updates; clients read the current values fro
 | `gemini-3.7-flash` | Gemini 3.7 Flash | 1048576 | 65536 | `batchGenerateContent, countTokens, createCachedContent, generateContent` |
 | `gemini-flash-latest` | Gemini Flash Latest | 1048576 | 65536 | `batchGenerateContent, countTokens, createCachedContent, generateContent` |
 | `gemini-flash-lite-latest` | Gemini Flash-Lite Latest | 1048576 | 65536 | `batchGenerateContent, countTokens, createCachedContent, generateContent` |
+| `gemini-nano-banana-2.1` | Nano Banana 2.1 | 65536 | 65536 | `batchGenerateContent, countTokens, generateContent` |
 | `gemini-omni-flash-preview` | Gemini Omni Flash Preview | 131072 | 65536 | `countTokens, generateContent` |
 | `gemini-pro-latest` | Gemini Pro Latest | 1048576 | 65536 | `batchGenerateContent, countTokens, createCachedContent, generateContent` |
 | `gemini-robotics-er-1.6-preview` | Gemini Robotics-ER 1.6 Preview | 131072 | 65536 | `batchGenerateContent, countTokens, createCachedContent, generateContent` |
@@ -392,7 +405,7 @@ The model catalog follows AI Studio updates; clients read the current values fro
 | `veo-3.1-generate-preview` | Veo 3.1 | 480 | 8192 | `predictLongRunning` |
 | `veo-3.1-lite-generate-preview` | Veo 3.1 lite | 480 | 8192 | `predictLongRunning` |
 
-Public endpoints implement `generateContent`, `countTokens`, and `predictLongRunning`. `/v1/models` and `/v1beta/models` preserve the live upstream catalogs across accounts; scheduling uses explicit model ID, method, and capability fields plus current account runtime state.
+Public endpoints implement `generateContent`, `countTokens`, `embedContent`, `batchEmbedContents`, and `predictLongRunning`; `bidiGenerateContent` and `bidiGenerateMusic` models are called through `/v1/live`. `/v1/models` and `/v1beta/models` preserve the live upstream catalogs across accounts; scheduling uses explicit model ID, method, and capability fields plus current account runtime state.
 
 ## Project Architecture
 
@@ -425,6 +438,8 @@ cp .env.example .env
 | `AISTUDIO_AUTH_STATES` | `auth` | Account file, directory, or comma-separated paths |
 | `LISTEN_ADDR` | `127.0.0.1:2048` | Management UI and API listen address |
 | `PROXY_API_KEY` | empty | Public API key |
+| `AUTO_START` | `false` | Start the generation service when the manager starts |
+| `REQUEST_BODY_LOG` | `false` | Store public API request and response bodies, each truncated to 64 KiB, keeping the latest 1000 |
 | `ADMIN_AUTH_ENABLED` | `false` | Enable username/password login for the console |
 | `ADMIN_USERNAME` | `admin` | Administrator username |
 | `ADMIN_PASSWORD` | empty | Administrator password, required when login is enabled |
@@ -433,16 +448,15 @@ cp .env.example .env
 | `REQUEST_TIMEOUT` | `5m` | Maximum request execution time |
 | `WARM_WORKER_LIMIT` | `5` | Number of resident prewarmed accounts |
 | `MAX_ACTIVE_WORKERS` | `10` | Maximum workers active during peak load |
-| `WARM_STARTUP_CONCURRENCY` | `2` | Accounts initialized concurrently during prewarming |
+| `WARM_STARTUP_CONCURRENCY` | `5` | Camoufox workers cold-started concurrently, shared by prewarming and on-demand scaling; unlimited with `WAA_BACKEND=go` |
 | `PER_ACCOUNT_CONCURRENCY` | `2` | Concurrent requests allowed per account |
 | `ROUTING_STRATEGY` | `round-robin` | `round-robin` rotates accounts; `fill-first` reuses the first available account |
 | `UPSTREAM_CHANNELS` | `playground,build` | Upstream channels for generation requests; either one can be used alone |
 | `BUILD_NATIVE_NONSTREAM` | `true` | Prefer native Build unary calls for non-streaming requests; log any fallback to stream collection |
 | `WAA_BACKEND` | `camoufox` | `camoufox` runs WAA in a Camoufox page; `go` runs WAA inside the service process and neither downloads nor starts Camoufox |
 | `TEMPORARY_CHAT` | `false` | Use Temporary Chat for the WAA prewarm page |
-| `HEADLESS` | `true` | Run Camoufox in headless mode (`true` for silent background; `false` to display browser window) |
-| `CAMOUFOX_PATH` | empty | Custom path to Camoufox executable (optional) |
-The service loads every account from `AISTUDIO_AUTH_STATES`. `WARM_WORKER_LIMIT` sets the resident warm pool, `MAX_ACTIVE_WORKERS` caps peak worker count, `WARM_STARTUP_CONCURRENCY` controls concurrent prewarming, and `PER_ACCOUNT_CONCURRENCY` controls request slots per account.
+
+The service loads every account from `AISTUDIO_AUTH_STATES`. `WARM_WORKER_LIMIT` sets the resident warm pool, `MAX_ACTIVE_WORKERS` caps peak worker count, `WARM_STARTUP_CONCURRENCY` controls how many Camoufox workers cold-start at once, and `PER_ACCOUNT_CONCURRENCY` controls request slots per account.
 
 ### Port Configuration
 
@@ -457,11 +471,12 @@ Use an HTTPS reverse proxy that preserves `Host` and sets `X-Forwarded-Proto: ht
 
 ### Proxy Configuration
 
-HTTP, HTTPS, and SOCKS5 proxies without embedded credentials are supported:
+HTTP, HTTPS, and SOCKS5 proxies are supported. For proxies that require authentication, include the credentials in the URL, for example `socks5://user:password@host:1080`:
 
-1. Set the global proxy `PROXY` in `.env`
+1. Set the global proxy under Service Configuration
 2. Edit an account to set an account-specific proxy
 3. The account proxy is used for login, WAA, and business requests
+4. For authenticated proxies, the program gives Camoufox a credential-free SOCKS5 relay on the loopback address; the credentials are not written to the browser profile. While the relay runs, other local processes can also use the proxy through it
 
 ### Authentication File Management
 
@@ -504,7 +519,7 @@ With `WAA_BACKEND=go`, WAA runs inside the service process, emulates the Firefox
 - **Client-Managed History**: Clients submit complete conversation context for Chat, Anthropic, and Gemini requests
 - **AI Studio History**: API requests are not saved to website history; `TEMPORARY_CHAT=true` also disables autosave for the WAA prewarm page
 - **Responses Sessions**: `previous_response_id` is stored only in the current process and is cleared on restart
-- **Authentication Expiry**: Chrome imports retain DBSC renewal material; isolated-login accounts must log in again after authentication expires
+- **Authentication Expiry**: Chrome imports retain DBSC renewal material. When another account expires and the local Chrome is signed in to the same email, the service renews it with that email's material from Chrome and renews it as a Chrome import from then on; otherwise log in again on the Accounts page
 
 ## Troubleshooting
 
@@ -552,11 +567,10 @@ Issues and Pull Requests are welcome!
 - ✅ **TTS Support**: Adapted `gemini-2.5-flash/pro-preview-tts` speech generation models
 - ✅ **Media Generation**: Supports Imagen 3, Veo 2, Nano Banana image/video generation
 - ✅ **Documentation**: Update and optimize documentation in `docs/` directory
-- **One-Click Deployment**: Provide fully automated install and launch scripts for Windows/Linux/macOS
 - ✅ **Go Refactoring**: Migrate core proxy service to Go for improved concurrency and reduced resource usage
 - ✅ **Multi-Worker Load Balancing**: Support multi-Google account rotation pool for higher concurrency limits
 
 ### Pure Go WAA Runtime
 
 - ✅ **Pure Go backend**: `WAA_BACKEND=go` runs the official interpreter and program inside the service process, emulating the Firefox page environment from each account fingerprint; it neither downloads nor starts Camoufox at runtime, while account login still uses Camoufox
-- **Firefox engine details**: implement `Intl` formatting, the global resolution timing of regular-expression literals, and the Symbol key order of `RegExp.prototype`
+- ✅ **Firefox engine details**: implement `Intl` formatting, the global resolution timing of regular-expression literals, and the Symbol key order of `RegExp.prototype`

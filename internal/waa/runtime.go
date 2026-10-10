@@ -51,7 +51,10 @@ const promptScript = `((prompt, submit) => {
   return textarea.value;
 })`
 
-// NewRuntime loads interpreter in Firefox host and initializes challenge program
+// promptProgram is the precompiled promptScript shared across Runtime instances.
+var promptProgram = goja.MustCompile(hostScriptName, promptScript, false)
+
+// NewRuntime loads interpreter in Firefox host and initializes challenge program.
 func NewRuntime(ctx context.Context, options Options) (*Runtime, error) {
 	if options.Interpreter == "" {
 		return nil, errors.New("WAA interpreter is empty")
@@ -237,7 +240,7 @@ func (runtime *Runtime) FillPrompt(ctx context.Context, prompt string, submit bo
 func (runtime *Runtime) fillPrompt(ctx context.Context, prompt string, submit bool) error {
 	result := make(chan error, 1)
 	if !runtime.loop.post(func() {
-		function, err := runtime.vm.RunScript(hostScriptName, promptScript)
+		function, err := runtime.vm.RunProgram(promptProgram)
 		if err != nil {
 			result <- err
 			return
