@@ -555,7 +555,7 @@ func sameOriginMiddleware(next http.Handler) http.Handler {
 func authMiddleware(requiredKey string, next http.Handler) http.Handler {
 	requiredKey = strings.TrimSpace(requiredKey)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if requiredKey != "" && subtle.ConstantTimeCompare([]byte(requestAPIKey(r)), []byte(requiredKey)) != 1 {
+		if requiredKey != "" && !checkAPIKeyMatches(r, requiredKey) {
 			writeAuthError(w, r)
 			return
 		}
@@ -564,18 +564,27 @@ func authMiddleware(requiredKey string, next http.Handler) http.Handler {
 	})
 }
 
-func requestAPIKey(r *http.Request) string {
-	if key := strings.TrimSpace(r.URL.Query().Get("key")); key != "" {
-		return key
+// checkAPIKeyMatches checks whether any API key in request headers or URL parameters matches the configured key.
+func checkAPIKeyMatches(r *http.Request, requiredKey string) bool {
+	requiredBytes := []byte(requiredKey)
+	candidates := []string{
+		r.Header.Get("X-Goog-API-Key"),
+		r.Header.Get("X-API-Key"),
+		bearerToken(r.Header.Get("Authorization")),
+		r.URL.Query().Get("key"),
 	}
-	if key := strings.TrimSpace(r.Header.Get("X-Goog-API-Key")); key != "" {
-		return key
+	for _, cand := range candidates {
+		cand = strings.TrimSpace(cand)
+		if cand != "" && subtle.ConstantTimeCompare([]byte(cand), requiredBytes) == 1 {
+			return true
+		}
 	}
-	if key := strings.TrimSpace(r.Header.Get("X-API-Key")); key != "" {
-		return key
-	}
-	authorization := strings.TrimSpace(r.Header.Get("Authorization"))
-	scheme, key, ok := strings.Cut(authorization, " ")
+	return false
+}
+
+// bearerToken extracts the bearer token from the Authorization header.
+func bearerToken(authorization string) string {
+	scheme, key, ok := strings.Cut(strings.TrimSpace(authorization), " ")
 	if ok && strings.EqualFold(scheme, "Bearer") {
 		return strings.TrimSpace(key)
 	}
