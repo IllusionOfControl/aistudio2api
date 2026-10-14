@@ -2057,6 +2057,7 @@ type trackedService struct {
 
 type modelCatalogService interface {
 	RefreshAccountModels(context.Context, string) ([]aistudio.Model, error)
+	RefreshAccountTier(context.Context, string) (aistudio.BenefitTier, aistudio.BenefitTier, error)
 	CachedModels() []aistudio.Model
 }
 
@@ -2091,6 +2092,7 @@ const (
 	serviceLaunching
 	serviceRunning
 	modelCatalogRetryInterval        = 30 * time.Second
+	benefitTierRefreshInterval       = 10 * time.Minute
 	modelCatalogShutdownTimeout      = 2 * time.Second
 	serviceTransitionShutdownTimeout = 12 * time.Second
 )
@@ -2460,9 +2462,9 @@ func (service *trackedService) finishStop(transitionDone chan struct{}, modelRef
 	service.lifecycleMu.Unlock()
 }
 
-// Models returns the public catalog of models qualified by enabled accounts.
+// Models returns the public catalog that enabled channels can provide.
 func (service *trackedService) Models(context.Context) ([]aistudio.Model, error) {
-	return service.pool.EligibleModels(service.modelSnapshot()), nil
+	return service.pool.PublicModels(service.modelSnapshot()), nil
 }
 
 // catalogModels returns the complete catalog and available channels for each model used by the admin page
@@ -2669,21 +2671,42 @@ func (service *trackedService) syncAccountModels(ctx context.Context, accountID 
 	return models, err
 }
 
+// retryModelCatalogs retries unsynced account catalogs every 30 seconds and checks enabled account benefit tiers every 10 minutes
 func (service *trackedService) retryModelCatalogs(ctx context.Context) {
 	ticker := time.NewTicker(modelCatalogRetryInterval)
 	defer ticker.Stop()
-
+	tierTicker := time.NewTicker(benefitTierRefreshInterval)
+	defer tierTicker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
+		case <-tierTicker.C:
+			service.refreshAccountTiers(ctx)
 		case <-ticker.C:
-		}
-
-		if !service.retryAccountModelCatalogs(ctx) {
-			return
+			if !service.retryAccountModelCatalogs(ctx) {
+				return
+			}
 		}
 	}
+}
+
+// refreshAccountTiers concurrently fetches benefit tiers for enabled accounts, publishing account and model events and logging changes
+func (service *trackedService) refreshAccountTiers(ctx context.Context) {
+	var refreshes sync.WaitGroup
+	for _, accountID := range service.modelCatalogAccountIDs() {
+		refreshes.Go(func() {
+			requestCtx, cancel := service.lifecycleRequestContext(ctx)
+			defer cancel()
+			previous, tier, err := service.catalog.RefreshAccountTier(requestCtx, accountID)
+			if err != nil || previous == tier || ctx.Err() != nil {
+				return
+			}
+			service.publishModelAccess()
+			service.requests.log(accountID, "INFO", fmt.Sprintf("Account benefit tier updated | tier=%s→%s", previous, tier))
+		})
+	}
+	refreshes.Wait()
 }
 
 func (service *trackedService) retryAccountModelCatalogs(ctx context.Context) bool {
@@ -2893,7 +2916,11 @@ func (service *trackedService) observedDataRequestContext(
 
 // CountTokens returns authoritative input token counts from upstream.
 func (service *trackedService) CountTokens(ctx context.Context, request aistudio.TokenCountRequest) (aistudio.TokenCount, error) {
-	request.Model = service.pool.CanonicalModelID(request.Model)
+	model, _, err := aistudio.ApplyModelSuffix(request.Model, aistudio.GenerationConfig{})
+	if err != nil {
+		return aistudio.TokenCount{}, err
+	}
+	request.Model = service.pool.CanonicalModelID(model)
 	requestCtx, cancel, err := service.observedDataRequestContext(ctx, request.Model)
 	if err != nil {
 		return aistudio.TokenCount{}, err
@@ -3417,13 +3444,18 @@ func inlineMediaInput(contents []aistudio.Content) (int, int64) {
 // Generate acquires an exclusive account and streams canonical events.
 func (service *trackedService) Generate(ctx context.Context, request aistudio.GenerateRequest) (<-chan aistudio.Event, error) {
 	generationStartedAt := time.Now()
-
+	model, config, suffixErr := aistudio.ApplyModelSuffix(request.Model, request.Config)
+	request.Model, request.Config = model, config
 	api.SetAccessLogTarget(ctx, request.Model, "")
 	api.SetAccessLogGenerationConfig(ctx, request.Config)
 	api.SetAccessLogGenerationInput(ctx, request)
 	api.StartAccessLog(ctx)
 	request.Model = service.pool.CanonicalModelID(request.Model)
-	requestCtx, cancel, err := service.dataRequestContext(ctx)
+	requestCtx, cancel, err := service.dataRequestContextFor(ctx, service.generateTimeout(request))
+	if err == nil && suffixErr != nil {
+		err = suffixErr
+		cancel()
+	}
 	if validator, ok := service.service.(interface {
 		ValidateGenerateRequest(aistudio.GenerateRequest) error
 	}); ok && err == nil {
@@ -3453,6 +3485,11 @@ func (service *trackedService) Generate(ctx context.Context, request aistudio.Ge
 	return events, nil
 }
 
+// generateTimeout returns the deadline for generation requests, scaled by continuation rounds for auto-continuation models
+func (service *trackedService) generateTimeout(request aistudio.GenerateRequest) time.Duration {
+	return service.timeout * time.Duration(service.pool.OutputContinuationRounds(request.Model, request.Config.MaxOutputTokens))
+}
+
 func (service *trackedService) generateWithRetry(
 	clientCtx context.Context,
 	requestCtx context.Context,
@@ -3465,6 +3502,7 @@ func (service *trackedService) generateWithRetry(
 	maxAttempts := 1
 	requestedAccountID := strings.TrimSpace(request.AccountID)
 	modelID := strings.TrimPrefix(strings.TrimSpace(request.Model), "models/")
+	continuationRounds := service.pool.OutputContinuationRounds(modelID, request.Config.MaxOutputTokens)
 	unbound := requestedAccountID == "" && resourceID == ""
 	fileBound := requestedAccountID == "" && resourceID != ""
 
@@ -3510,6 +3548,9 @@ func (service *trackedService) generateWithRetry(
 			ResourceID: selectionResourceID,
 		}
 		if resourceID != "" || request.Config.SpeechConfig != nil && request.Config.SpeechConfig.Mode != "" {
+			selection.PlaygroundOnly = true
+		}
+		if continuationRounds > 1 {
 			selection.PlaygroundOnly = true
 		}
 		if !selection.PlaygroundOnly && service.pool.BuildEnabled() && aistudio.RequestNeedsBuildSchema(request) {
@@ -3908,13 +3949,17 @@ func (service *trackedService) lifecycleRequestContext(ctx context.Context) (con
 }
 
 func (service *trackedService) dataRequestContext(ctx context.Context) (context.Context, context.CancelFunc, error) {
+	return service.dataRequestContextFor(ctx, service.timeout)
+}
+
+// dataRequestContextFor returns a request context bound to data-plane lifecycle with timeout deadline
+func (service *trackedService) dataRequestContextFor(ctx context.Context, timeout time.Duration) (context.Context, context.CancelFunc, error) {
 	service.lifecycleMu.Lock()
 	if service.state.Load() != serviceRunning || service.dataContext == nil {
 		service.lifecycleMu.Unlock()
 		return nil, nil, &serviceStoppedError{}
 	}
-
-	requestCtx, cancel := context.WithTimeout(ctx, service.timeout)
+	requestCtx, cancel := context.WithTimeout(ctx, timeout)
 	stopData := context.AfterFunc(service.dataContext, cancel)
 	service.lifecycleMu.Unlock()
 

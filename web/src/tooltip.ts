@@ -17,6 +17,8 @@ function tooltipElement(): HTMLDivElement {
 function show(target: HTMLElement): void {
   const text = target.dataset.tooltip
   if (!text) return
+  if (target.dataset.tooltipOverflow !== undefined && target.scrollWidth <= target.clientWidth)
+    return
   window.clearTimeout(timer)
   timer = window.setTimeout(() => {
     const element = tooltipElement()
@@ -39,10 +41,11 @@ function hide(): void {
   tip?.classList.remove('visible')
 }
 
-// vTooltip displays hover and keyboard focus tooltips using site styling; does not display when empty
-export const vTooltip: Directive<HTMLElement, string | undefined> = {
+// vTooltip displays hover and keyboard focus tooltips using site styling; does not display when empty; 'overflow' modifier displays tooltip only when text is truncated
+export const vTooltip: Directive<HTMLElement, string | undefined, 'overflow'> = {
   mounted(element, binding) {
     element.dataset.tooltip = binding.value ?? ''
+    if (binding.modifiers.overflow) element.dataset.tooltipOverflow = ''
     element.addEventListener('pointerenter', () => show(element))
     element.addEventListener('pointerleave', hide)
     element.addEventListener('focus', () => show(element))

@@ -74,7 +74,7 @@ let searchTimer: number | undefined
 
 const filtered = computed(() => props.status !== '' || props.search !== '')
 
-// parameters 在调用时解析时间范围并组合筛选、状态码、关键字与分页参数，范围无效时返回 null
+// parameters resolves time range upon call and composes filter, status, search, and pagination query params; returns null if range is invalid
 function parameters(cursor?: string): URLSearchParams | null {
   const query = props.baseQuery()
   if (query === null) return null
@@ -84,7 +84,7 @@ function parameters(cursor?: string): URLSearchParams | null {
   return query
 }
 
-// load 读取当前页，较早发出的请求被取消
+// load fetches the current page, cancelling in-flight previous requests
 async function load(): Promise<void> {
   controller?.abort()
   const current = new AbortController()
@@ -106,14 +106,14 @@ async function load(): Promise<void> {
   }
 }
 
-// restart 回到第一页重新读取
+// restart resets to page 1 and reloads records
 function restart(): void {
   cursors.value = [undefined]
   page.value = 0
   void load()
 }
 
-// move 前后翻页，向后翻页时记录下一页的位置
+// move navigates forward or backward across pages, recording next page cursor when moving forward
 function move(step: 1 | -1): void {
   if (step === 1) {
     if (nextCursor.value === undefined) return
@@ -143,7 +143,7 @@ onUnmounted(() => {
   window.clearTimeout(searchTimer)
 })
 
-// download 按当前范围与筛选下载 CSV
+// download triggers CSV export for the current range and filters
 function download(): void {
   const query = parameters()
   if (query === null) return
@@ -153,14 +153,14 @@ function download(): void {
   link.click()
 }
 
-// toggleColumn 切换一列的显示
+// toggleColumn toggles visibility of a column
 function toggleColumn(column: Column, checked: boolean): void {
   visible.value = checked
     ? allColumns.filter((item) => item === column || visible.value.includes(item))
     : visible.value.filter((item) => item !== column)
 }
 
-// stateClass 返回结果徽标的色调
+// stateClass returns styling class for status badge
 function stateClass(record: UsageRecord): string {
   if (record.state === 'failed') return 'bg-red-500/15 text-red-300'
   if (record.state === 'cancelled') return 'bg-gray-500/15 text-gray-300'
@@ -169,7 +169,7 @@ function stateClass(record: UsageRecord): string {
   return 'bg-yellow-500/15 text-yellow-300'
 }
 
-// latencyWidth 把耗时映射到 0 到 100 的条形宽度，3 分钟为满格
+// latencyWidth maps latency in ms to 0-100 bar percentage width, capped at 3 minutes
 function latencyWidth(milliseconds: number): number {
   return Math.min(100, Math.max(4, (milliseconds / 180_000) * 100))
 }
@@ -183,7 +183,12 @@ function latencyWidth(milliseconds: number): number {
           {{ t('usage.records') }}
         </h3>
         <p v-if="!filtered" class="text-xs text-gray-500">
-          {{ t('usage.recordsCount').replace('{count}', integer(total)) }}
+          {{
+            t(total === 1 ? 'usage.recordsCountOne' : 'usage.recordsCount').replace(
+              '{count}',
+              integer(total),
+            )
+          }}
         </p>
       </div>
       <label class="relative">
@@ -395,9 +400,13 @@ function latencyWidth(milliseconds: number): number {
                 dateTime(record.time, true)
               }}</span>
             </div>
-            <div class="mt-1.5 truncate text-gray-200">{{ record.model || '—' }}</div>
+            <div v-tooltip.overflow="record.model" class="mt-1.5 truncate text-gray-200">
+              {{ record.model || '—' }}
+            </div>
             <div class="mt-0.5 flex gap-3 text-gray-500 tabular-nums">
-              <span class="truncate">{{ record.account || '—' }}</span>
+              <span v-tooltip.overflow="record.account" class="truncate">{{
+                record.account || '—'
+              }}</span>
               <span class="ml-auto shrink-0">{{ duration(record.duration_ms) }}</span>
               <span class="shrink-0">{{ compact(record.total_tokens) }}</span>
             </div>

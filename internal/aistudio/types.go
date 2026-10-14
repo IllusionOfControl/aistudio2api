@@ -257,6 +257,10 @@ type GenerateRequest struct {
 	Unary bool `json:"-"`
 	// Truncate removes earliest complete conversation turns before generation according to model context window
 	Truncate bool `json:"-"`
+	// continuationRound is the iteration index for auto-continuation, starting at 0
+	continuationRound int
+	// continuationToken is the continuation token returned from previous round
+	continuationToken string
 }
 
 // TokenCountRequest represents a token counting request
@@ -287,9 +291,10 @@ type Model struct {
 	Channels          []string            `json:"channels,omitempty"`
 }
 
-// Usage represents token usage for a single generation
+// Usage represents token usage for a single generation; CachedTokens is the portion of InputTokens hitting upstream cache.
 type Usage struct {
 	InputTokens         int64 `json:"input_tokens"`
+	CachedTokens        int64 `json:"cached_tokens,omitempty"`
 	OutputTokens        int64 `json:"output_tokens"`
 	ReasoningTokens     int64 `json:"reasoning_tokens,omitempty"`
 	ToolTokens          int64 `json:"tool_tokens,omitempty"`

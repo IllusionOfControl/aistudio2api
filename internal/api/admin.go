@@ -12,7 +12,7 @@ import (
 // AdminService defines authoritative state operations required by the admin interface.
 type AdminService interface {
 	Status(context.Context) (AdminStatus, error)
-	Models(context.Context) ([]aistudio.Model, error)
+	CatalogModels(context.Context) ([]aistudio.Model, error)
 	Accounts(context.Context) ([]AdminAccount, error)
 	CreateAccount(context.Context, AccountCreateInput) (AdminAccount, error)
 	ChromeImportProfiles(context.Context) ([]ChromeImportProfile, error)
@@ -80,9 +80,10 @@ type RequestLog struct {
 	Channel         string            `json:"channel,omitempty"`
 }
 
-// RequestLogUsage distinguishes input, thinking, reply, and end-to-end output token rates.
+// RequestLogUsage distinguishes input, cache hit, thinking, reply, and end-to-end output token rates.
 type RequestLogUsage struct {
 	InputTokens            int64   `json:"input_tokens"`
+	CachedTokens           int64   `json:"cached_tokens"`
 	ReasoningTokens        int64   `json:"reasoning_tokens"`
 	ReplyTokens            int64   `json:"reply_tokens"`
 	OutputTokens           int64   `json:"output_tokens"`
@@ -280,7 +281,7 @@ func (s *server) handleStatus(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) handleAdminModels(w http.ResponseWriter, r *http.Request) {
-	models, err := s.config.Admin.Models(r.Context())
+	models, err := s.config.Admin.CatalogModels(r.Context())
 	if err != nil {
 		writeAdminUpstreamError(w, err)
 		return

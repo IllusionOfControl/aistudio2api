@@ -231,6 +231,13 @@ func (manager *runtimeManager) Models(ctx context.Context) ([]aistudio.Model, er
 	return manager.current.service.Models(ctx)
 }
 
+// CatalogModels returns the admin catalog from the current generation service.
+func (manager *runtimeManager) CatalogModels(ctx context.Context) ([]aistudio.Model, error) {
+	manager.mu.RLock()
+	defer manager.mu.RUnlock()
+	return manager.current.admin.CatalogModels(ctx)
+}
+
 // CountTokens counts tokens using the current generation service.
 func (manager *runtimeManager) CountTokens(ctx context.Context, request aistudio.TokenCountRequest) (aistudio.TokenCount, error) {
 	manager.mu.RLock()

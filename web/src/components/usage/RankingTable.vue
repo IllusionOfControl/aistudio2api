@@ -40,7 +40,7 @@ const columns: { key: SortKey; label: () => string; numeric: boolean }[] = [
   { key: 'last', label: () => t('usage.lastRequest'), numeric: true },
 ]
 
-// sortValue 返回行在排序列上的比较值
+// sortValue returns comparison value for a row on the active sort column
 function sortValue(key: string, stats: UsageStats, column: SortKey): number | string {
   switch (column) {
     case 'key':
@@ -72,7 +72,7 @@ const rows = computed(() => {
   })
 })
 
-// children 返回账户或模型行展开后的组合明细
+// children returns breakdown pairs when an account or model row is expanded
 function children(key: string): { key: string; label: string; stats: UsageStats }[] {
   if (tab.value === 'account')
     return props.report.pairs
@@ -89,7 +89,7 @@ function children(key: string): { key: string; label: string; stats: UsageStats 
   return []
 }
 
-// toggleSort 切换排序列，再次点击同一列时反转方向
+// toggleSort toggles the sort column, reversing direction on repeat click
 function toggleSort(key: SortKey): void {
   sort.value =
     sort.value.key === key
@@ -97,7 +97,7 @@ function toggleSort(key: SortKey): void {
       : { key, descending: key !== 'key' }
 }
 
-// toggleRow 展开或收起一行的组合明细
+// toggleRow expands or collapses breakdown pairs for a row
 function toggleRow(key: string): void {
   const next = new Set(expanded.value)
   if (next.has(key)) next.delete(key)
@@ -105,7 +105,7 @@ function toggleRow(key: string): void {
   expanded.value = next
 }
 
-// applyFilter 把行取值加入筛选；状态码行筛选请求记录
+// applyFilter adds row value to filters; status code rows filter request records
 function applyFilter(key: string): void {
   if (tab.value === 'status') emit('status', key)
   else emit('filter', tab.value, key)

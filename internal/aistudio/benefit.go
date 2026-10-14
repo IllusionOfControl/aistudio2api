@@ -132,6 +132,39 @@ func (c *Client) applyBenefitTier(method string, accountID string, header http.H
 	}
 }
 
+// ModelAccessError indicates that model access requires account benefits that no enabled account currently possesses
+type ModelAccessError struct {
+	Model       string
+	AccessModes []int64
+}
+
+func (e *ModelAccessError) Error() string {
+	names := make([]string, 0, len(e.AccessModes))
+	for _, mode := range e.AccessModes {
+		switch mode {
+		case 1:
+			names = append(names, "Paid API key")
+		case 3:
+			names = append(names, "Google AI Pro or Ultra subscription")
+		case 4:
+			names = append(names, "Google AI Ultra subscription")
+		default:
+			names = append(names, fmt.Sprintf("access mode %d", mode))
+		}
+	}
+	return fmt.Sprintf("model %s requires %s, but no enabled account possesses it", e.Model, strings.Join(names, " or "))
+}
+
+// HTTPStatus returns the HTTP status code for insufficient account benefit tier
+func (e *ModelAccessError) HTTPStatus() int {
+	return http.StatusForbidden
+}
+
+// ErrorCode returns the OpenAI-compatible error code
+func (e *ModelAccessError) ErrorCode() string {
+	return "account_required"
+}
+
 func modelAllowedByTier(model Model, tier BenefitTier) bool {
 	if len(model.AccessModes) == 0 {
 		return true

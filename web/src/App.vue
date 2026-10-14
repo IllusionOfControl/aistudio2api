@@ -36,7 +36,7 @@ import { useTabParam } from '@/url'
 import type { IconName } from '@/icons'
 
 const { availableLocales, locale, setLocale, t, errorText } = useI18n()
-// lazyPanel 创建按需加载的页面组件
+// lazyPanel creates an on-demand loaded page component
 function lazyPanel(loader: AsyncComponentLoader) {
   return defineAsyncComponent({
     loader,
@@ -65,7 +65,7 @@ const validTabs: TabID[] = [
 const { tab: currentTab, select: selectTab } = useTabParam(validTabs, 'logs')
 const navigationBar = ref<HTMLElement | null>(null)
 
-// revealCurrentTab 把窄屏横向导航的当前项横向滚入视野
+// revealCurrentTab scrolls the active item into view on narrow screens
 function revealCurrentTab(): void {
   const bar = navigationBar.value
   const item = bar?.querySelector<HTMLElement>('[aria-current="page"]')
@@ -150,20 +150,20 @@ function showNotice(message: string, tone: 'success' | 'error'): void {
   }, 3200)
 }
 
-// deleteAccount 隐藏账户并在撤销时限结束后删除，新的删除会先提交上一项
+// deleteAccount hides account and deletes it after undo window expires; subsequent deletes commit earlier pending deletes first
 function deleteAccount(account: Account): void {
   void commitDelete()
   pendingDelete.value = { account, timer: window.setTimeout(() => void commitDelete(), 6000) }
 }
 
-// undoDelete 撤销尚未提交的账户删除
+// undoDelete cancels a pending account deletion
 function undoDelete(): void {
   if (pendingDelete.value === null) return
   window.clearTimeout(pendingDelete.value.timer)
   pendingDelete.value = null
 }
 
-// commitDelete 立即提交等待中的账户删除，页面关闭时使用 keepalive 请求
+// commitDelete immediately commits pending account deletion, using keepalive if page is closing
 async function commitDelete(keepalive = false): Promise<void> {
   const pending = pendingDelete.value
   if (pending === null) return
@@ -183,12 +183,12 @@ async function commitDelete(keepalive = false): Promise<void> {
   }
 }
 
-// flushDelete 在页面隐藏时提交等待中的删除
+// flushDelete commits pending deletion when page is hidden
 function flushDelete(): void {
   void commitDelete(true)
 }
 
-// logout 先在当前会话内提交等待中的删除再退出登录
+// logout commits pending deletion within current session before logging out
 async function logout(): Promise<void> {
   await commitDelete()
   emit('logout')
@@ -536,7 +536,7 @@ onUnmounted(() => {
             @refresh="loadRequestData"
             @notice="showNotice"
           />
-          <UsagePanel v-else-if="currentTab === 'usage'" />
+          <UsagePanel v-else-if="currentTab === 'usage'" :models="models" />
           <SettingsPanel
             v-else-if="currentTab === 'settings'"
             :config="config"
@@ -572,9 +572,13 @@ onUnmounted(() => {
           class="pointer-events-auto flex max-w-full items-center gap-4 rounded border border-line-strong bg-panel px-4 py-3 text-sm text-gray-200 shadow-xl"
           role="status"
         >
-          <span class="min-w-0 truncate">{{
-            t('accounts.deletedNamed').replace('{name}', pendingDelete.account.label)
-          }}</span>
+          <span
+            v-tooltip.overflow="
+              t('accounts.deletedNamed').replace('{name}', pendingDelete.account.label)
+            "
+            class="min-w-0 truncate"
+            >{{ t('accounts.deletedNamed').replace('{name}', pendingDelete.account.label) }}</span
+          >
           <button
             type="button"
             class="flex shrink-0 items-center gap-1.5 rounded px-2 py-1 font-medium text-blue-400 hover:bg-raised"

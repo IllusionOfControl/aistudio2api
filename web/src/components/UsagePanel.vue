@@ -2,7 +2,7 @@
 import { computed, onMounted, onUnmounted, ref, shallowRef, watch } from 'vue'
 import { api } from '@/api'
 import { useI18n } from '@/i18n'
-import type { UsageDimension, UsageReport, UsageStats } from '@/types'
+import type { Model, UsageDimension, UsageReport, UsageStats } from '@/types'
 import UiIcon from './UiIcon.vue'
 import UiSelect from './UiSelect.vue'
 import FilterMenu from './usage/FilterMenu.vue'
@@ -24,10 +24,20 @@ import {
   type RangePreset,
 } from './usage/model'
 
+const props = defineProps<{ models: Model[] }>()
 const { t, errorText } = useI18n()
-const { compact, integer, percent, duration, dateTime, clock, ago, dimensionLabel } =
+const { compact, integer, usd, percent, duration, dateTime, clock, ago, dimensionLabel } =
   useUsageFormat()
 const state = useUsageState()
+
+// filterOptions returns filter candidates, with models sorted according to catalog order and uncataloged values at the end
+function filterOptions(dimension: UsageDimension): string[] {
+  const options = report.value?.options[dimension] ?? []
+  if (dimension !== 'model') return options
+  const order = new Map(props.models.map((model, index) => [model.id, index]))
+  const rank = (value: string) => order.get(value) ?? order.size
+  return [...options].sort((left, right) => rank(left) - rank(right))
+}
 const report = shallowRef<UsageReport | null>(null)
 const status = ref<'loading' | 'ready' | 'error'>('loading')
 const loading = ref(false)
@@ -51,7 +61,7 @@ const live = computed(() => liveRange(state.range))
 const hasFilters = computed(() => dimensions.some((item) => (state.filters[item] ?? []).length > 0))
 const scope = computed(() => JSON.stringify([state.range, state.from, state.to, state.filters]))
 
-// baseQuery 在调用时解析时间范围并写入范围与筛选参数，自定义范围无效时返回 null
+// baseQuery resolves time range upon call and writes range and filter query parameters; returns null if custom range is invalid
 function baseQuery(): URLSearchParams | null {
   const range = resolveRange(state, new Date())
   if (range === null) return null
@@ -63,7 +73,7 @@ function baseQuery(): URLSearchParams | null {
   return query
 }
 
-// load 读取用量报告，新的请求会取消尚未完成的旧请求
+// load fetches the usage report, cancelling any in-flight previous request
 async function load(): Promise<void> {
   const query = baseQuery()
   if (query === null) {
@@ -92,7 +102,7 @@ async function load(): Promise<void> {
   }
 }
 
-// refresh 立即刷新报告与请求记录
+// refresh immediately reloads usage report and request records
 function refresh(): void {
   void load()
   recordsRefresh.value++
@@ -103,7 +113,7 @@ watch(
   () => void load(),
 )
 
-// tick 每秒更新时钟，到期且页面可见时自动刷新
+// tick updates clock every second and auto-refreshes when due if page is visible
 function tick(): void {
   now.value = Date.now()
   if (
@@ -117,7 +127,7 @@ function tick(): void {
     refresh()
 }
 
-// resume 页面重新可见时补一次过期的刷新
+// resume triggers an overdue refresh when page becomes visible again
 function resume(): void {
   if (document.visibilityState === 'visible') tick()
 }
@@ -133,12 +143,12 @@ onUnmounted(() => {
   document.removeEventListener('visibilitychange', resume)
 })
 
-// applyRange 应用时间范围选择
+// applyRange applies selected time range
 function applyRange(range: RangePreset, from: string, to: string): void {
   Object.assign(state, { range, from, to })
 }
 
-// setFilter 替换一个维度的筛选值
+// setFilter replaces filter values for a dimension
 function setFilter(dimension: UsageDimension, values: string[]): void {
   const filters = { ...state.filters }
   if (values.length === 0) delete filters[dimension]
@@ -146,13 +156,13 @@ function setFilter(dimension: UsageDimension, values: string[]): void {
   state.filters = filters
 }
 
-// addFilter 把取值加入维度筛选
+// addFilter appends value to dimension filter
 function addFilter(dimension: UsageDimension, value: string): void {
   const values = state.filters[dimension] ?? []
   if (!values.includes(value)) setFilter(dimension, [...values, value])
 }
 
-// clearFilters 清除全部维度筛选
+// clearFilters clears all dimension filters
 function clearFilters(): void {
   state.filters = {}
 }
@@ -177,12 +187,12 @@ const countdown = computed(() => {
   return t('usage.nextRefresh').replace('{seconds}', String(seconds))
 })
 
-// relative 返回相对变化比例，上一周期为 0 时返回 null
+// relative returns relative change ratio, or null when previous period value is 0
 function relative(current: number, previous: number): number | null {
   return previous > 0 ? (current - previous) / previous : null
 }
 
-// delta 生成相对上一周期的变化标注
+// delta generates change annotation relative to previous period
 function delta(
   change: number | null,
   text: (value: number) => string,
@@ -212,30 +222,26 @@ const kpis = computed(() => {
   const value = report.value
   if (value === null) return []
   const { totals, previous, buckets, recent } = value
-  const minutes = Math.max(
-    1,
-    (Math.min(new Date(value.to).getTime(), new Date(value.generated_at).getTime()) -
-      new Date(value.from).getTime()) /
-      60_000,
-  )
   const rate = successRate(totals)
   const previousRate = successRate(previous)
   const series = (pick: (bucket: UsageStats) => number | null) =>
     buckets.map(pick).filter((item): item is number => item !== null)
+  const otherErrors = totals.failed - totals.rate_limited
+  const first = totals.first_event
   return [
     {
       label: t('usage.requests'),
       icon: 'requests' as const,
       value: integer(totals.requests),
+      raw: totals.requests,
       help: t('usage.requestsHelp'),
       details: [
-        { label: t('usage.succeeded'), value: compact(totals.succeeded) },
         {
           label: t('usage.failed'),
-          value: compact(totals.failed),
+          value: integer(totals.failed),
           tone: totals.failed > 0 ? 'text-red-400' : undefined,
         },
-        { label: t('usage.canceled'), value: compact(totals.canceled) },
+        { label: t('usage.canceled'), value: integer(totals.canceled) },
       ],
       delta: delta(relative(totals.requests, previous.requests), (item) => percent(item), 'none'),
       spark: buckets.map((bucket) => bucket.requests),
@@ -245,17 +251,18 @@ const kpis = computed(() => {
       label: t('usage.successRate'),
       icon: 'success' as const,
       value: percent(rate),
+      raw: rate,
       help: t('usage.successRateHelp'),
       details: [
         {
-          label: t('usage.rateLimited'),
-          value: compact(totals.rate_limited),
+          label: t('usage.rateLimitedShort'),
+          value: integer(totals.rate_limited),
           tone: totals.rate_limited > 0 ? 'text-yellow-400' : undefined,
         },
         {
           label: t('usage.otherErrors'),
-          value: compact(totals.failed - totals.rate_limited),
-          tone: totals.failed - totals.rate_limited > 0 ? 'text-red-400' : undefined,
+          value: integer(otherErrors),
+          tone: otherErrors > 0 ? 'text-red-400' : undefined,
         },
       ],
       delta: delta(
@@ -274,11 +281,12 @@ const kpis = computed(() => {
       label: t('usage.tokens'),
       icon: 'tokens' as const,
       value: compact(totals.total_tokens),
-      help: `${t('usage.input')} + ${t('usage.reasoning')} + ${t('usage.reply')}`,
+      raw: totals.total_tokens,
+      help: `${t('usage.input')} + ${t('usage.output')}`,
       details: [
         { label: t('usage.input'), value: compact(totals.input_tokens) },
-        { label: t('usage.reasoning'), value: compact(totals.reasoning_tokens) },
-        { label: t('usage.reply'), value: compact(totals.reply_tokens) },
+        { label: t('usage.cached'), value: compact(totals.cached_tokens) },
+        { label: t('usage.output'), value: compact(totals.reasoning_tokens + totals.reply_tokens) },
       ],
       delta: delta(
         relative(totals.total_tokens, previous.total_tokens),
@@ -291,54 +299,48 @@ const kpis = computed(() => {
     {
       label: t('usage.throughput'),
       icon: 'throughput' as const,
-      value: `${compact(totals.requests / minutes)} RPM`,
+      value: `${compact(recent.requests / recent.minutes)} RPM`,
+      raw: recent.requests / recent.minutes,
       help: t('usage.throughputHelp').replace('{minutes}', String(recent.minutes)),
       details: [
-        { label: 'TPM', value: compact(totals.total_tokens / minutes) },
-        {
-          label: `${t('usage.current')} RPM`,
-          value: compact(recent.requests / recent.minutes),
-        },
-        { label: `${t('usage.current')} TPM`, value: compact(recent.tokens / recent.minutes) },
+        { label: t('usage.recentMinutes').replace('{minutes}', String(recent.minutes)), value: '' },
+        { label: 'TPM', value: compact(recent.tokens / recent.minutes) },
       ],
       spark: buckets.map((bucket) => bucket.requests),
       color: '#f59e0b',
     },
     {
-      label: `${t('usage.duration')} P95`,
-      icon: 'latency' as const,
-      value: duration(totals.duration.p95_ms),
-      help: t('usage.durationHelp'),
+      label: t('usage.cost'),
+      icon: 'cost' as const,
+      value: usd(value.cost),
+      raw: value.cost,
+      help: t('usage.costHelp'),
       details: [
-        { label: 'P50', value: duration(totals.duration.p50_ms) },
-        { label: 'P99', value: duration(totals.duration.p99_ms) },
-        { label: t('usage.average'), value: duration(totals.duration.avg_ms) },
+        { label: t('usage.input'), value: compact(totals.input_tokens) },
+        { label: t('usage.cached'), value: compact(totals.cached_tokens) },
+        {
+          label: t('usage.output'),
+          value: compact(totals.reasoning_tokens + totals.reply_tokens),
+        },
       ],
-      delta: delta(
-        relative(totals.duration.p95_ms, previous.duration.p95_ms),
-        (item) => percent(item),
-        'down',
-      ),
-      spark: series((bucket) => (bucket.duration.p95_ms > 0 ? bucket.duration.p95_ms : null)),
-      color: '#a78bfa',
+      delta: delta(relative(value.cost, value.previous_cost), (item) => percent(item), 'none'),
+      spark: buckets.map((bucket) => bucket.cost),
+      color: '#34d399',
     },
     {
-      label: `${t('usage.firstEvent')} P95`,
+      label: `${t('usage.firstEvent')} P50`,
       icon: 'firstEvent' as const,
-      value: duration(totals.first_event.p95_ms),
+      value: duration(first.p50_ms),
+      raw: first.p50_ms > 0 ? first.p50_ms : null,
       help: t('usage.firstEventHelp'),
-      details: [
-        { label: 'P50', value: duration(totals.first_event.p50_ms) },
-        { label: t('usage.average'), value: duration(totals.first_event.avg_ms) },
-        { label: t('usage.queue'), value: duration(totals.queue_avg_ms) },
-      ],
+      details: [{ label: 'P95', value: duration(first.p95_ms) }],
       delta: delta(
-        relative(totals.first_event.p95_ms, previous.first_event.p95_ms),
+        relative(first.p50_ms, previous.first_event.p50_ms),
         (item) => percent(item),
         'down',
       ),
-      spark: series((bucket) => (bucket.first_event.p95_ms > 0 ? bucket.first_event.p95_ms : null)),
-      color: '#34d399',
+      spark: series((bucket) => (bucket.first_event.p50_ms > 0 ? bucket.first_event.p50_ms : null)),
+      color: '#a78bfa',
     },
   ]
 })
@@ -398,7 +400,7 @@ const statusOptions = computed(() =>
         v-for="dimension in dimensions"
         :key="dimension"
         :label="t(`usage.dimension.${dimension}`)"
-        :options="report?.options[dimension] ?? []"
+        :options="filterOptions(dimension)"
         :selected="state.filters[dimension] ?? []"
         :format="(value: string) => dimensionLabel(dimension, value)"
         @change="setFilter(dimension, $event)"
@@ -416,13 +418,17 @@ const statusOptions = computed(() =>
       <span
         v-for="chip in activeChips"
         :key="`${chip.dimension}:${chip.value}`"
-        class="flex items-center gap-1 rounded-md border border-blue-500/40 bg-blue-600/10 py-0.5 pr-1 pl-2.5 text-xs text-blue-200"
+        class="flex max-w-full items-center gap-1 rounded-md border border-blue-500/40 bg-blue-600/10 py-0.5 pr-1 pl-2.5 text-xs text-blue-200"
       >
-        <span class="text-blue-300/70">{{ t(`usage.dimension.${chip.dimension}`) }}:</span>
-        {{ dimensionLabel(chip.dimension, chip.value) }}
+        <span class="shrink-0 text-blue-300/70">{{ t(`usage.dimension.${chip.dimension}`) }}:</span>
+        <span
+          v-tooltip.overflow="dimensionLabel(chip.dimension, chip.value)"
+          class="min-w-0 truncate"
+          >{{ dimensionLabel(chip.dimension, chip.value) }}</span
+        >
         <button
           type="button"
-          class="rounded-sm p-0.5 hover:bg-blue-500/20"
+          class="shrink-0 rounded-sm p-0.5 hover:bg-blue-500/20"
           :aria-label="`${t('common.close')} ${dimensionLabel(chip.dimension, chip.value)}`"
           @click="
             setFilter(
@@ -436,7 +442,7 @@ const statusOptions = computed(() =>
       </span>
     </div>
 
-    <div class="mx-auto w-full max-w-[96rem] space-y-4 p-4 md:p-8">
+    <div class="w-full space-y-4 p-4 md:p-8">
       <div
         v-if="error && status !== 'error'"
         class="flex items-center gap-3 rounded-lg border border-red-500/40 bg-red-500/10 px-4 py-3 text-sm text-red-300"
@@ -510,6 +516,7 @@ const statusOptions = computed(() =>
                 :label="kpi.label"
                 :icon="kpi.icon"
                 :value="kpi.value"
+                :raw="kpi.raw"
                 :help="kpi.help"
                 :details="kpi.details"
                 :delta="kpi.delta"

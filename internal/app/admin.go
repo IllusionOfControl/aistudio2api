@@ -457,7 +457,7 @@ func (admin *runtimeAdmin) UpdateAccount(ctx context.Context, accountID string, 
 	}
 
 	account := lease.Account()
-
+	enabling := accountConfig.Enabled && !account.Config.Enabled
 	headerUpdate, err := admin.headers.prepareUpdate(account, accountConfig)
 	if err != nil {
 		return api.AdminAccount{}, errors.Join(err, lease.Release())
@@ -485,8 +485,10 @@ func (admin *runtimeAdmin) UpdateAccount(ctx context.Context, accountID string, 
 	}
 
 	admin.syncModelCache()
+	if enabling {
+		admin.syncAccountModelCatalog(ctx, account)
+	}
 	admin.requests.log("auth", "INFO", "Account configuration updated | account="+accountConfig.Label)
-
 	return admin.account(account.ID)
 }
 
@@ -816,7 +818,7 @@ func (admin *runtimeAdmin) syncAccountModelCatalog(ctx context.Context, account 
 
 // publishRuntimeSnapshot broadcasts authoritative runtime state to admin subscribers.
 func (admin *runtimeAdmin) publishRuntimeSnapshot(ctx context.Context, status api.AdminStatus) {
-	models, err := admin.Models(ctx)
+	models, err := admin.CatalogModels(ctx)
 	if err != nil {
 		return
 	}
@@ -976,14 +978,14 @@ func (admin *runtimeAdmin) CancelRequest(_ context.Context, id string) error {
 
 // adminEventSource provides current snapshots for the admin event stream.
 type adminEventSource interface {
-	Models(context.Context) ([]aistudio.Model, error)
+	CatalogModels(context.Context) ([]aistudio.Model, error)
 	Status(context.Context) (api.AdminStatus, error)
 	Accounts(context.Context) ([]api.AdminAccount, error)
 	Cooldowns(context.Context) ([]api.AdminCooldown, error)
 }
 
-// Models returns the complete catalog and available channels for each model in the current runtime.
-func (admin *runtimeAdmin) Models(ctx context.Context) ([]aistudio.Model, error) {
+// CatalogModels returns the complete catalog and available channels for each model in the current runtime.
+func (admin *runtimeAdmin) CatalogModels(ctx context.Context) ([]aistudio.Model, error) {
 	return admin.service.catalogModels(), nil
 }
 
@@ -1001,8 +1003,7 @@ func openAdminEvents(
 	eventCtx, cancel := context.WithCancel(ctx)
 	stopLifecycle := context.AfterFunc(lifecycle, cancel)
 	subscriber := requests.subscribe(eventCtx)
-
-	models, err := source.Models(eventCtx)
+	models, err := source.CatalogModels(eventCtx)
 	if err != nil {
 		stopLifecycle()
 		cancel()

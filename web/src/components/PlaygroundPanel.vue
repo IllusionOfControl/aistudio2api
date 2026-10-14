@@ -28,7 +28,7 @@ const props = defineProps<{
   apiKey: string
 }>()
 
-const { t, errorText } = useI18n()
+const { locale, t, errorText } = useI18n()
 const protocolLabels: Record<PlaygroundProtocol, string> = {
   'openai-chat': 'OpenAI Chat',
   'openai-responses': 'OpenAI Responses',
@@ -53,7 +53,7 @@ const tools: { id: PlaygroundTool; label: string; capability: string }[] = [
   { id: 'google_maps', label: 'Google Maps', capability: 'google_maps' },
 ]
 type NumericSetting = 'temperature' | 'topP' | 'topK' | 'maxOutputTokens' | 'seed'
-// numericFields 是生成参数中的数值项，空值使用模型默认值
+// numericFields are numeric generation parameters; empty values use model defaults
 const numericFields: {
   key: NumericSetting
   label: TranslationKey
@@ -67,14 +67,14 @@ const numericFields: {
   { key: 'maxOutputTokens', label: 'playground.maxOutputTokens', min: 1, step: 1 },
   { key: 'seed', label: 'playground.seed', step: 1 },
 ]
-// pill 是输入框底栏中紧凑选择器的样式
+// pill is the styling for compact selectors in input bar
 const pill =
   'max-w-full rounded-md border border-white/10 bg-transparent px-3 py-1 text-xs text-gray-300 transition-colors hover:bg-white/5'
-// field 是参数浮层中输入控件的样式
+// field is the styling for inputs inside the parameter popover
 const field =
   'w-full rounded-lg border border-line bg-canvas px-2.5 py-1.5 text-xs text-white focus:border-blue-500 focus:outline-none'
 
-// markdown 渲染回复正文，原始 HTML 按文本转义，链接在新标签页打开
+// markdown renders response text, escaping raw HTML and opening links in new tab
 const markdown = new MarkdownIt({ linkify: true, breaks: true })
 const renderLink =
   markdown.renderer.rules.link_open ??
@@ -117,7 +117,7 @@ const form = reactive<PlaygroundInput>({
   apiKey: props.apiKey,
 })
 const stopDraft = ref('')
-// settingsOpen 控制运行设置面板，宽屏默认展开
+// settingsOpen toggles the settings panel, expanded by default on wide viewports
 const settingsOpen = ref(window.matchMedia('(min-width: 1024px)').matches)
 const result = reactive<PlaygroundResult>({
   text: '',
@@ -134,6 +134,16 @@ const copied = ref(false)
 const hasRun = ref(false)
 const submittedPrompt = ref('')
 const submittedModel = ref('')
+// resultMeta displays model, HTTP status, and duration below response
+const resultMeta = computed(() =>
+  [
+    submittedModel.value,
+    result.status ? `HTTP ${result.status}` : '',
+    result.durationMs ? `${result.durationMs} ms` : '',
+  ]
+    .filter(Boolean)
+    .join(' · '),
+)
 const promptInput = ref<HTMLTextAreaElement>()
 const scroller = ref<HTMLElement>()
 let controller: AbortController | undefined
@@ -156,6 +166,22 @@ const availableModels = computed(() =>
   }),
 )
 const selectedModel = computed(() => availableModels.value.find((model) => model.id === form.model))
+// outputTokenLimit is the configurable output limit for the model, or input limit for auto-continuation models
+const outputTokenLimit = computed(() => {
+  const model = selectedModel.value
+  return model?.capabilities?.output_continuation
+    ? model.input_token_limit
+    : model?.output_token_limit
+})
+// outputContinuationHint is the description displayed under output limit for auto-continuation models
+const outputContinuationHint = computed(() => {
+  const limit = outputTokenLimit.value
+  if (!selectedModel.value?.capabilities?.output_continuation || limit === undefined) return ''
+  return t('playground.outputContinuation').replace(
+    '{limit}',
+    new Intl.NumberFormat(locale.value).format(limit),
+  )
+})
 const supportsThinking = computed(() => {
   const capabilities = selectedModel.value?.capabilities ?? {}
   return (
@@ -172,14 +198,14 @@ const voices = computed(() => selectedModel.value?.capability_options?.voices ??
 const supportsMediaResolution = computed(
   () => selectedModel.value?.capabilities?.media_resolution === true,
 )
-// harmCategories 为官网运行设置的四个安全类别
+// harmCategories represents the 4 official safety harm categories
 const harmCategories: { id: string; label: TranslationKey }[] = [
   { id: 'HARM_CATEGORY_HARASSMENT', label: 'playground.harassment' },
   { id: 'HARM_CATEGORY_HATE_SPEECH', label: 'playground.hateSpeech' },
   { id: 'HARM_CATEGORY_SEXUALLY_EXPLICIT', label: 'playground.sexuallyExplicit' },
   { id: 'HARM_CATEGORY_DANGEROUS_CONTENT', label: 'playground.dangerousContent' },
 ]
-// harmThresholds 按官网滑块从关闭到最严格排列
+// harmThresholds ordered from off to most strict per official slider
 const harmThresholds: { value: string; label: TranslationKey }[] = [
   { value: 'OFF', label: 'playground.blockOff' },
   { value: 'BLOCK_NONE', label: 'playground.blockNone' },
@@ -195,7 +221,7 @@ const mediaResolutions: { value: string; label: TranslationKey }[] = [
 const settings = computed(() => playgroundSettings(form.mode, form.protocol))
 const protocolOptions = computed(() => playgroundProtocols(form.mode))
 const numericSettings = computed(() => numericFields.filter((item) => settings.value.has(item.key)))
-// modelOptions 读取当前模型在实时目录中的取值列表
+// modelOptions retrieves available option values for the current model in the catalog
 function modelOptions(key: string): string[] {
   return selectedModel.value?.capability_options?.[key] ?? []
 }
@@ -212,7 +238,7 @@ const resolutions = computed(() => {
     ? values.filter((value) => value === '720p' || value === '1080p')
     : values
 })
-// videoDurations 与官网一致，720p 以上的分辨率只配 8 秒
+// videoDurations limits options above 720p to 8s per official parity
 const videoDurations = computed(() => {
   const values = modelOptions('video_durations_seconds')
   return form.resolution !== '' && form.resolution !== '720p'
@@ -264,27 +290,27 @@ watch([selectedModel, () => form.protocol], () => {
   if (!videoDurations.value.includes(form.videoSeconds)) form.videoSeconds = ''
 })
 
-// numberValue 把数值输入框内容转换为参数，空值表示使用模型默认值
+// numberValue converts numeric input value to parameter, with empty indicating model default
 function numberValue(event: Event): number | null {
   const value = (event.target as HTMLInputElement).value
   return value === '' ? null : Number(value)
 }
 
-// numberPlaceholder 显示数值参数省略时实际使用的值
+// numberPlaceholder displays the effective default when numeric parameter is omitted
 function numberPlaceholder(key: NumericSetting): string {
   if (key !== 'maxOutputTokens') return t('playground.default')
   if (form.protocol === 'anthropic') return '1024'
   return String(selectedModel.value?.output_token_limit ?? t('playground.default'))
 }
 
-// addStopSequence 把输入框中的文本加入停止序列
+// addStopSequence appends stop draft text to stop sequences
 function addStopSequence(): void {
   const value = stopDraft.value
   if (value !== '' && !form.stopSequences.includes(value)) form.stopSequences.push(value)
   stopDraft.value = ''
 }
 
-// toggleTool 开启或关闭一个内置工具
+// toggleTool enables or disables a built-in tool
 function toggleTool(tool: PlaygroundTool, enabled: boolean): void {
   form.tools = enabled ? [...form.tools, tool] : form.tools.filter((item) => item !== tool)
 }
@@ -310,7 +336,7 @@ const hasOutput = computed(
 )
 const renderedText = computed(() => markdown.render(result.text))
 
-// resizePrompt 让输入框随内容增高，超过上限后在框内滚动
+// resizePrompt auto-expands textarea height with content, scrolling when limit is reached
 function resizePrompt(): void {
   const input = promptInput.value
   if (input === undefined) return
@@ -323,7 +349,7 @@ watch(
   () => void nextTick(resizePrompt),
 )
 
-// followOutput 在阅读位置接近底部时随新输出滚动
+// followOutput scrolls with new output when reading position is near bottom
 watch(
   () => [result.text.length, result.reasoning.length, result.media.length, result.raw.length],
   () => {
@@ -459,6 +485,7 @@ onUnmounted(() => {
         </div>
         <div class="hidden min-w-0 flex-1 justify-end sm:flex">
           <code
+            v-tooltip.overflow="`POST ${endpoint}`"
             class="min-w-0 truncate rounded-md border border-line px-2 py-1 font-mono text-[11px] text-gray-400"
             ><span class="text-blue-400">POST</span> {{ endpoint }}</code
           >
@@ -481,7 +508,7 @@ onUnmounted(() => {
           class="flex h-full flex-col items-center justify-center px-6 text-center"
         >
           <h2 class="text-2xl font-semibold text-gray-100">{{ t('playground.emptyTitle') }}</h2>
-          <p class="mt-2 max-w-md text-sm text-gray-500">
+          <p class="mt-2 max-w-md text-sm break-words text-gray-500">
             {{ t('playground.emptyHelp').replace('{endpoint}', endpoint) }}
           </p>
         </div>
@@ -508,7 +535,7 @@ onUnmounted(() => {
                 />
               </summary>
               <div
-                class="mt-2 border-l-2 border-line pl-4 text-[13px] leading-6 whitespace-pre-wrap text-gray-400"
+                class="mt-2 border-l-2 border-line pl-4 text-[13px] leading-6 break-words whitespace-pre-wrap text-gray-400"
                 v-text="result.reasoning"
               ></div>
             </details>
@@ -596,11 +623,9 @@ onUnmounted(() => {
               >
                 <UiIcon name="raw" :size="14" />
               </button>
-              <span class="ml-1.5 truncate tabular-nums">
-                {{ submittedModel }}
-                <template v-if="result.status"> · HTTP {{ result.status }}</template>
-                <template v-if="result.durationMs"> · {{ result.durationMs }} ms</template>
-              </span>
+              <span v-tooltip.overflow="resultMeta" class="ml-1.5 truncate tabular-nums">{{
+                resultMeta
+              }}</span>
             </div>
           </article>
         </div>
@@ -823,7 +848,7 @@ onUnmounted(() => {
               <input
                 type="number"
                 :min="item.min"
-                :max="item.max"
+                :max="item.key === 'maxOutputTokens' ? outputTokenLimit : item.max"
                 :step="item.step"
                 :value="form[item.key] ?? ''"
                 :placeholder="numberPlaceholder(item.key)"
@@ -832,6 +857,9 @@ onUnmounted(() => {
               />
             </label>
           </div>
+          <p v-if="settings.has('maxOutputTokens') && outputContinuationHint" class="text-gray-500">
+            {{ outputContinuationHint }}
+          </p>
           <div v-if="settings.has('stopSequences')" class="space-y-1.5">
             <label for="playground-stop" class="text-gray-400">
               {{ t('playground.stopSequences') }}
@@ -842,7 +870,7 @@ onUnmounted(() => {
                 :key="value"
                 class="inline-flex max-w-full items-center gap-1 rounded-md bg-white/[0.07] py-0.5 pr-0.5 pl-2 font-mono text-gray-200"
               >
-                <span class="truncate">{{ value }}</span>
+                <span v-tooltip.overflow="value" class="truncate">{{ value }}</span>
                 <button
                   type="button"
                   class="rounded-sm p-0.5 text-gray-500 hover:bg-white/10 hover:text-white"

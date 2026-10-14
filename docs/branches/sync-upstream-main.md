@@ -1,8 +1,8 @@
 ---
 branch: sync/upstream-main
-last_commit: 5b52422
+last_commit: 88b47e1
 status: complete
-last_activity: 13-10-2026
+last_activity: 14-10-2026
 ---
 
 ## Task
@@ -181,3 +181,51 @@ This sync integrates all these changes, resolves 24 conflicted files, and transl
    - Updated `internal/config/config_test.go` to isolate `AUTO_START` and `WAA_AUTO_START` tests from ambient OS environment variables.
    - Verified static analysis (`go vet ./...`, 0 issues) and full test suite (`go test ./...`, all packages passing).
    - Validated frontend typechecking (`npm --prefix web run typecheck`, 0 errors) and compilation (`go build ./cmd/aistudio2api`).
+
+---
+
+### Update: Upstream Auto-Continuation, Compaction, Thought Suffixes & v0.2.10 Synchronization (2026-10-14)
+
+**Task**: Synchronize `sync/upstream-main` with upstream commits up to `88b47e1` (release v0.2.10: auto-continuation, remote compaction, model thought suffixes, catalog and usage dashboard enhancements, stream grounding metadata and protocol alignment), resolve all merge conflicts preserving read-only configuration and English-only code invariants, translate all newly introduced comments, logs, and error strings to English, verify backend and frontend, commit the sync branch, and merge into `dev`.
+
+**Upstream Additions**:
+1. **Auto-Continuation for Long Outputs (`internal/aistudio/generate.go`, `event.go`, `channel.go`)**:
+   - Models with `output_continuation` capability (such as Gemini 4 Argon) support multi-round automatic continuation up to `inputTokenLimit`.
+   - Each round requests up to 32,768 tokens, extracting continuation tokens from stream completion frames and chaining subsequent generation requests with accumulated output, reasoning, and tool token counts.
+   - Generation deadlines scale proportionally with continuation rounds (`REQUEST_TIMEOUT` multiplied by round count).
+2. **Responses Remote Context Compaction (`internal/api/responses_compaction.go`, `responses.go`)**:
+   - Added `POST /v1/responses/compact` and `compaction` / `compaction_trigger` input item support.
+   - Automatically identifies verbatim preserved history (~20,000 tokens) and non-streamingly summarizes earlier history using structured handoff prompts with incremental update support (`<previous-summary>`).
+   - Retains relevant user messages up to 64,000 tokens while omitting environment and skill injection prefixes.
+3. **Model Name Thought Suffixes (`internal/aistudio/generate.go`)**:
+   - Supports parenthesized thought suffixes in model names (e.g. `gemini-4-argon(low)`, `gemini-2.5-pro(16384)`).
+   - Validates reasoning levels (`none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, `auto`, `-1`) and non-negative integer budgets, overriding request body parameters.
+4. **Usage Ledger & Pricing Estimator (`internal/pricing`, `internal/requestdb`, `internal/api/ledger.go`)**:
+   - Added `internal/pricing` package estimating request costs based on current Gemini API and Vertex AI published text pricing with long-context tier support.
+   - Migrated request and rollup database tables to track `cached_tokens`.
+   - Updated usage reports with estimated costs, throughput, and cache metrics.
+5. **Periodic Account Benefit Tier Inspection (`internal/app/runtime.go`, `service.go`)**:
+   - Added a concurrent 10-minute ticker in runtime to refresh `GetAiStudioBenefitTier` for enabled accounts, updating account capabilities and publishing snapshot events when tiers change.
+6. **Gemini Stream Alignment & Protocol Refinements (`internal/api/gemini.go`, `openai.go`)**:
+   - Stream grounding metadata and citations are consolidated onto the final chunk.
+   - Input rejections before header commitment emit HTTP 200 with `promptFeedback` for Gemini API compatibility.
+   - Mapped legacy OpenAI `functions` and `function_call` onto `tools` and `tool_choice`.
+7. **Web UI Usage Dashboard & Stage Cards (`web/src`)**:
+   - Integrated usage KPI metrics, trend charts, cost estimates, and ranking tables.
+   - Operational logs group step-by-step progress messages into collapsible stage cards (`StageLogCard.vue`).
+
+**Resolution & Adaptations**:
+1. **Immutable Configuration Preserved**:
+   - Rejected upstream editable form inputs and save buttons in `SettingsPanel.vue`, keeping settings as a read-only configuration inspector.
+   - Maintained immutable config invariants across `internal/app/admin.go` and `internal/api/admin.go`.
+2. **English-Only Code & Logs**:
+   - Translated all new comments, log messages, and error strings across Go source (`internal/aistudio`, `internal/api`, `internal/app`, `internal/pricing`, `internal/requestdb`) and TypeScript source (`web/src`) into concise technical English.
+   - Maintained English in `README.md`, `docs/build.md`, `docs/development.md`, `docs/logging.md`, and `docs/protocol.md`.
+3. **Frontend Build & Validation**:
+   - Verified TypeScript types (`npm run typecheck`, 0 errors).
+   - Rebuilt production bundle via `npm run build` embedded into binary.
+   - Validated linting and formatting (`npm run lint`, `npm run format:check`, 0 issues).
+4. **Backend Verification**:
+   - Static analysis clean (`go vet ./...`, 0 issues).
+   - Full test suite passing (`go test ./...`, all 9 packages ok).
+   - Compiled binary verification (`go build ./cmd/aistudio2api`).

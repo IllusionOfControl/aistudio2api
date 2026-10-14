@@ -25,7 +25,7 @@ const body = ref<RequestBody | null>(null)
 const bodyState = ref<'idle' | 'loading' | 'ready' | 'error'>('idle')
 const bodyError = ref('')
 const copied = ref('')
-// clipboardAvailable 表示页面处于可使用剪贴板 API 的安全上下文
+// clipboardAvailable indicates the page is in a secure context where the Clipboard API is accessible
 const clipboardAvailable = window.isSecureContext
 
 watch(
@@ -64,18 +64,19 @@ const summary = computed(() => {
     { label: t('usage.queue'), value: duration(record.queue_ms) },
     { label: t('usage.toolCalls'), value: integer(record.tool_calls) },
     { label: t('usage.input'), value: integer(record.input_tokens) },
+    { label: t('usage.cached'), value: integer(record.cached_tokens) },
     { label: t('usage.reasoning'), value: integer(record.reasoning_tokens) },
     { label: t('usage.reply'), value: integer(record.reply_tokens) },
     { label: t('usage.tokens'), value: integer(record.total_tokens) },
   ]
 })
 
-// byteLength 返回文本的 UTF-8 字节数
+// byteLength returns the UTF-8 byte length of text
 function byteLength(text: string): number {
   return new TextEncoder().encode(text).length
 }
 
-// pretty 格式化 JSON 正文，无法解析时原样返回
+// pretty formats JSON bodies with indentation, keeping non-JSON text unchanged
 function pretty(text: string): string {
   try {
     return JSON.stringify(JSON.parse(text), null, 2)
@@ -84,7 +85,7 @@ function pretty(text: string): string {
   }
 }
 
-// copy 复制文本并短暂显示已复制
+// copy copies text to clipboard and briefly shows copied state
 async function copy(kind: string, text: string): Promise<void> {
   await navigator.clipboard.writeText(text)
   copied.value = kind
