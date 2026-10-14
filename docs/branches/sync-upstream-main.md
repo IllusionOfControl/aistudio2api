@@ -1,7 +1,7 @@
 ---
 branch: sync/upstream-main
-last_commit: 1e3f73e
-status: in_progress
+last_commit: 5b52422
+status: complete
 last_activity: 13-10-2026
 ---
 
