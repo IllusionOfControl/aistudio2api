@@ -72,17 +72,21 @@ The management dashboard and `/api` control plane continue running even when the
 ```text
 cmd/aistudio2api/        Thin entry point, calls app.Run in internal/app
 internal/app/            Configuration, account assembly, auth refresh, signals, generation service instances, scheduling, lifecycle
+internal/setup/          CLI setup execution for Chrome, file, and browser login
 internal/aistudio/       Accounts, MakerSuite, WAA, models, tools, uploads, RPC client, protocol encoding
 internal/api/            Protocol routing, request decoding, SSE conversion, admin endpoints
 internal/camoufoxnative/ Camoufox WebDriver BiDi, process lifecycle, profile isolation, and login
-internal/chromeauth/     Chrome profile discovery, DBSC renewal material, DPAPI and app-bound decryption
-internal/config/         Configuration loading, validation, and immutable settings
+internal/waa/            Pure-Go BotGuard VM runtime, Firefox DOM simulation, Goja JavaScript VM
 internal/proxydial/      Upstream proxy dialing and local SOCKS5 relay for authenticated proxies
 internal/requestdb/      Request usage ledger and optional body SQLite storage
-internal/setup/          CLI setup execution for Chrome, file, and browser login
-internal/waa/            Pure-Go BotGuard VM runtime, Firefox DOM simulation, Goja JavaScript VM
+internal/pricing/        Gemini API pricing tables used for usage cost estimation
+internal/chromeauth/     Chrome profile discovery, DBSC renewal material, DPAPI and app-bound decryption
+internal/config/         Configuration loading, validation, and immutable settings
 internal/webui/          Static frontend embedding and SPA fallback routing
 web/                     Vue 3, TypeScript, Vite, and Tailwind CSS source code
+docs/                    Development runbooks and private protocol specifications
+auth/                    Per-account configuration, credentials, and recoverable runtime states
+runtime/camoufox/        Camoufox runtime used in releases
 runtime/requests.db      Request usage ledger and optional captured bodies
 ```
 
@@ -142,7 +146,7 @@ The application reads optional `.env` configuration from the current working dir
 | `ADMIN_PASSWORD` | Admin console password; required when authentication is enabled | empty |
 | `PROXY` | HTTP, HTTPS, or SOCKS5 proxy shared across setup and accounts without a dedicated proxy | empty |
 | `INIT_TIMEOUT` | Per-account initialization timeout | `2m` |
-| `REQUEST_TIMEOUT` | Request execution timeout | `5m` |
+| `REQUEST_TIMEOUT` | Request execution timeout, multiplied by continuation rounds for auto-continuation models | `5m` |
 | `WARM_WORKER_LIMIT` | Resident prewarmed accounts | `5` |
 | `MAX_ACTIVE_WORKERS` | Maximum concurrent workers during peak load | `10` |
 | `WARM_STARTUP_CONCURRENCY` | Concurrently cold-started Camoufox workers, shared by prewarming and scaling; unlimited when `WAA_BACKEND=go` | `5` |
@@ -242,7 +246,7 @@ Model access scopes:
 
 `ModelAccessKey(scope, model)` removes the `models/` prefix; empty scope returns the canonical model ID, and non-empty scope returns `<scope>:<canonicalModelID>`. Bidi setup uses the account lease timestamp, while each qualifying turn within a session is assigned a strictly increasing attempt timestamp consumed by `turn_complete`. Standard streaming generation writes `verified` upon arrival of canonical `EventFinish`; prior text, reasoning, tool, usage, and initial events serve output and latency metrics, while mid-stream disconnections, cancellations, or errors preserve existing verification states.
 
-Model catalog refresh runs concurrently across all enabled ready/busy accounts. Accounts returning errors or empty catalogs enter a pending ID set within the generation instance; each non-empty result immediately updates the shared catalog, account state, and warms additional workers during `RUNNING`. After the initial fan-out completes, a single 30-second ticker concurrently re-refreshes eligible pending accounts. Tasks in cooldown are retained until expiration; accounts requiring login, disabled, unavailable, or deleted exit the retry loop, re-syncing via account updates once re-authenticated or re-enabled. Failure logs record account and reason; successful recovery logs model count. `modelRevision` tracks account and configuration changes, ensuring the generation service validates application of the current revision before accepting traffic.
+Model catalog refresh runs concurrently across all enabled ready/busy accounts. Accounts returning errors or empty catalogs enter a pending ID set within the generation instance; each non-empty result immediately updates the shared catalog, account state, and warms additional workers during `RUNNING`. After the initial fan-out completes, a single 30-second ticker concurrently re-refreshes eligible pending accounts; a 10-minute ticker in the same loop concurrently reads `GetAiStudioBenefitTier` for all enabled ready/busy accounts, each occupying a normal concurrency slot (accounts with full slots skip the round; when tiers change, the existing catalog is written back with the new tier and account/model snapshots are published). Tasks in cooldown are retained until expiration; accounts requiring login, disabled, unavailable, or deleted exit the retry loop, re-syncing via account updates once re-authenticated or re-enabled. Failure logs record account and reason; successful recovery logs model count. `modelRevision` tracks account and configuration changes, ensuring the generation service validates application of the current revision before accepting traffic.
 
 Authentication state contains persistent credentials and device-bound materials stored in a secure local directory. Commits, issues, CI logs, and standard logs use sanitized payloads, preserving field structures while replacing cookies, tokens, proofs, emails, account IDs, prompts, response bodies, and raw wire frames.
 
@@ -253,16 +257,16 @@ Public endpoints uniformly consume the same real-time model catalog and canonica
 | Protocol | Endpoints |
 | --- | --- |
 | OpenAI Chat | `GET /v1/models`, `GET /v1/models/{model}`, `POST /v1/chat/completions` |
-| OpenAI Responses | `POST /v1/responses`, `POST /v1/responses/input_tokens`, `GET`/`DELETE /v1/responses/{id}`, `GET /v1/responses/{id}/input_items`, `POST /v1/responses/{id}/cancel` |
-| OpenAI Files | `POST /v1/files`, `GET /v1/files`, `GET /v1/files/{id}`, `GET /v1/files/{id}/content`, `DELETE /v1/files/{id}` |
-| Anthropic Messages | `POST /v1/messages`, `POST /v1/messages/count_tokens` |
-| Gemini | `POST /v1beta/models/{model}:generateContent`, `:streamGenerateContent`, `:countTokens` |
-| Embeddings | `POST /v1/embeddings`, `POST /v1beta/models/{model}:embedContent`, `:batchEmbedContents` |
-| Images | `POST /v1/images/generations`, `POST /v1/images/edits` |
-| Audio | `POST /v1/audio/speech`, `POST /v1/audio/transcriptions`, `POST /v1/audio/translations` |
-| Videos | `POST /v1/videos`, `GET /v1/videos`, `GET`/`DELETE /v1/videos/{id}`, `GET /v1/videos/{id}/content` |
-| Gemini Videos | `POST /v1beta/models/{model}:predictLongRunning`, `GET /v1beta/operations/{id}` |
-| Live & Robotics | `GET /v1/live`, `GET /v1/robotics/stream` |
+| OpenAI Responses | `POST /v1/responses`, `POST /v1/responses/input_tokens`, `POST /v1/responses/compact`, `GET`/`DELETE /v1/responses/{id}`, `GET /v1/responses/{id}/input_items`, `POST /v1/responses/{id}/cancel` |
+| Gemini Interactions | `POST /v1beta/interactions`, `GET`/`DELETE /v1beta/interactions/{id}`, `POST /v1beta/interactions/{id}/cancel` (same paths under `/v1/interactions`) |
+| OpenAI & Anthropic Files | `POST`/`GET /v1/files`, `GET`/`DELETE /v1/files/{file}`, `GET /v1/files/{file}/content` |
+| OpenAI Media | `POST /v1/images/generations`, `POST /v1/images/edits`, `POST /v1/audio/speech`, `POST`/`GET /v1/videos`, `GET`/`DELETE /v1/videos/{id}`, `GET /v1/videos/{id}/content` |
+| OpenAI Transcribe | `POST /v1/audio/transcriptions`, `POST /v1/audio/translations` |
+| OpenAI Embeddings | `POST /v1/embeddings` |
+| Anthropic | `POST /v1/messages`, `POST /v1/messages/count_tokens` |
+| Gemini | `GET /v1beta/models`, `GET /v1beta/models/{model}`, `POST /v1beta/models/{model}:generateContent`, `:streamGenerateContent`, `:countTokens`, `:embedContent`, `:batchEmbedContents`, `:predictLongRunning`, `GET /v1beta/operations/{id}` |
+| Gemini Files | `POST /upload/v1beta/files`, `GET /v1beta/files`, `GET`/`DELETE /v1beta/files/{file}` |
+| Realtime | `GET /v1/live`, `GET /v1/robotics/stream` |
 
 Management dashboard routes:
 
@@ -297,6 +301,8 @@ The API playground consumes SSE via `eventsource-parser`, completing requests on
 
 ## 5. Protocol Implementation Workflow
 
+The logs panel retains the latest 2000 events, displaying the latest 200 rows after merging by request and execution stage. When autoscroll is disabled, the current top row remains pinned while new logs append at the bottom. Request details and stage steps render upon first expansion.
+
 New upstream capabilities are implemented in the following order:
 
 1. Define canonical request, response types, and model capabilities in `internal/aistudio`
@@ -306,6 +312,12 @@ New upstream capabilities are implemented in the following order:
 5. Bind structured state and management controls to the dashboard
 
 `internal/api` consumes canonical requests and events, while `internal/aistudio` manages account files, WAA runtimes, raw upstream arrays, and real-time model capabilities. Resource-based operations record the creating account ID, routing subsequent polling, downloads, and prompt references to that account.
+
+1. Define canonical request, response types, and model capabilities in `internal/aistudio`
+2. Encode corresponding JSON+protobuf wire arrays described in [protocol.md](protocol.md)
+3. Decode network stream deltas into canonical events
+4. Project events into OpenAI, Responses, Anthropic, and Gemini protocols in `internal/api`, matching chunking, fields, and ordering of official protocol outputs
+5. Bind structured states and operational controls into the admin console
 
 Recognized fields validate types and oneof constraints. Unknown non-empty slots are preserved as provider events or raw extension fields; uninterpretable consumed fields, missing finish frames, and invalid media payloads return structured protocol errors.
 

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -347,6 +348,27 @@ func (s *PooledService) RefreshAccountModels(ctx context.Context, accountID stri
 		return models, fmt.Errorf("release model catalog lease for account %s: %w", accountID, releaseErr)
 	}
 	return models, nil
+}
+
+// RefreshAccountTier fetches account benefit tier using a normal concurrency slot. If the tier changes, it updates the pool preserving the existing catalog, and returns the previous and current tier; skips if no slot is free.
+func (s *PooledService) RefreshAccountTier(ctx context.Context, accountID string) (BenefitTier, BenefitTier, error) {
+	lease, _, err := s.pool.TryAcquireFor(ctx, AccountSelection{AccountID: strings.TrimSpace(accountID)})
+	if lease == nil {
+		return BenefitTierFree, BenefitTierFree, err
+	}
+	account := lease.Account()
+	tier, err := s.client.BenefitTierForAccount(ContextWithAccountLease(ctx, lease), account.ID)
+	s.pool.mu.Lock()
+	previous := account.BenefitTier
+	models := cloneAccountModels(account.Models)
+	s.pool.mu.Unlock()
+	if err == nil && tier != previous {
+		err = s.pool.SetCatalog(account.ID, tier, models)
+	}
+	if err != nil {
+		return previous, previous, errors.Join(err, lease.Release())
+	}
+	return previous, tier, lease.Release()
 }
 
 // CachedModels returns the union of recently synced catalogs for enabled accounts
@@ -794,17 +816,35 @@ func mergeModels(base []Model, additions []Model) []Model {
 		merged[model.ID] = current
 	}
 	result := make([]Model, 0, len(merged))
-	for _, model := range merged {
+	for _, id := range upstreamModelOrder(base, additions) {
+		model := merged[id]
 		model.Methods = unionStrings(nil, model.Methods)
 		for name, values := range model.CapabilityOptions {
 			model.CapabilityOptions[name] = unionStrings(nil, values)
 		}
 		result = append(result, model)
 	}
-	sort.Slice(result, func(left int, right int) bool {
-		return result[left].ID < result[right].ID
-	})
 	return result
+}
+
+// upstreamModelOrder merges model IDs following upstream ordering across catalogs: models appearing only in a later catalog are placed after their preceding known model in that catalog, before the first known model if none precedes, or at the end if the catalog contains no known models.
+func upstreamModelOrder(lists ...[]Model) []string {
+	var order []string
+	for _, models := range lists {
+		previous := len(order) - 1
+		if index := slices.IndexFunc(models, func(model Model) bool { return slices.Contains(order, model.ID) }); index >= 0 {
+			previous = slices.Index(order, models[index].ID) - 1
+		}
+		for _, model := range models {
+			if index := slices.Index(order, model.ID); index >= 0 {
+				previous = index
+				continue
+			}
+			previous++
+			order = slices.Insert(order, previous, model.ID)
+		}
+	}
+	return order
 }
 
 func unionInt64(left []int64, right []int64) []int64 {

@@ -160,7 +160,7 @@ func (p *AccountPool) channelSupportsLocked(account *Account, channel Channel, s
 			return p.channelEnabledLocked(ChannelBuild) && p.buildSupportsMethodLocked(account, selection.ModelID, selection.Method)
 		}
 		return generationChannelSelection(selection) && p.channelEnabledLocked(ChannelBuild) &&
-			p.buildSupportsModelLocked(account, selection.ModelID)
+			p.buildSupportsModelLocked(account, selection.ModelID, selection.anyTier)
 	default:
 		return false
 	}
@@ -228,8 +228,8 @@ func (p *AccountPool) channelCandidatesLocked(indices []int, selection AccountSe
 	return append(candidates[start:], candidates[:start]...)
 }
 
-// buildSupportsModelLocked determines whether account Build catalog can invoke model via generation request
-func (p *AccountPool) buildSupportsModelLocked(account *Account, modelID string) bool {
+// buildSupportsModelLocked determines whether account Build catalog can invoke model via generation request; when anyTier is true, account benefit tier is not checked
+func (p *AccountPool) buildSupportsModelLocked(account *Account, modelID string, anyTier bool) bool {
 	modelID = strings.TrimPrefix(strings.TrimSpace(modelID), "models/")
 	found := false
 	for _, model := range account.buildModels {
@@ -247,7 +247,7 @@ func (p *AccountPool) buildSupportsModelLocked(account *Account, modelID string)
 		}
 		for _, model := range candidate.Models {
 			if modelMatchesID(model, modelID) {
-				return !buildExcludedPlaygroundModel(model) && modelAllowedByTier(model, account.BenefitTier)
+				return !buildExcludedPlaygroundModel(model) && (anyTier || modelAllowedByTier(model, account.BenefitTier))
 			}
 		}
 	}
@@ -312,7 +312,7 @@ func (p *AccountPool) buildOnlyModelsLocked() []Model {
 			listed := cloneAccountModels([]Model{model})[0]
 			if !hasMethod(model, "generateContent") {
 				listed.Methods = buildPublicMethods(model)
-			} else if !p.buildSupportsModelLocked(account, model.ID) {
+			} else if !p.buildSupportsModelLocked(account, model.ID, false) {
 				continue
 			}
 			if len(listed.Methods) == 0 {
@@ -349,6 +349,32 @@ func (p *AccountPool) BidiMethod(modelID string) string {
 	return "bidiGenerateContent"
 }
 
+// OutputContinuationRounds returns the number of rounds required by official auto-continuation; defaults to catalog limit if not specified, or 1 if continuation is not needed. Multi-round requests can only be generated via Playground.
+func (p *AccountPool) OutputContinuationRounds(modelID string, maxOutputTokens *int64) int {
+	if maxOutputTokens != nil && *maxOutputTokens <= continuationRoundTokens {
+		return 1
+	}
+	modelID = strings.TrimPrefix(strings.TrimSpace(modelID), "models/")
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, account := range p.accounts {
+		if account == nil {
+			continue
+		}
+		for _, model := range account.Models {
+			if modelMatchesID(model, modelID) && model.Capabilities["output_continuation"] {
+				requested := model.OutputTokenLimit
+				if maxOutputTokens != nil {
+					requested = *maxOutputTokens
+				}
+				total := min(requested, max(model.InputTokenLimit, continuationRoundTokens))
+				return max(1, int((total+continuationRoundTokens-1)/continuationRoundTokens))
+			}
+		}
+	}
+	return 1
+}
+
 func (p *AccountPool) hasBuildModelLocked(modelID string, method string) bool {
 	if !p.channelEnabledLocked(ChannelBuild) {
 		return false
@@ -361,7 +387,7 @@ func (p *AccountPool) hasBuildModelLocked(modelID string, method string) bool {
 			if model.ID != modelID || method != "" && !hasMethod(model, method) {
 				continue
 			}
-			if hasMethod(model, "generateContent") && p.buildSupportsModelLocked(account, modelID) {
+			if hasMethod(model, "generateContent") && p.buildSupportsModelLocked(account, modelID, false) {
 				return true
 			}
 			for _, served := range buildMethods {
@@ -374,9 +400,9 @@ func (p *AccountPool) hasBuildModelLocked(modelID string, method string) bool {
 	return false
 }
 
-// modelChannelsLocked returns channels through which at least one enabled account can invoke the model
-func (p *AccountPool) modelChannelsLocked(model Model) []string {
-	selection := AccountSelection{ModelID: model.ID}
+// modelChannelsLocked returns channels through which at least one enabled account can invoke the model; when anyTier is true, account benefit tier is not checked
+func (p *AccountPool) modelChannelsLocked(model Model, anyTier bool) []string {
+	selection := AccountSelection{ModelID: model.ID, anyTier: anyTier}
 	if hasMethod(model, "generateContent") {
 		selection.Method = "generateContent"
 	} else if index := slices.IndexFunc(buildMethods, func(method string) bool { return hasMethod(model, method) }); index >= 0 {

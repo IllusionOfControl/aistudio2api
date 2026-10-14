@@ -157,7 +157,7 @@ Embedding (`embedContent`), Live (`bidiGenerateContent`), and realtime music (`b
 
 ### Public Catalog
 
-The public catalog represents the union of enabled channels. Models unique to Build that can be called by at least one enabled account for generation, embedding, Live, or realtime music are added to the public catalog; embedding model methods are `batchEmbedContents, embedContent`, and realtime models are `bidiGenerateContent` or `bidiGenerateMusic`. When a model appears in the Playground catalog, Build requests use the Playground catalog default parameters and capabilities; for Build-only models, the default output limit is `outputTokenLimit`, and thinking capability is derived from `thinkingLevel` and `thinkingBudget`.
+The public catalog represents the union of enabled channels. Models unique to Build that can be called by at least one enabled account for generation, embedding, Live, or realtime music are added to the public catalog; embedding model methods are `batchEmbedContents, embedContent`, and realtime models are `bidiGenerateContent` or `bidiGenerateMusic`. When Build is not enabled, these models are not listed in the catalog and requests return model not found. When a model appears in the Playground catalog, Build requests use the Playground catalog default parameters and capabilities; for Build-only models, the default output limit is `outputTokenLimit`, and thinking capability is taken from `thinking`. Each model's `channels` lists channels through which at least one enabled account can invoke it; models whose `AccessModes` are not satisfied by any enabled account contain no `channels`.
 
 ### Scheduling & Cooldowns
 
@@ -252,9 +252,11 @@ Tool choice defaults or `auto` emit tool declarations; `none` omits `tools`; oth
 | `maxOutputTokens` | Request value or catalog default |
 | `temperature`, `topP`, `topK`, `seed` | Request value or catalog default |
 | `responseMimeType` | Request value |
-| `responseJsonSchema` | JSON Schema for structured output |
-| `mediaResolution` | Request value |
-| `thinkingConfig` | Converted from `reasoning_effort` or budget |
+| `responseSchema` | Schema in protobuf JSON format |
+| `responseModalities` | Uppercase modality names |
+| `imageConfig` | `{aspectRatio?, imageSize?}` |
+| `speechConfig` | Single voice as `voiceConfig.prebuiltVoiceConfig.voiceName`; multi-speaker as `multiSpeakerVoiceConfig.speakerVoiceConfigs[{speaker, voiceConfig}]` |
+| `thinkingConfig` | `includeThoughts` (true when request requires thoughts), `thinkingBudget`, `thinkingLevel` |
 
 Thinking levels map from Playground enums: Low=`LOW`, Medium=`MEDIUM`, High=`HIGH`, Minimal=`MINIMAL`. Conversion rules between `reasoning_effort`, token budgets, and levels match Playground.
 

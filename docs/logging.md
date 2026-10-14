@@ -26,6 +26,8 @@ Management event DTOs (event objects returned by the management API) use the fol
 
 `INFO` records state progress and completion results; `WARN` records waits, fallbacks, and client cancellations; `ERROR` records failures. The management UI supports filtering by level, source, and message text, and log messages support selection and horizontal scrolling.
 
+Operational events formatted like `Stage Name | i/N | details` are merged on the UI into a single card by source and stage name, displaying the stage name, current progress `i/N`, and details of the latest step. Subsequent completion messages from the same source merge into the same card displaying terminal status: `Protocol runtime ready`, `Generation service ready`, `WAA worker ready`, and stage name plus `completed` denote completed; stage name plus `failed` denotes failure; stage name plus `cancelled` denotes cancellation. Starting from `1/N` again from the same source opens a new card. The card remains at the timestamp of the first event, and expanding details shows the timestamp and content of each step; level, source, and text filters show the card if any step matches.
+
 Request errors are stored in `request.error` and displayed directly below the request row. Operational event error details are preserved in `message`.
 
 ## Startup Sequence
@@ -58,7 +60,13 @@ In `preparing model catalog`, `cached` indicates the consolidated verified model
 Accounts with empty catalogs, single-account sync failures, or empty responses enter the pending ID set. After the initial fan-out completes, a `RUNNING` generation service uses a single 30-second ticker to re-execute `ListModels` concurrently for all pending IDs; non-empty successes immediately update accounts, models, and worker selection, while failures and empty results are retained:
 
 ```text
-INFO  service  model catalog retry completed | synced=2 | non_empty=2 | retry_pending=0
+INFO  account@example.com  Model catalog updated | models=39
+```
+
+The same loop checks `GetAiStudioBenefitTier` for all `enabled`, `ready`, or `busy` accounts every 10 minutes, with accounts whose concurrency slots are occupied skipping the round. When tier changes, scheduling and public channels update:
+
+```text
+INFO  account@example.com  Account benefit tier updated | tier=Free→Ultra
 ```
 
 Cancellation and failure logs:
@@ -144,6 +152,7 @@ thinking 32 · reply 38 · total output 70 tokens · avg speed 14.7 tokens/s
 | Avg Speed | Total output divided by total latency (tokens/s), including preparation and wait time |
 | Tool Calls | Count of function call events produced in this generation |
 | Input Usage | `request.usage.input_tokens`, including input messages and tool definitions |
+| Cache Hit | `request.usage.cached_tokens`, portion of input tokens hitting upstream implicit cache; hidden when 0 |
 | Total Usage | `request.usage.total_tokens`, sum of input and output tokens |
 
 Usage metrics are displayed once returned by the generation service; `request.usage` is omitted when usage is unavailable. Average speed measures end-to-end throughput across the same duration interval, even for buffered or chunk-burst network delivery.
@@ -153,7 +162,7 @@ Usage metrics are displayed once returned by the generation service; `request.us
 In the console, each line is an independent JSON event:
 
 ```json
-{"time":"2026-09-06T14:11:47Z","level":"INFO","msg":"tool calls completed","event":"request.finished","source":"account@example.com","request":{"id":"chatcmpl_example","state":"tool_calls","model":"gemini-3.8-flash","status":200,"duration_ms":4758,"tool_calls":1,"finish_reason":"stop","usage":{"input_tokens":100,"reasoning_tokens":32,"reply_tokens":38,"output_tokens":70,"total_tokens":170,"average_tokens_per_second":14.712064}}}
+{"time":"2026-09-06T14:11:47Z","level":"INFO","msg":"tool calls completed","event":"request.finished","source":"account@example.com","request":{"id":"chatcmpl_example","state":"tool_calls","model":"gemini-3.8-flash","status":200,"duration_ms":4758,"tool_calls":1,"finish_reason":"stop","usage":{"input_tokens":100,"cached_tokens":0,"reasoning_tokens":32,"reply_tokens":38,"output_tokens":70,"total_tokens":170,"average_tokens_per_second":14.712064}}}
 ```
 
 Sampling parameters are preserved in `request.parameters`. `first_event_ms`, `queue_ms`, `proof_ms`, and `upstream_bytes` are retained as JSON diagnostic fields: `queue_ms` is the duration from request arrival to acquiring the final execution account, and `proof_ms` is the time spent waiting for and generating WAA proof. The management interface supports filtering by level, account, model, request ID, and status code.
@@ -248,7 +257,7 @@ Delayed authentication results apply only when `authGeneration` and `checkedAt` 
 
 ## Usage Ledger
 
-`runtime/requests.db` is a local SQLite ledger. Every POST request on `/v1` and `/v1beta` passing API key authentication writes one row upon completion: request ID, completion timestamp, protocol, path, model, account, channel, HTTP status, `request.state`, latency, first upstream event latency, queue wait, token usage, tool call count, error message, and attempt count.
+`runtime/requests.db` is a local SQLite ledger. Every POST request on `/v1` and `/v1beta` passing API key authentication writes one row upon completion: request ID, completion timestamp, protocol, path, model, account, channel, HTTP status, `request.state`, latency, first upstream event latency, queue wait, token usage (including cached tokens), tool call count, error message, and earlier unfulfilled upstream attempts. The same transaction rolls up summary and latency distributions by UTC hour and server-local day: local days fully falling within range and a single bucket read day rollups; other full hours read hour rollups; range boundaries and cross-bucket portions read raw records. If the server timezone changes, local daily rollups are rebuilt from hour rollups and raw records on next startup. Writes are committed in batches by a background goroutine without blocking responses: when queued records exceed 4096, new records are dropped, reporting dropped count when writing resumes. Records and rollups are retained for 90 full server-local days. The admin dashboard queries via `GET /api/usage` and `GET /api/usage/records`. Dashboard estimated costs are calculated item-by-item from raw records using current Gemini API and Vertex AI published text pricing, billing cache hit tokens at cache pricing.
 
 ```text
 INFO  service  Request ledger rebuilt daily summaries according to server timezone | days=<COUNT>

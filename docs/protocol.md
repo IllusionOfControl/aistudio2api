@@ -416,9 +416,10 @@ Root message fields:
 | 4 | 5 | fresh WAA proof |
 | 5 | 6 | system instruction |
 | 6 | 7 | tools |
-| 10 | 11 | Fixed value `1` |
+| 10 | 11 | Fixed value `1`, omitted for auto-continuation models |
 | 13 | 14 | `[[null,null,<TIMEZONE>]]` |
 | 14 | 15 | User Cloud API key; remains `null` for free web chains |
+| 16 | 17 | Continuation token for auto-continuation rounds |
 
 safety settings:
 
@@ -445,6 +446,7 @@ generation config fields:
 | 7 | 8 | response MIME type |
 | 8 | 9 | response schema |
 | 13 | 14 | Fixed value `1` |
+| 45 | 46 | `1` for auto-continuation models |
 | 14 | 15 | response modalities: TEXT=`1`, IMAGE=`2`, AUDIO=`3` |
 | 15 | 16 | speech config |
 | 16 | 17 | thinking config `[1, budget?, null, level]` |
@@ -457,7 +459,7 @@ Generation parameter validation:
 
 | Parameter | Default Source | Valid Values |
 | --- | --- | --- |
-| max output | ListModels field 7 | `1..model.outputTokenLimit` |
+| max output | ListModels field 7 | `1..model.outputTokenLimit`，自动续写模型为 `1..model.inputTokenLimit` |
 | temperature | ListModels field 9 | `0..2` |
 | topP | ListModels field 10 | `0..1` |
 | topK | ListModels field 11 | Non-negative integer |
@@ -467,6 +469,8 @@ Generation parameter validation:
 - If max output tokens exceeds the model limit, it is clamped to the model limit
 
 `reasoning_effort` / `thinkingLevel` / Anthropic `output_config.effort` accepts `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, and `max`; `xhigh` and `max` are treated as `high`, and `THINKING_LEVEL_UNSPECIFIED` is treated as unset. `none` uses a budget of 0 on models that only support thinking budget, the lowest available level on models supporting thinking level, and is ignored on models without thinking support. When a model only supports thinking budget, an explicit effort must also provide a numeric thinking budget; when a model supports thinking level, a budget converts to thinking level according to compatibility tiers (1024, 8192, 24576). Model requests lacking thinking support omit thinking configuration.
+
+Model names in generation and count requests can include a thinking suffix `<model ID>(<value>)`, such as `gemini-4-argon(low)`, `gemini-2.5-pro(16384)`. Values are case-insensitive: `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max` set reasoning effort; non-negative integers set thinking budget; `auto` and `-1` use model default thinking settings. The suffix overrides thinking effort and budget parameters in the request body; the clean model ID without suffix is used for routing, request logging, and usage stats. Other values return HTTP 400.
 
 response modalities:
 
@@ -654,16 +658,28 @@ Completion frame usage:
 | 0 | input tokens | `input_tokens` |
 | 1 | visible output tokens | `output_tokens` |
 | 2 | total tokens | `total_tokens` |
+| 3 | 输入中命中上游隐式缓存的 tokens | `cached_tokens` |
 | 7 | tool tokens | `tool_tokens` |
 | 9 | thought tokens | `reasoning_tokens` |
 
 Complete usage is returned directly using upstream values. When the completion frame omits visible output tokens, the service reconstructs this value from the upstream total and the remaining breakdown fields. When complete usage is missing entirely, the built-in Gemini SentencePiece tokenizer calculates observable inputs, tool declarations, reasoning summaries, and actual outputs locally.
 
-Input statistics for OpenAI and Anthropic are computed as input + tool, while output statistics are visible output + reasoning. Gemini projects `promptTokenCount`, `candidatesTokenCount`, `thoughtsTokenCount`, and `totalTokenCount` respectively. Hidden thinking token usage comes from upstream usage field 9; the local fallback tallies the reasoning summary returned by the server.
+Input statistics for OpenAI and Anthropic are computed as input + tool, while output statistics are visible output + reasoning. Gemini projects `promptTokenCount`, `candidatesTokenCount`, `thoughtsTokenCount`, and `totalTokenCount` respectively. Cache hit count is represented as `prompt_tokens_details.cached_tokens` in Chat and `input_tokens_details.cached_tokens` in Responses, both included in the input count; Anthropic `cache_read_input_tokens` represents cached tokens, with `input_tokens` representing total input minus cached tokens, and `cache_creation_input_tokens` set to 0; Gemini outputs `cachedContentTokenCount` upon cache hits. Build channel cached token count comes from `usageMetadata.cachedContentTokenCount`. Hidden thinking token usage comes from upstream usage field 9; the local fallback tallies the reasoning summary returned by the server.
 
 Anthropic streaming `message_start` writes an initial input estimate, while the final `message_delta` overrides it with the completion usage to provide authoritative input and output counts.
 
 Requests carrying stop sequences execute `CountTokens` in parallel under the same account. When the generated text matches the actual sequence, the protocol core terminates the generation stream and constructs the final usage from the `CountTokens` total input count along with already emitted text, reasoning, and tool statistics; if counting fails, it still returns the `stop_sequence` finish state and omits usage.
+
+### Auto-continuation
+
+Models with ListModels capability code 91 (catalog capability `output_continuation`) generate outputs exceeding 32,768 tokens across multiple rounds per official site behavior, with output length capped at the model's `inputTokenLimit`:
+
+1. Generation config field 46 is set to `1` in the request, and root field 11 is omitted; when max output exceeds 32,768, the first round requests 32,768.
+2. Candidate field 9 (JSON index 8) provides the continuation token. When the completion frame ends with `max_tokens` accompanied by a token and the round limit is lower than the total requested output, or when ending with finish reason 22, the round does not form a terminal state.
+3. The next round duplicates the original request, setting root message field 17 to the latest continuation token and max output to `min(total requested output, (round + 1) × 32768)` with round index starting at 0.
+4. If finish reason 22 is encountered without a continuation token in the response, the request fails.
+
+Text, thinking, and tool events from each round are emitted sequentially as a single response, with the terminal state taken from the final round. Usage is based on the final round, with visible output, thought, and tool tokens accumulated across rounds, and total reflecting the final round total plus the cumulative sum of these three fields from earlier rounds. Auto-continuation requests exceeding 32,768 tokens route exclusively via Playground, with the request deadline set to `REQUEST_TIMEOUT` multiplied by `⌈total output / 32768⌉`; if max output is omitted, total output defaults to the catalog output token limit. Each continuation round logs an upstream call with mode annotated as `continuation=<round>`.
 
 ### Finish and Errors
 
@@ -683,18 +699,19 @@ Requests carrying stop sequences execute `CountTokens` in parallel under the sam
 
 generation config, safety settings, tools, and transcription configurations are validated against model catalogs loaded for each account before account selection; accepting by any account passes validation. Streaming requests wait for the first event before writing response headers: parameter errors and upstream errors before the first event return HTTP status and error objects non-streamingly; if no event arrives within 10 seconds, headers are written, and subsequent errors return as in-stream error events per protocol.
 
-The root shape of an error response is `[null,[code,message,...]]`. Rejected input returns `[null,[block_reason,null,message]]` as HTTP 400, including the rejection reason and upstream explanation. The protocol core preserves HTTP status, protocol code, and message; public adapters map these to OpenAI, Anthropic, or Gemini error objects. Chat, Responses, Anthropic Messages, and Gemini GenerateContent output normal text from media models as text results; dedicated image endpoints require image results. HTTP/protocol Code 16 and HTTP 401 trigger automatic token renewal and single retry.
+The root shape of an error response is `[null,[code,message,...]]`. When input is rejected by upstream, the frame is `[null,[block_reason,null,message]]`: Gemini GenerateContent returns HTTP 200 with `promptFeedback:{blockReason,blockReasonMessage}` and no `candidates`, sent as the sole frame in streaming; other protocols return HTTP 400 with the error message including the rejection reason and upstream explanation. The protocol core preserves HTTP status, protocol code, and message; public adapters map these to OpenAI, Anthropic, or Gemini error objects. Chat, Responses, Anthropic Messages, and Gemini GenerateContent output normal text from media models as text results; dedicated image endpoints require image results. HTTP/protocol errors or missing completion frames produce failure; upstream finish reasons are preserved as normal terminal states and mapped to public protocols.
 
 Specific terminal state mappings across protocols are as follows:
 
 | Upstream Terminal State | OpenAI Chat | OpenAI Responses | Anthropic Messages | Gemini GenerateContent |
 | --- | --- | --- | --- | --- |
-| `stop` with function call | `tool_calls` | `completed`, retaining function call item | `tool_use` | `STOP`, retaining functionCall Part |
+| `stop` with function call | `tool_calls`, legacy `functions` requests return `function_call` | `completed`, retaining function call item | `tool_use` | `STOP`, retaining functionCall Part |
 | `stop_sequence` | `stop` | `completed` | `stop_sequence` with actual sequence | `STOP` |
 | `max_tokens` | `length` | `incomplete/max_output_tokens` | `max_tokens` | `MAX_TOKENS` |
-| policy, refusal, missing signature, and other anomalous terminal states | `content_filter` | `incomplete/content_filter` | `refusal` | Corresponding Gemini enum or `OTHER` |
+| safety, recitation, blocklist, prohibited_content, spii, image reasons, and `provider_*` | `content_filter` | `incomplete/content_filter` | `refusal` | Corresponding Gemini enum or `OTHER` |
+| other, language, malformed_function_call, missing thought signature, and other terminal states | `stop`, or `tool_calls` if function calls present | `completed` | `end_turn`, or `tool_use` if function calls present | Corresponding Gemini enum |
 
-Anomalous terminal states take precedence over tool call terminal states within the same result, while already emitted content, reasoning, tool events, and usage are retained in the response. `provider_*` retains its original value in `provider_finish_reason` within Chat choice, Responses response, Anthropic message, or `message_delta`; Gemini retains the code using `finishMessage`. `provider_19` corresponds to `Content blocked` on the AI Studio UI.
+Content filtering terminal states take precedence over tool call terminal states within the same result, while already emitted content, reasoning, tool events, and usage are retained in the response. `provider_*` retains its original value in `provider_finish_reason` within Chat choice, Responses response, Anthropic message, or `message_delta`; Gemini retains the code using `finishMessage`. `provider_19` corresponds to `Content blocked` on the AI Studio UI.
 
 ## 6. Functions, Google Tools, Drive, and Media
 
@@ -1033,7 +1050,7 @@ server content indices `0/1/2/4/5/6` correspond to model content, turn complete,
 | Protocol | Endpoints |
 | --- | --- |
 | OpenAI Chat | `GET /v1/models`, `GET /v1/models/{id}`, `POST /v1/chat/completions` |
-| OpenAI Responses | `POST /v1/responses`, `POST /v1/responses/input_tokens`, `GET /v1/responses/{id}`, `DELETE /v1/responses/{id}`, `GET /v1/responses/{id}/input_items`, `POST /v1/responses/{id}/cancel` |
+| OpenAI Responses | `POST /v1/responses`, `POST /v1/responses/input_tokens`, `POST /v1/responses/compact`, `GET /v1/responses/{id}`, `DELETE /v1/responses/{id}`, `GET /v1/responses/{id}/input_items`, `POST /v1/responses/{id}/cancel` |
 | OpenAI Embeddings | `POST /v1/embeddings` |
 | OpenAI Images | `POST /v1/images/generations`, `POST /v1/images/edits` |
 | OpenAI Speech | `POST /v1/audio/speech` |
@@ -1102,14 +1119,22 @@ The admin API uses DTOs (Data Transfer Objects) to represent request, response, 
 | `AdminStatus` | `state`, `running`, `ready`, `version`, `active_requests`, `accounts` |
 | `AdminAccountCounts` | `total`, `ready`, `busy`, `cooldown`, `auth_required` |
 | `AdminAccount` | `id`, `label`, `enabled`, `state`, `proxy`, `locale`, `timezone`, `models`, `benefit_tier`, `message` |
-| `AccountCreateInput` | `label`, `storage_state`, `proxy`, `locale`, `timezone` |
-| `AccountUpdateInput` | `label`, `proxy`, `locale`, `timezone`, `enabled` |
+| `AccountCreateInput` | `proxy`, `locale`, `timezone` |
+| `AccountInput` | `label`, `enabled`, `proxy`, `locale`, `timezone` |
+| `ChromeImportProfile` | `id`, `profile`, `display_name`, `email`, `locale` |
 | `ChromeImportInput` | `account_ids`, `proxy`, `locale`, `timezone` |
-| `AccountStateInput` | `label`, `account`, `storage_state`, `runtime_state`, `fingerprint` |
-| `PairingCreated` | `token`, `origin`, `command`, `expires_at` |
-| `AdminModel` | `id`, `display_name`, `channels`, `input_token_limit`, `output_token_limit`, `methods`, `capabilities`, `capability_options`, `thinking_level`, `thinking_budget` |
-| `AdminRequest` | `id`, `path`, `method`, `model`, `account`, `channel`, `status`, `duration_ms`, `input_tokens`, `output_tokens`, `total_tokens`, `created_at` |
-| `RequestBody` | `request_id`, `path`, `method`, `model`, `time`, `request_content_type`, `response_content_type`, `request_body`, `response_body` |
+| `PairingToken` | `token`, `expires_at` |
+| `AccountStateInput` | `label`, `locale`, `timezone`, `storage_state`, optional `fingerprint` |
+| `AdminCooldown` | `account_id`, `account_label`, `model_id`, `until`, optional `reason` |
+| `AdminRequest` | `id`, `model`, `account_id`, `account_label`, `state`, `started_at` |
+| `AdminLog` | `time`, `level`, `source`, `message`, `event`; request events carry `request`, including `id`, `state`, HTTP `status`, `model`, `duration_ms`, `tool_calls`, `usage`, and diagnostics, see [logging.md](logging.md) |
+| `AdminEvent` | `type`, `data` |
+| `UsageLatency` | `avg_ms`, `p50_ms`, `p95_ms`, `p99_ms` |
+| `UsageStats` | `requests`, `succeeded`, `failed`, `canceled`, `rate_limited`, `input_tokens`, `cached_tokens`, `reasoning_tokens`, `reply_tokens`, `total_tokens`, `duration`, `first_event`, `queue_avg_ms`, optional `last_at` |
+| `UsageReport` | `from`, `to`, `bucket_seconds`, `generated_at`, optional `latest_at`, `totals`, `previous`, `recent`, `cost`, `previous_cost`, `buckets`, `stack_by`, `series`, `groups`, `pairs`, `options` |
+| `UsageRecord` | `id`, `time`, `protocol`, `path`, `model`, `account`, `channel`, `status`, `state`, `duration_ms`, `first_event_ms`, `queue_ms`, `input_tokens`, `cached_tokens`, `reasoning_tokens`, `reply_tokens`, `total_tokens`, `tool_calls`, `error`, `attempts`, `has_body` |
+| `UsageRecordPage` | `items`, optional `next_cursor` |
+| `RequestBody` | `id`, `time`, `request`, `request_size`, `response`, `response_size` |
 
 `AdminStatus.state` can be `STOPPED`, `LAUNCHING`, or `RUNNING`; `running` is true only when in `RUNNING` state; `ready` requires `RUNNING` and at least one account in ready or busy state; `version` is sourced from build metadata; `active_requests` represents the number of active requests in the current process registry. `AdminAccount.message` records the reason for the current state, and `models` lists the real-time catalog IDs available to that account. `until` and `started_at` use RFC 3339 JSON timestamps.
 
@@ -1126,7 +1151,7 @@ The admin API uses DTOs (Data Transfer Objects) to represent request, response, 
 - The query window is `[from, to)`, max 90 days. `auto` selects buckets based on span duration.
 - `UsageReport` contains summary metrics, timeline time-series, rankings across dimensions, and model performance latency percentiles.
 
-The commit sequence for `PUT /api/accounts/{id}` is strictly ordered: validate the immutable email ID, acquire an exclusive lease on the account, create a new unpromoted egress, shut down the current worker and mark the new worker configuration as `pending` (unpromoted), atomically write `account.json` and update the account pool within a model catalog write lock, and subsequently promote the worker configuration, swap the egress, release the lease, and rebuild the model cache. Writing `account.json` is the sole point of durable commit. Any errors during egress creation, worker shutdown, or file write prior to commit discard the pending configuration and preserve the old configuration; any already-terminated worker is reconstructed according to the old configuration on subsequent requests. Once durably written, the new account configuration, worker configuration, and egress collectively transition to the committed state. A failure during lease release maintains this committed state while returning the original unlock error; a successful release logs completion and synchronizes the model cache.
+`auto` selects bucket duration based on range span: 1 minute for spans under 2 hours, 5 minutes for spans under 12 hours, 1 hour for spans under 8 days, and days for longer spans. `buckets` start from aligned buckets containing `from`, with empty buckets zero-filled; `previous` is the preceding period of equal length immediately before `from`; `recent` aggregates the latest 5 minutes. `cost`, `previous_cost`, and per-bucket `cost` represent estimated USD cost computed from Gemini API and Vertex AI published text pricing: non-cached input tokens × input price + cached tokens × cached price + (reasoning + reply) tokens × output price; tiered models choose tier per request based on input tokens; non-text models (images, audio, video, speech, embeddings) cost 0. `succeeded` includes `completed`, `tool_calls`, `limited`, and `blocked`; `rate_limited` is HTTP 429 failures; `duration` and `first_event` only aggregate successful requests, with ~0.5% relative error on percentiles. `groups` lists all values across `model`, `account`, `channel`, `protocol`, `state`, and HTTP `status`; `pairs` combines accounts and models; `series` takes top 8 by request count with remainder grouped into `other: true`. `options` lists dimension values appearing in range unaffected by filters. `latest_at` is completion timestamp of latest ledger record.
 
 `RuntimeConfig` fields. `response-only` indicates that the field is populated by the server and client-submitted values are not persisted:
 
@@ -1253,7 +1278,9 @@ On-demand hot replacement spawns a pending worker (a bootstrapping, unpromoted r
 
 Worker process crashes, worker replacement, and protocol Code 5 rebuild the account worker and retry once on the same account.
 
-The pending retry set for the model catalog maintains account IDs awaiting re-synchronization. Accounts are added during the initial full-account fan-out at startup or during single-account syncs following creation, login, or verification if any error occurs or if an empty catalog is returned; they are removed once a non-empty catalog is retrieved or when the account is deleted. After background sync for all accounts completes, a single 30-second ticker is started. Each tick fans out concurrently to the sorted list of pending accounts, re-verifying at task initiation that the ID remains in the pending set. Accounts producing errors or empty catalogs remain in the set; each non-empty success immediately updates the account cache and public catalog snapshot, emits `accounts` and `models` events, and triggers worker prewarming if in `RUNNING` state. At batch completion, an updated account and model snapshot is emitted if the `auth_required` set changed; on-demand single-account synchronizations immediately emit snapshots regardless of success or failure.
+The pending retry set for the model catalog maintains account IDs awaiting re-synchronization. Accounts are added during the initial full-account fan-out at startup or during single-account syncs following creation, login, verification, or enabling in the console if any error occurs or if an empty catalog is returned; they are removed once a non-empty catalog is retrieved or when the account is deleted. After background sync for all accounts completes, a single 30-second ticker is started. Each tick fans out concurrently to the sorted list of pending accounts, re-verifying at task initiation that the ID remains in the pending set. Accounts producing errors or empty catalogs remain in the set; each non-empty success immediately updates the account cache and public catalog snapshot, emits `accounts` and `models` events, and triggers worker prewarming if in `RUNNING` state. At batch completion, an updated account and model snapshot is emitted if the `auth_required` set changed; on-demand single-account synchronizations immediately emit snapshots regardless of success or failure.
+
+A 10-minute ticker in the same loop concurrently calls `GetAiStudioBenefitTier` for all enabled accounts in `ready` or `busy` states. Each account occupies a normal concurrency slot, sharing `PER_ACCOUNT_CONCURRENCY` with generation requests; accounts with full slots skip this round. When benefits change, `benefit_tier` is written back using the account's current catalog, invalidating model eligibility records for that account and publishing `accounts` and `models`.
 
 Model catalog projections:
 
@@ -1327,6 +1354,10 @@ The management catalog merges live models across all accounts, sorted by ID. The
 
 Primary request formats:
 
+The admin catalog merges upstream live models across all accounts following each account's `ListModels` upstream order: models appearing only in a later account catalog are placed after their preceding known model in that catalog, before the first known model if none precedes, or at the end if the catalog contains no known models; this ordering prioritizes standard models with available channels, followed by Interactions agent models with available channels (`interaction_route`, such as Deep Research), and finally models without available channels. The public catalog retains models supported by current public protocols and providable by enabled channels; when Build channels are enabled, it also includes Build-unique generative models with `channels` listing available channels, see [Build Channel](build.md). Models whose `AccessModes` are not satisfied by any enabled account are also listed without `channels`. Short-term cooldown and busy states are handled by request scheduling.
+
+Main request formats:
+
 | Endpoint | Required Fields | Primary Result |
 | --- | --- | --- |
 | `/v1/chat/completions` | `model` | Chat completion or streaming delta chunks |
@@ -1358,10 +1389,10 @@ The four generation entry points share a canonical request format, with input pa
 | tool calls | `tool_calls` array | `function_call`, `custom_tool_call` items | `tool_use`, `server_tool_use` blocks | `functionCall` parts |
 | tool results | `tool` role message | `function_call_output`, `custom_tool_call_output` items | `tool_result`, `web_search_tool_result` blocks | `functionResponse` parts |
 | YouTube | `video_url` / `input_video` | `input_video` | URL source | `fileData.fileUri` |
-| function call | Assistant `tool_calls` | `function_call` item | `tool_use` block | `functionCall` Part |
-| function result | Tool message | `function_call_output` item | `tool_result` block | `functionResponse` Part |
+| function call | assistant `tool_calls` or legacy `function_call` | `function_call` item | `tool_use` block | `functionCall` Part |
+| function result | tool message | `function_call_output` item | `tool_result` block | `functionResponse` Part |
 | structured output | `response_format` | `text.format` | — | `responseMimeType` and response schema |
-| thinking | `reasoning_effort` or `reasoning.effort` | `reasoning.effort` | `thinking.budget_tokens`, `output_config.effort` | `thinkingConfig` |
+| thinking | `reasoning_effort` or `reasoning.effort` | `reasoning.effort`; `reasoning.summary` determines whether to output reasoning summary | `thinking.budget_tokens`, `output_config.effort`; `thinking.type` determines whether to output thoughts | `thinkingConfig`; `includeThoughts` determines whether to output thoughts |
 
 Gemini attachments and image inputs for `predictLongRunning` accept `inlineData` / `inline_data`, `fileData` / `file_data`, `mimeType` / `mime_type`, and `fileUri` / `file_uri`. If duplicate aliases are supplied simultaneously, outer containers prioritize camelCase objects, and inner fields prioritize non-empty camelCase values.
 
@@ -1377,9 +1408,18 @@ Generation parameter mapping:
 | Anthropic max tokens | `max_tokens` maps to generation config field 4 |
 | Gemini max tokens | `maxOutputTokens` maps to generation config field 4 |
 | temperature / topP / topK / seed | Map to generation config fields 5 / 6 / 7 / 19 |
-| stop sequences | Maps to generation config field 8 |
-| safety settings | Gemini `safetySettings` maps to root field 3; image routes omit defaults |
-| structured outputs | `response_format`, `output_format`, or `responseSchema` encoded as JSON Schema |
+| stop sequence | Maps to generation config field 2 |
+| stop sequence hit | Matched locally, returning the sequence actually hit |
+| structured output | MIME type maps to field 8, Schema maps to field 9 |
+| OpenAI `parallel_tool_calls` | When `false`, at most one function call per round |
+| Responses `truncation` | `auto` removes earliest complete conversation turns |
+| Anthropic `thinking` | `enabled` writes `budget_tokens`; `adaptive` uses model default thinking |
+| Anthropic thinking type | `disabled` uses model minimum thinking configuration |
+
+- OpenAI Chat and Responses allow parallel tool calls when `parallel_tool_calls` is omitted or `true`; Responses also records this in response metadata
+- Responses `truncation:auto` removes earliest complete conversation turns per upstream authoritative token count, preserving the newest turns and tool call/response pairs; omitted or `disabled` preserves full input
+- Anthropic omitting `thinking` or with `thinking.type:"disabled"` suppresses thinking text in output, maintaining continuation signature via `redacted_thinking`; unknown type returns `400 invalid_request_error`
+- Specific protocol parameters for Chat, Responses, and Gemini are detailed in their respective sections
 
 ### OpenAI Chat Completions
 
@@ -1391,15 +1431,31 @@ Generation parameter mapping:
 | `messages` | Array of message objects |
 | `stream` | boolean |
 | `stream_options.include_usage` | Emit usage-only chunk after finish chunk |
-| `tools` | Array of functions, custom tools, or Google server tools |
-| `tool_choice` | Omitted / `auto` / `none` / `required`, named function, or `allowed_tools` |
-| `web_search_options` | Search configuration parameters |
-| `response_format` | `text`, `json_object`, or `json_schema` |
-| `reasoning_effort` | `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max` |
-| `temperature`, `top_p`, `seed` | Sampling parameters |
-| `max_completion_tokens`, `max_tokens` | Output token limits |
+| `tools` | Array of function, custom, or Google server tools |
+| `tool_choice` | Omitted / `auto` / `none` / `required`, named function or custom object, `allowed_tools` |
+| `web_search_options` | Object enabling Google Search |
+| `temperature`, `top_p` | Optional sampling parameters |
+| `max_tokens`, `max_completion_tokens` | Latter takes precedence |
+| `frequency_penalty`, `presence_penalty` | Accepted, do not affect generation |
+| `n` | 1–128 |
+| `parallel_tool_calls` | Omitted / `true` / `false` |
+| `logprobs`, `top_logprobs`, `logit_bias` | Accepted, do not affect generation |
 | `stop` | string or string array |
-| `media_resolution` | `low`, `medium`, `high` input resolution |
+| `response_format` | `{type:"text"}`, `{type:"json_object"}`, or `{type:"json_schema",json_schema:{schema}}` |
+| `reasoning_effort` | thinking effort |
+| `reasoning.effort` | nested thinking effort |
+| `seed` | 64-bit integer |
+| `functions`, `function_call` | Legacy function declaration and selection |
+
+- `allowed_tools` mode and tool list map to tool mode and permitted function names; the request only sends listed functions and Google tools corresponding to managed tools
+- `web_search_options` search depth and approximate location are written into search instructions
+- When `n` > 1, choices are generated independently and concurrently; with `seed`, choice $i$ uses `seed+i`; `choices` are ordered by `index` with respective `finish_reason`, and `usage` is aggregated across choices; if any choice fails, the entire request returns that error; streaming begins output after first choice is ready, with startup errors on other choices emitted in-stream
+- `frequency_penalty`, `presence_penalty`, `logprobs`, `top_logprobs`, and `logit_bias` accept arbitrary values; non-streaming `choices[].logprobs` is `null`
+- Empty strings in `stop` are filtered out
+- `reasoning.effort` and `reasoning_effort` map to the same setting, with `reasoning.effort` taking precedence if both are present
+- `functions` are sent as function tools, and `function_call` values (`none`, `auto`, `{name}`) are handled as `tool_choice`, with at most one call per round; requests with `functions` return assistant `function_call:{name,arguments}`, `finish_reason` is `function_call`, and streaming uses `delta.function_call`. Assistant `function_call` and `function` role messages in conversation history are sent as function calls and results
+
+Message fields are `role`, `content`, optional `name`, `tool_call_id`, `tool_calls`, `function_call`. Assistant tool call:
 
 ```json
 {
@@ -1472,11 +1528,9 @@ Chat SSE sequence:
 | `input` | string or array of input items |
 | `instructions` | Top-level system instructions |
 | `stream` | boolean |
-| `tools`, `tool_choice` | function, custom, namespace, local_shell, shell, apply_patch, and Google tools; choice supports auto/none/required, named tools, and managed types |
+| `tools`, `tool_choice` | function, custom, namespace (may contain custom), local_shell/shell/apply_patch, and Google tools; choice supports auto/none/required, named function/custom, allowed_tools, apply_patch/shell, and managed tool types |
 | `temperature`, `top_p`, `max_output_tokens` | Sampling parameters |
-| `truncation` | Context truncation policy |
-| `media_resolution` | Media resolution specification |
-| `reasoning` | `{"effort":"..."}` |
+| `reasoning` | `{"effort":"...","summary":"..."}`, `generate_summary` synonymous with `summary` |
 | `text` | `{"format":{"type":"text|json_object|json_schema","schema":...}}` |
 | `previous_response_id` | Previously saved response ID within current process |
 | `parallel_tool_calls` | Omitted / `true` / `false` |
@@ -1508,11 +1562,16 @@ Additional input item mappings:
 | --- | --- |
 | system/developer message | Text enters system instructions, images and files move to first user turn |
 | `custom_tool_call` | Function call with arguments `{"input": <INPUT>}` |
-| `local_shell_call` | `local_shell` call with action omitting `type` |
+| `local_shell_call` | `local_shell` call with action argument omitting `type` |
 | `shell_call` | `shell` call with action argument |
-| `apply_patch_call` | `apply_patch` call with patch argument |
-| `function_call_output` | Tool result with matching call ID |
-| `custom_tool_call_output` | Output string or object |
+| `apply_patch_call` | `apply_patch` call with operation argument |
+| `custom_tool_call_output`, `local_shell_call_output`, `shell_call_output`, `apply_patch_call_output` | Tool results linked by `call_id` |
+| `web_search_call`, `code_interpreter_call`, `file_search_call`, `computer_call`, `mcp_call`, `mcp_list_tools`, `mcp_approval_request`, `tool_search_call`, `tool_search_output` | Assistant text summary `<type> <JSON>` |
+| `image_generation_call` | Assistant text summary and `result` image |
+| `computer_call_output`, `mcp_approval_response` | User text summary with screenshot as image |
+| `item_reference` | Input or output item of the same ID saved in current process |
+| `compaction` | Summary user turn and verbatim preserved items, see Context Compaction below |
+| `compaction_trigger` | Triggers context compaction; must be the final input item, other positions return HTTP 400 |
 
 | tool type | Fields |
 | --- | --- |
@@ -1558,11 +1617,26 @@ Output item union types:
 
 | type | Fields |
 | --- | --- |
-| `reasoning` | `id`, `status`, `summary: [{type: "summary_text", text}]`, optional `encrypted_content` |
-| `message` | `id`, `status`, `role: "assistant"`, `content: [{type: "output_text", text, annotations}]` |
+| `reasoning` | `id`, `status`, `summary:[{type:"summary_text",text}]`, optional `encrypted_content`; summary text only returned when requested `reasoning.summary` (or `generate_summary`) is `auto`, `concise`, or `detailed` |
+| `message` | `id`, `status`, `role:"assistant"`, `content:[{type:"output_text",text,annotations}]` |
 | `function_call` | `id`, `status`, `call_id`, `name`, `arguments` |
-| `custom_tool_call` | `id`, `status`, `call_id`, `name`, `input` |
-| `local_shell_call`, `shell_call`, `apply_patch_call` | Tool call output objects |
+| `custom_tool_call` | `id`, `status`, `call_id`, `name`, `input`, optional `namespace` |
+| `local_shell_call` | `id`, `status`, `call_id`, `action:{type:"exec",command,env,...}` |
+| `shell_call` | `id`, `status`, `call_id`, `action:{commands,timeout_ms,max_output_length}`, `environment:null` |
+| `apply_patch_call` | `id`, `status`, `call_id`, `operation:{type,path,diff}` |
+| `code_interpreter_call` | `id`, `status`, `code`, `container_id:"aistudio"`, `outputs:[{type:"logs",logs}]` |
+| `image_generation_call` | `id`, `status`, Base64 `result` |
+| `web_search_call` | `id`, `status`, `action` |
+
+Context Compaction:
+
+- `POST /v1/responses/compact` is a stateless endpoint accepting `model` (required), `input`, `instructions`, `tools`, and `previous_response_id`; input conversion, `item_reference`, media, and continuation chains match `POST /v1/responses`.
+- Compaction first identifies the verbatim preserved portion within the continuation chain and input items: scanning backward from newest items, accumulating complete model-side item groups (reasoning, assistant messages, and calls with subsequent tool outputs) or user messages, preserving ~20,000 tokens verbatim; newest group is always preserved; cut never lands on tool outputs. Tokens are estimated at 4 bytes per token; messages count text and 765 per image, other items exclude `encrypted_content`.
+- Items before the verbatim preserved portion are summarized non-streamingly by the requested model: system instructions and tools match the request, `tool_choice` is `none`, and a user turn is appended with OMP's structured handoff summary prompt (Goal, Constraints & Preferences, Progress, Key Decisions, Next Steps, Critical Context, Additional Notes). When input already contains a compaction item, only verbatim items and subsequent new items are summarized, wrapping previous summary in `<previous-summary>` as the first user turn with incremental summary prompt at the end. Upstream is not called if no items require summarization; errors return if summary finish reason is not `stop`.
+- Compaction items take the shape `{"id":"cmp_...","type":"compaction","encrypted_content":"<plaintext JSON>"}`, with `encrypted_content` containing `{"v":1,"summary":"<summary>","items":[<verbatim preserved items>]}`, preserving original items with reasoning `encrypted_content` thinking signatures and call IDs.
+- The compact response is `{"id":"resp_...","object":"response.compaction","created_at":0,"output":[...],"usage":{...}}`. `output` begins with user messages preceding the verbatim preserved portion: accumulating newest-to-oldest up to 64,000 tokens; the budget-crossing message retains head and tail text with `…N tokens truncated…` inserted, skipping context messages starting with `<environment_context>`, `<user_instructions>`, `<additional_context>`, `<skills`, `<token_budget>`, `<model_switch>`; ending with the compaction item; `usage` reports summary generation tokens.
+- Input compaction items expand only the final item: prior items are retained, user messages identical to verbatim user messages are deduplicated, and earlier compaction items are discarded; followed sequentially by summary user turn (`Prior model work/tool state available.\nMUST build on prior work; NEVER duplicate prior work.\n\n<summary>\n...\n</summary>`), verbatim items, and items following the compaction item; returns HTTP 400 if `encrypted_content` was not produced by this service.
+- When `POST /v1/responses` ends with `compaction_trigger`, it compresses history following compact behavior, returning an `output` with a single compaction item and empty `output_text`; streaming emits `response.created`, `response.in_progress`, `response.output_item.added` (`encrypted_content:""`), `response.output_item.done`, and `response.completed`, including usage from upstream summarization; saved responses decouple from preceding nodes, setting continuation context to expanded compact items.
 
 `web_search_call.action` is `{"type":"search","query":"...","sources":[{"type":"url","url":"..."}]}`, where queries are deduplicated by their first appearance and sources are deduplicated by URI. `code_interpreter_call.status` is `incomplete` when there are no results, `completed` on success, and `failed` for non-`OUTCOME_OK` outcomes; stdout is written to `outputs[].logs`, and failure text is prefixed with `stderr:`. Streaming `output_item.added` uses `in_progress`, and the corresponding `output_item.done` uses the final status.
 
@@ -1589,6 +1663,16 @@ Every Responses SSE payload contains `type` and a monotonically increasing `sequ
 | `response.output_text.delta` | Main output text delta |
 | `response.function_call_arguments.delta` | Function arguments streaming delta |
 | `response.completed` | Final completed response object |
+
+上下文压缩：
+
+- `POST /v1/responses/compact` 为无状态端点，接受 `model`（必需）、`input`、`instructions`、`tools` 与 `previous_response_id`；`input` 的转换、`item_reference`、媒体与续接链同 `POST /v1/responses`
+- 压缩先在续接链与输入的条目中确定原样保留部分：从最新条目向前，以完整的模型侧条目组（reasoning、assistant 消息与各类调用，连同其后的工具输出）或 user 消息为单位累计，约 20000 token 内的部分原样保留，最新一组总是保留，切点不落在工具输出上；token 按每 4 字节 1 个估算，消息只计文本、每张图片计 765，其他条目不计 `encrypted_content`
+- 原样保留部分之前的条目由请求的模型非流式生成摘要：系统指令与工具同请求，`tool_choice` 为 `none`，末尾追加一个 user 轮，为 OMP 的结构化交接摘要提示词（Goal、Constraints & Preferences、Progress、Key Decisions、Next Steps、Critical Context、Additional Notes）；输入已含 compaction 项时，只摘要其原样条目与之后的新条目，旧摘要以 `<previous-summary>` 包裹作为首个 user 轮，末尾改用增量摘要提示词；没有需要摘要的条目时不调用上游；摘要的结束原因不是 `stop` 时返回错误
+- compaction 项为 `{"id":"cmp_...","type":"compaction","encrypted_content":"<明文 JSON>"}`，`encrypted_content` 为 `{"v":1,"summary":"<摘要>","items":[<原样保留的条目>]}`，条目保持输入原文，含 reasoning 的 `encrypted_content` 思考签名与调用 ID
+- compact 响应为 `{"id":"resp_...","object":"response.compaction","created_at":0,"output":[...],"usage":{...}}`；`output` 先是原样保留部分之前的 user 消息：从最新向前累计到 64000 token，跨预算的一条只保留首尾文本并在中间写入 `…N tokens truncated…`，跳过以 `<environment_context>`、`<user_instructions>`、`<additional_context>`、`<skills`、`<token_budget>`、`<model_switch>` 开头的上下文消息；最后是 compaction 项；`usage` 为生成摘要的用量
+- 输入中的 compaction 项只展开最后一个：其前的条目保留，与原样条目中 user 消息文本相同的 user 消息各去掉一条，更早的 compaction 项丢弃；之后依次接摘要 user 轮（`Prior model work/tool state available.`、`MUST build on prior work; NEVER duplicate prior work.` 与 `<summary>` 包裹的摘要）、原样条目与 compaction 项之后的条目；`encrypted_content` 不是本服务生成的 JSON 时返回 400
+- `POST /v1/responses` 以 `compaction_trigger` 结尾时按 compact 的方式压缩，响应 `output` 只有一个 compaction 项，`output_text` 为空；流式事件依次为 `response.created`、`response.in_progress`、`response.output_item.added`（`encrypted_content:""`）、`response.output_item.done` 与 `response.completed`，调用上游生成摘要时带 usage；保存的响应不接续前序节点，续接上下文为 compact 输出的条目展开后的内容
 
 ### Anthropic Messages
 
@@ -1753,11 +1837,13 @@ Parts lacking data fields and `thoughtSignature` are omitted; parts with multipl
 | thinking config | `thinkingConfig.thinkingLevel` or `thinkingBudget` |
 | modalities | `responseModalities` |
 | image | `imageConfig:{aspectRatio,imageSize}` |
-| thinking | `thinkingConfig:{thinkingBudget,thinkingLevel}` |
+| thinking | `thinkingConfig:{thinkingBudget,thinkingLevel,includeThoughts}` |
 | transcription | `transcriptionConfig:{languageCodes,customVocabulary,wordTimestamps,speakerLabels,smartTranscription}` |
 | speech | `speechConfig` |
 
-`candidateCount` accepts 0 to 8; values > 1 generate separate candidates concurrently, candidate 0 keeping the original request ID and candidate i using `<id>-<i>`. `:streamGenerateContent` begins output once the first candidate is ready, aggregating total usage across all candidates.
+When `thinkingConfig.includeThoughts` is `true`, thought Parts with `thought:true` are output; when omitted or `false`, thinking text is omitted; thinking signatures are returned with Parts as usual, and `thoughtsTokenCount` is tracked normally.
+
+`candidateCount` accepts omitted, `0`, or `1` to `8`; when > 1, each candidate generates separately; candidate 0 keeps the request ID, and candidate $i$ uses `<id>-<i>`, with `seed` using `seed+i`; if any candidate fails, the request returns that error; `:streamGenerateContent` begins output once the first candidate is ready, emitting startup errors for remaining candidates in-stream; usage is aggregated across candidates. `frequencyPenalty`, `presencePenalty`, `responseLogprobs`, and `logprobs` accept arbitrary values without being sent upstream, and responses do not contain logprobs.
 
 `responseMimeType` and `responseJsonSchema` map structured output constraints.
 
@@ -1825,7 +1911,9 @@ Non-streaming generation response:
 }
 ```
 
-`finishMessage` conveys upstream termination explanations (e.g. content filtering reasons). When `candidateCount` > 1, candidates are indexed 0 to n-1 with individual finish reasons. Streaming blocks emit candidates as they arrive, with final blocks listing all finish reasons and aggregated usageMetadata.
+`finishMessage` conveys upstream termination explanations (e.g. content filtering reasons); when no upstream explanation is given, fixed descriptions are provided for `provider_*` and missing thought signatures. When a candidate has no output Part, `content` is omitted. When `candidateCount` > 1, candidates are ordered by `index` 0 to n-1 with individual `finishReason`. `:streamGenerateContent` emits candidate delta chunks in arrival order, each containing one candidate with `index`; the final chunk lists all candidates, each with `content`, `finishReason`, and that candidate's `groundingMetadata`, `citationMetadata`, alongside aggregated `usageMetadata`. Non-streaming candidates also return `groundingMetadata` and `citationMetadata` for upstream citations.
+
+Output Parts use the same `text`, `thought`, `thoughtSignature`, `inlineData`, `fileData`, `functionCall`, `executableCode`, `codeExecutionResult` as input. Transcription text can include:
 
 ```json
 {
@@ -1844,7 +1932,7 @@ Non-streaming generation response:
 
 Non-streaming results merge adjacent, homogeneous body or thought fragments that have no signature boundaries. Parts with tools, media, and transcription metadata remain separate; standalone signatures attach to the preceding unsigned Part, or fall back to `{"text":"","thoughtSignature":"..."}` when no attachable content exists.
 
-`:streamGenerateContent` uses SSE. Each semantic event sends a partial `GenerateContentResponse` containing `responseId`, `modelVersion`, and a candidate Part, grounding, or citation; the final frame contains the candidate `finishReason`, optional `finishMessage`, and `usageMetadata`. Error frames after response headers are `data: {"error":{"code","message","status"}}`.
+`:streamGenerateContent` uses SSE. Each content event sends a partial `GenerateContentResponse` containing `responseId`, `modelVersion`, and a candidate Part with `content`; each candidate in the final frame includes `content`, `finishReason`, optional `finishMessage`, `groundingMetadata`, and `citationMetadata`, accompanied by `usageMetadata`. Error frames after response headers are `data: {"error":{"code","message","status"}}`.
 
 ### Files, Transcribe, and Media
 
@@ -1903,13 +1991,13 @@ Unknown files return 404 `file_not_found`, oversized files return 413 `file_too_
 
 | Field | Values and Handling |
 | --- | --- |
-| `model` | Defaults to first generatable `image_route` model |
-| `prompt` | Required text prompt |
-| `n` | Number of images (default 1, range 1-10) |
+| `model` | Omitted defaults to first `image_route` model supporting `generateContent` in public catalog order |
+| `prompt` | Required |
+| `n` | Default `1`, range 1–10 |
 | `size` | `auto` or `WIDTHxHEIGHT` |
 | `quality` | `auto`, `low/standard=1K`, `medium/hd=2K`, `high/xhigh/max=4K` |
 | `response_format` | `b64_json` returns Base64; other returns data URL |
-| `stream` | Streaming support |
+| `stream` | boolean |
 
 `POST /v1/audio/speech`:
 
@@ -1929,11 +2017,15 @@ OpenAI `POST /v1/videos` accepts JSON or multipart:
 
 | Field | Values and Handling |
 | --- | --- |
-| `model` | Defaults to first model supporting `predictLongRunning` |
-| `prompt` | Required generation prompt |
-| `seconds` | Video duration in seconds (default 4; snaps to nearest option) |
-| `size` | Aspect ratio and resolution string (e.g. `1280x720`, `1920x1080`) |
-| `input_reference` | Image file ID, data URL, or multipart upload for image-to-video |
+| `model` | Omitted defaults to first model supporting `predictLongRunning` in public catalog order |
+| `prompt` | Required |
+| `seconds` | Integer string; default 4; snaps to nearest option per model |
+| `size` | `1280x720`, `720x1280`, `1792x1024`, `1920x1080`, `1024x1792`, `1080x1920` |
+| `input_reference` | File ID or data URL in JSON; file in multipart |
+
+- When the `input_reference` file part's Content-Type is missing, invalid, or `application/octet-stream`, image type is detected from content
+
+OpenAI video object:
 
 ```json
 {
@@ -2054,7 +2146,7 @@ Live input modalities are non-empty subsets of text/audio/image. Standard Live m
 
 Corresponding fields are used according to `type`: `session_opened{model}`, `setup_complete`, `text{text}`, `media{mime_type,data}`, `input_transcription/output_transcription/interim_input_transcription{transcription}`, `tool_call{tool_call}`, `tool_call_cancellation{tool_call_ids}`, `interrupted`, `generation_complete`, `turn_complete`, `session_resumption{session_token,resumable}`, `usage{raw}`, `go_away{raw}`, `provider{raw}`, `closed`, and `error{error,code,retryable,raw?}`.
 
-If the initial frame or subsequent client fields are invalid, `{type:"error",code:"invalid_request",error:"..."}` is sent. Upstream errors retain their original `error` content. The client single-frame size limit is 8 MiB; exceeding this limit sends WebSocket close code 1009. The timeout for each write operation is 10 seconds; session termination allows up to 5 seconds each to wait for the read and send goroutines to exit.
+If the initial frame or subsequent client fields are invalid, `{type:"error",code:"invalid_request",error:"..."}` is sent. When benefits are insufficient, candidate accounts are all in cooldown, or generation service is stopped, `code` matches the OpenAI column of the HTTP errors table. Upstream errors retain their original `error` content. The client single-frame size limit is 8 MiB; exceeding this limit sends WebSocket close code 1009. The timeout for each write operation is 10 seconds; session termination allows up to 5 seconds each to wait for the read and send goroutines to exit.
 
 Streaming endpoints uniformly use `text/event-stream`, with each SSE frame terminated by an empty line:
 
@@ -2072,8 +2164,8 @@ Public adaptation rules:
 | Canonical Event | OpenAI Chat | Responses | Anthropic | Gemini |
 | --- | --- | --- | --- | --- |
 | text | message/content delta | output_text | text block | candidate text Part |
-| reasoning | `reasoning_content` | reasoning summary | thinking block | thought Part |
-| function | `tool_calls` | function_call item | tool_use block | functionCall Part |
+| reasoning | `reasoning_content` | reasoning summary，请求设置 `reasoning.summary` 时输出 | thinking block，请求启用 `thinking` 时输出 | thought Part，`includeThoughts` 为 true 时输出 |
+| function | `tool_calls`，旧式 `functions` 请求为 `function_call` | function_call item | tool_use block | functionCall Part |
 | function result | tool message | function_call_output | tool_result | functionResponse Part |
 | code execution | readable Markdown | code_interpreter item | text block | executableCode/result Part |
 | grounding/citation | annotations | output annotations | text sources | groundingMetadata |
@@ -2096,6 +2188,7 @@ Error objects and status semantics:
 | --- | ---: | --- | --- | --- |
 | Invalid parameters, schema, or tool choice | 400 | `invalid_request` | `invalid_request_error` | `INVALID_ARGUMENT` |
 | No eligible accounts | 400 | `account_required` | `invalid_request_error` | `INVALID_ARGUMENT` |
+| Enabled accounts do not satisfy model AccessModes | 403 | `account_required` | `permission_error` | `PERMISSION_DENIED` |
 | All accounts supporting the request are unschedulable | 503 | `account_unavailable` | `api_error` | `UNAVAILABLE` |
 | Invalid local API key | 401 | `invalid_api_key` | `authentication_error` | `UNAUTHENTICATED` |
 | Model or method not found | 404 | `model_not_found` | `not_found_error` | `NOT_FOUND` |
@@ -2111,9 +2204,10 @@ Error objects and status semantics:
 | Request deadline exceeded | 504 | `upstream_error` | `api_error` | `DEADLINE_EXCEEDED` |
 | Transport, Content-Type, decoding, or missing terminal state | 502 | `upstream_error` | `api_error` | `INTERNAL` |
 
-- "no eligible account": no account matches the requested method, capabilities, and benefit tiers
-- "accounts supporting request cannot be scheduled": matching accounts require re-login, are unavailable, or disabled
-- Generation service `STOPPED`: generation and token counting endpoints return `service_stopped`
+- "no eligible account": candidates exhausted and no account matches the requested method and capabilities
+- When benefits are insufficient, error messages name the required benefits: `1` for paid API key, `3` for Google AI Pro or Ultra subscription, `4` for Google AI Ultra subscription
+- "accounts supporting request cannot be scheduled": matching accounts all require re-login, are unavailable, or disabled; the error message lists each account, its state, and reason
+- When generation service is `STOPPED`, generation and token counting endpoints return `service_stopped`
 
 Upstream HTTP 404 maps to 502 Bad Gateway; public 404 indicates missing local models or resources. Client disconnects record 499 in access logs.
 

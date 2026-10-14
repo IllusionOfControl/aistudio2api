@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -218,6 +219,7 @@ type AccountSelection struct {
 	PlaygroundOnly    bool
 	Channel           Channel
 	PreferredChannel  Channel
+	anyTier           bool
 }
 
 const preferredBootstrapModelID = "gemini-flash-latest"
@@ -636,7 +638,7 @@ func accountSupportsSelection(account *Account, selection AccountSelection) bool
 		if !modelMatchesID(model, modelID) {
 			continue
 		}
-		if !modelAllowedByTier(model, account.BenefitTier) {
+		if !selection.anyTier && !modelAllowedByTier(model, account.BenefitTier) {
 			return false
 		}
 		if strings.TrimSpace(selection.Method) != "" && !hasMethod(model, selection.Method) {
@@ -647,30 +649,48 @@ func accountSupportsSelection(account *Account, selection AccountSelection) bool
 	return false
 }
 
-// CatalogModels returns the complete catalog, with each model annotated with channels that enabled accounts can invoke.
+// CatalogModels returns the complete catalog, with each model annotated with channels that enabled accounts can invoke, ordered by callableFirst.
 func (p *AccountPool) CatalogModels(models []Model) []Model {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	catalog := make([]Model, len(models))
 	for index, model := range models {
-		model.Channels = p.modelChannelsLocked(model)
+		model.Channels = p.modelChannelsLocked(model, false)
 		catalog[index] = model
 	}
-	return catalog
+	return callableFirst(catalog)
 }
 
-// EligibleModels returns catalog entries where at least one enabled account has model eligibility.
-func (p *AccountPool) EligibleModels(models []Model) []Model {
+// PublicModels returns catalog entries that enabled channels can provide. Models that cannot be called solely due to insufficient account benefits are also listed with empty channels, ordered by callableFirst.
+func (p *AccountPool) PublicModels(models []Model) []Model {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	eligible := make([]Model, 0, len(models))
+	public := make([]Model, 0, len(models))
 	for _, model := range models {
-		if channels := p.modelChannelsLocked(model); len(channels) > 0 {
-			model.Channels = channels
-			eligible = append(eligible, model)
+		model.Channels = p.modelChannelsLocked(model, false)
+		if len(model.Channels) == 0 && len(p.modelChannelsLocked(model, true)) == 0 {
+			continue
+		}
+		public = append(public, model)
+	}
+	return callableFirst(public)
+}
+
+// callableFirst preserves the original order, placing standard models with channels first, followed by Interactions agent models with channels, and finally restricted models without channels.
+func callableFirst(models []Model) []Model {
+	ordered := make([]Model, 0, len(models))
+	var agents, restricted []Model
+	for _, model := range models {
+		switch {
+		case len(model.Channels) == 0:
+			restricted = append(restricted, model)
+		case model.Capabilities["interaction_route"]:
+			agents = append(agents, model)
+		default:
+			ordered = append(ordered, model)
 		}
 	}
-	return eligible
+	return slices.Concat(ordered, agents, restricted)
 }
 
 // CanonicalModelID converts model aliases from the live catalog to canonical model IDs accepted upstream.
@@ -1252,7 +1272,41 @@ func (p *AccountPool) validateSelectionLocked(selection AccountSelection) error 
 	if selection.Capability != "" && !p.hasModelCapabilityLocked(modelID, selection.Capability) {
 		return fmt.Errorf("%w: model %s does not support %s", ErrModelNotFound, modelID, selection.Capability)
 	}
-	return nil
+	return p.modelAccessErrorLocked(selection)
+}
+
+// modelAccessErrorLocked returns an error if model cannot be called solely due to insufficient enabled account benefits
+func (p *AccountPool) modelAccessErrorLocked(selection AccountSelection) error {
+	if p.enabledAccountSupportsLocked(selection) {
+		return nil
+	}
+	selection.anyTier = true
+	if !p.enabledAccountSupportsLocked(selection) {
+		return nil
+	}
+	modelID := strings.TrimPrefix(strings.TrimSpace(selection.ModelID), "models/")
+	var modes []int64
+	for _, account := range p.accounts {
+		if account == nil {
+			continue
+		}
+		for _, model := range account.Models {
+			if modelMatchesID(model, modelID) {
+				modes = unionInt64(modes, model.AccessModes)
+			}
+		}
+	}
+	return &ModelAccessError{Model: modelID, AccessModes: modes}
+}
+
+// enabledAccountSupportsLocked returns whether any channel on any enabled account supports the selection
+func (p *AccountPool) enabledAccountSupportsLocked(selection AccountSelection) bool {
+	for _, account := range p.accounts {
+		if account != nil && account.Config.Enabled && p.accountSupportsAnyChannelLocked(account, selection) {
+			return true
+		}
+	}
+	return false
 }
 
 // AcquireResource retrieves the fixed account that created the resource
@@ -2305,6 +2359,9 @@ func (p *AccountPool) classifyCandidatesLocked(
 		}
 		if selection.Method != "" && !p.hasModelMethodLocked(modelID, selection.Method) {
 			return AccountCandidateGroups{}, fmt.Errorf("%w: model %s does not support %s", ErrModelNotFound, modelID, selection.Method)
+		}
+		if err := p.modelAccessErrorLocked(selection); err != nil {
+			return AccountCandidateGroups{}, err
 		}
 	}
 	indices, err := p.selectionIndicesLocked(selection)

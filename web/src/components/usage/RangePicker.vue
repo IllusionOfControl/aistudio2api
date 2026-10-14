@@ -39,7 +39,7 @@ const beforeRetention = computed(
   () => new Date(customFrom.value).getTime() < now.value.getTime() - retention,
 )
 
-// prepare 打开浮层时用当前范围填充自定义输入框
+// prepare populates custom inputs with current range when opening popover
 function prepare(value: boolean): void {
   open.value = value
   if (!value) return
@@ -52,13 +52,13 @@ function prepare(value: boolean): void {
   customTo.value = localInput(range.to)
 }
 
-// choose 应用快捷范围并关闭浮层
+// choose applies preset range and closes popover
 function choose(range: RangePreset): void {
   emit('apply', range, '', '')
   open.value = false
 }
 
-// applyCustom 应用校验通过的自定义范围
+// applyCustom applies validated custom range
 function applyCustom(): void {
   if (customError.value !== '') return
   emit('apply', 'custom', customFrom.value, customTo.value)
@@ -74,9 +74,11 @@ function applyCustom(): void {
     >
       <UiIcon name="calendar" :size="14" class="text-gray-400" />
       <span class="font-medium whitespace-nowrap">{{ t(`usage.range.${range}`) }}</span>
-      <span class="hidden truncate text-xs text-gray-500 tabular-nums sm:inline">{{
-        summary
-      }}</span>
+      <span
+        v-tooltip.overflow="summary"
+        class="hidden truncate text-xs text-gray-500 tabular-nums sm:inline"
+        >{{ summary }}</span
+      >
       <UiIcon name="chevronDown" :size="12" class="text-gray-500" />
     </PopoverTrigger>
     <PopoverPortal>

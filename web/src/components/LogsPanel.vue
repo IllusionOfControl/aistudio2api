@@ -5,6 +5,7 @@ import type { AdminLog } from '@/types'
 import UiIcon from './UiIcon.vue'
 import UiSelect from './UiSelect.vue'
 import RequestLogCard from './RequestLogCard.vue'
+import StageLogCard from './StageLogCard.vue'
 import { groupLogs } from '@/logs'
 
 const props = defineProps<{
@@ -51,18 +52,22 @@ function matchLog(entry: AdminLog, query: string): boolean {
 }
 
 const rows = computed(() => groupLogs(props.logs))
+// filteredLogs filters log rows by level, source, and search query; displays stage cards if any step matches
 const filteredLogs = computed(() => {
   const query = search.value.trim().toLowerCase()
-  return rows.value.filter(
-    ({ entry, events }) =>
-      (level.value === 'ALL' || entry.level.toUpperCase() === level.value) &&
+  return rows.value.filter(({ entry, events, stage }) => {
+    const checked = stage ? events : [entry]
+    return (
+      (level.value === 'ALL' ||
+        checked.some((event) => event.level.toUpperCase() === level.value)) &&
       (source.value === 'ALL' || events.some((event) => event.source === source.value)) &&
-      (query === '' || matchLog(entry, query)),
-  )
+      (query === '' || checked.some((event) => matchLog(event, query)))
+    )
+  })
 })
 
 const displayLimit = ref(200)
-// pinnedKey 自动滚动关闭时固定为窗口首行的日志行，新日志只追加在末尾
+// pinnedKey pins the top visible log row when autoscroll is off, so new logs only append at the bottom
 const pinnedKey = ref<string>()
 const firstVisible = computed(() => {
   const list = filteredLogs.value
@@ -77,7 +82,7 @@ const hasMore = computed(() => firstVisible.value > 0)
 const hiddenCount = computed(() => firstVisible.value)
 const visibleLogs = computed(() => filteredLogs.value.slice(firstVisible.value))
 
-// pinWindow 自动滚动关闭时固定当前窗口首行，开启时恢复跟随末尾
+// pinWindow pins the current top visible row when autoscroll is disabled and resumes following bottom when enabled
 function pinWindow(): void {
   pinnedKey.value = autoScroll.value ? undefined : visibleLogs.value[0]?.key
 }
@@ -120,7 +125,7 @@ function scrollToBottom(): void {
   })
 }
 
-// timeFormat 格式化日志行的 24 小时制时间
+// timeFormat formats log row timestamps in 24-hour format
 const timeFormat = new Intl.DateTimeFormat('en-GB', {
   hour: '2-digit',
   minute: '2-digit',
@@ -301,6 +306,7 @@ watch(autoScroll, () => {
           }}</span>
           <div class="log-cell log-message">
             <RequestLogCard v-if="row.entry.request" :row="row" />
+            <StageLogCard v-else-if="row.stage" :row="row" />
             <span v-else>{{ row.entry.message }}</span>
           </div>
         </div>
