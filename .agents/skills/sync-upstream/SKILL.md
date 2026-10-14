@@ -62,8 +62,8 @@ git branch -f upstream-main upstream/main
 git checkout dev
 git pull --ff-only
 
-# 4. Create a dedicated sync branch (e.g., sync/upstream-YYYYMMDD or sync/upstream-vX.Y.Z)
-git checkout -b sync/upstream-$(date +%Y%m%d)
+# 4. Create a dedicated sync branch (sync/upstream-main-<ddmmyyyy>)
+git checkout -b sync/upstream-main-$(date +%d%m%Y)
 ```
 
 ### Step 2: Merge `upstream-main`
@@ -153,7 +153,7 @@ All tests and builds must succeed with 0 errors and 0 warnings.
 3. **Merge into `dev`**:
    ```bash
    git checkout dev
-   git merge --no-ff sync/upstream-YYYYMMDD -m "Merge branch 'sync/upstream-YYYYMMDD' into dev"
+   git merge --no-ff sync/upstream-main-<ddmmyyyy> -m "Merge branch 'sync/upstream-main-<ddmmyyyy>' into dev"
    ```
 4. **Log Merge in `docs/branches/_dev.md`**:
    - Add a new changelog entry with Date, Commit, Author, Source Branch, and bulleted summary.

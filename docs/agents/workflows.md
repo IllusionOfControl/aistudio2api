@@ -27,7 +27,7 @@ Because this repository maintains independent refactors (English codebase, read-
 3. **Create a Dedicated Sync Branch**:
    ```bash
    git checkout dev
-   git checkout -b sync/upstream-sync
+   git checkout -b sync/upstream-main-$(date +%d%m%Y)
    ```
 4. **Merge Upstream**:
    ```bash
@@ -44,7 +44,7 @@ Because this repository maintains independent refactors (English codebase, read-
    npm --prefix web run typecheck
    ```
 7. **Commit & Merge to `dev`**:
-   Once verified, merge `sync/upstream-sync` into `dev`.
+   Once verified, merge `sync/upstream-main-<ddmmyyyy>` into `dev`.
 
 ---
 
