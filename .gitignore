@@ -1,5 +1,6 @@
 # Build artifacts
 *.exe
+*.exe~
 *.dll
 *.so
 *.dylib
@@ -10,6 +11,7 @@
 .env
 /auth/
 /runtime/
+/data/
 *.log
 
 # Frontend artifacts

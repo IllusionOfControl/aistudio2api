@@ -1,8 +1,8 @@
 ---
 branch: sync/upstream-main
-last_commit: 38e80dd
-status: complete
-last_activity: 06-10-2026
+last_commit: 1e3f73e
+status: in_progress
+last_activity: 13-10-2026
 ---
 
 ## Task
@@ -150,3 +150,34 @@ This sync integrates all these changes, resolves 24 conflicted files, and transl
 2. **English-Only Code & Logs**: Identified and translated 668 lines of Chinese comments, log messages, CLI output, and error strings across all Go and TypeScript files into idiomatic English. Zero Chinese characters remain in source files outside of i18n dictionaries.
 3. **Frontend Build & Validation**: Validated Vue 3 codebase with `npm run typecheck` (0 errors), `npm run lint` (0 errors), `npm run format:check`, and rebuilt production bundle via `npm run build` embedded into binary.
 4. **Backend Verification**: Ran static analysis (`go vet ./...`, 0 issues) and full test suite (`go test ./...`, all packages passing). Verified binary compilation via `go build ./cmd/aistudio2api`.
+
+---
+
+### Update: Upstream Docker Support, BiDi Connection Reusability & v0.2.9 Synchronization (2026-10-13)
+
+**Task**: Synchronize `sync/upstream-main` with upstream commits up to `d14ba0b` (release v0.2.9 and subsequent BiDi fix), resolve all merge conflicts preserving read-only configuration and English-only code invariants, translate all newly introduced comments to English, verify backend and frontend, and prepare sync branch without merging into `dev` per user instructions.
+
+**Upstream Additions**:
+1. **WebDriver BiDi Connection Resilience (`internal/camoufoxnative/bidi.go`)**:
+   - Refactored `command` to serialize requests via `commandLock` channel with background exchange routines.
+   - When caller cancels context or times out, `command` returns immediately, while the background routine finishes consuming responses with the matching ID before releasing the lock, keeping the BiDi connection reusable for subsequent requests.
+2. **Build Quota Retry & Bidi Frame Termination (`internal/aistudio/client.go`, `internal/api/live.go`)**:
+   - Parsed retry delay following "retry in " directly from error messages when upstream RPC errors lack metadata (`messageRetryDelay`).
+   - Clean handling for WebSocket messages exceeding limits via `closeBidiTooBig`: sends 1009 close frame, drains incoming buffer, and cleanly closes connection.
+3. **Multi-Source API Key Matching (`internal/api/middleware.go`)**:
+   - Updated `checkAPIKeyMatches` to accept matching API keys across `X-Goog-API-Key`, `X-API-Key`, `Authorization: Bearer`, or query parameter `?key=`, eliminating 401 errors when downstream proxies forward credentials in alternative headers.
+4. **Thought Signature Normalization (`internal/api/gemini.go`)**:
+   - Standalone thought signatures are now carried by empty text parts (`{"text": "", "thoughtSignature": signature}`) instead of empty thought parts, avoiding empty thought drawers in clients.
+5. **Docker Deployment Support**:
+   - Multi-stage `Dockerfile`, `docker-compose.yml`, `.dockerignore`, and data volume mount pattern for containerized deployments.
+
+**Resolution & Adaptations**:
+1. **Conflict Resolution**:
+   - Resolved merge conflicts in `internal/camoufoxnative/bidi.go`, `internal/api/gemini.go`, `README.md`, `docs/development.md`, and `docs/protocol.md`.
+   - Synchronized Chinese documentation in `README_ch.md` with new Docker setup instructions and removed obsolete `README_en.md` in favor of primary English `README.md`.
+2. **English-Only Code & Logs**:
+   - Translated all upstream Chinese comments and PR template instructions into idiomatic technical English across `internal/camoufoxnative/bidi.go`, `internal/aistudio/client.go`, `internal/api/live.go`, `internal/api/middleware.go`, `internal/waa/dom.js`, `internal/waa/intl.js`, and `.github/pull_request_template.md`.
+3. **Testing & Robustness**:
+   - Updated `internal/config/config_test.go` to isolate `AUTO_START` and `WAA_AUTO_START` tests from ambient OS environment variables.
+   - Verified static analysis (`go vet ./...`, 0 issues) and full test suite (`go test ./...`, all packages passing).
+   - Validated frontend typechecking (`npm --prefix web run typecheck`, 0 errors) and compilation (`go build ./cmd/aistudio2api`).

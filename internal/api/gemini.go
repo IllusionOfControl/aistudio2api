@@ -1039,9 +1039,9 @@ func geminiOutputParts(result generationResult) []map[string]any {
 	return parts
 }
 
-// geminiSignaturePart carries a standalone signature using an empty thought part.
+// geminiSignaturePart carries a standalone signature using an empty text part.
 func geminiSignaturePart(signature string) map[string]any {
-	return map[string]any{"text": "", "thought": true, "thoughtSignature": signature}
+	return map[string]any{"text": "", "thoughtSignature": signature}
 }
 
 func geminiTextPart(event aistudio.Event) map[string]any {

@@ -1,4 +1,4 @@
-// intl.js 按 Firefox 152 的 Intl 行为为一个 Realm 实现 Intl 构造器、toLocaleString 与 localeCompare
+// intl.js implements Intl constructors, toLocaleString, and localeCompare for a Realm matching Firefox 152 Intl behavior.
 (function installIntl(Intl, host, helpers) {
   'use strict';
   const { native, setLength, define } = helpers;

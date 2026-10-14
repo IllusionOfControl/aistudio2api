@@ -660,7 +660,7 @@
     host.trust(object, text);
     return object;
   };
-  // keyHash 是 nsStringHashKey 经 PLDHashTable 混淆后的键哈希，低位留作冲突标记
+  // keyHash is the nsStringHashKey hashed via PLDHashTable, with low bits reserved as collision tags.
   const keyHash = key => {
     let hash = 0;
     for (let index = 0; index < key.length; index++) hash = Math.imul(0x9E3779B9, ((hash << 5) | (hash >>> 27)) ^ key.charCodeAt(index));
@@ -668,7 +668,7 @@
     if (hash < 2) hash = (hash - 2) >>> 0;
     return (hash & ~1) >>> 0;
   };
-  // keyTable 按 Firefox PLDHashTable 的槽位保存 Storage 键，键顺序即槽位顺序
+  // keyTable stores Storage keys following Firefox PLDHashTable slots; key order matches slot order.
   const keyTable = log2 => ({ log2, hashes: new Array(2 ** log2).fill(0), keys: new Array(2 ** log2).fill(null), count: 0, removed: 0 });
   const tableSlot = (table, key, hash, adding) => {
     const mask = table.hashes.length - 1;
@@ -729,7 +729,7 @@
     const capacity = table.hashes.length;
     if (table.removed >= capacity >> 2 || (capacity > 8 && table.count <= capacity >> 2)) tableResize(table, Math.max(3, Math.ceil(Math.log2(Math.ceil(table.count * 4 / 3)))));
   };
-  // storageArea 返回同一 agent 内同源 Realm 共享的存储区，localStorage 按键名顺序写入账户条目
+  // storageArea returns the shared storage area for same-origin Realms within the same agent; localStorage writes account entries ordered by key name.
   const storageArea = brand => {
     const name = brand.area;
     if (!host.storage[name]) {
@@ -740,7 +740,7 @@
     }
     return host.storage[name];
   };
-  // storageTable 返回当前键表；localStorage 的快照在空闲 5 秒后结束，下次访问按存储区写入顺序重建
+  // storageTable returns the current key table; localStorage snapshot expires after 5 seconds of idle time, and is rebuilt on next access matching storage area write order.
   const storageTable = area => {
     const now = Date.now();
     if (!area.table || (area.snapshot && now - area.used >= 5000)) {
@@ -772,7 +772,7 @@
   const HostProxy = Proxy;
   const { has: reflectHas, get: reflectGet, getOwnPropertyDescriptor: reflectDescriptor, defineProperty: reflectDefine, deleteProperty: reflectDelete, ownKeys: reflectOwnKeys, getPrototypeOf: reflectPrototype } = Reflect;
   const hasOwn = (object, key) => reflectDescriptor(object, key) !== undefined;
-  // storageProxy 为 Storage 实例提供 WebIDL 命名属性：原型链与自有属性上没有的键名可见，赋值与 defineProperty 写入存储，delete 删除条目
+  // storageProxy provides WebIDL named properties for Storage instances: visible for key names absent from prototype chain and own properties, assignment/defineProperty writes to storage, and delete removes entries.
   function storageProxy(target, brand) {
     const named = key => {
       if (typeof key !== 'string') return false;

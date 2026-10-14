@@ -43,23 +43,41 @@ func newBiDiClient(connection *websocket.Conn) *bidiClient {
 	}
 }
 
-// command sends a BiDi command and consumes interleaved network events.
+type bidiResponse struct {
+	result map[string]any
+	err    error
+}
+
+// command sends a BiDi command; returns immediately if the context is canceled, releasing the command lock after reading the response.
 func (client *bidiClient) command(ctx context.Context, method string, params map[string]any) (map[string]any, error) {
 	select {
 	case client.commandLock <- struct{}{}:
-		defer func() { <-client.commandLock }()
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
 	if err := ctx.Err(); err != nil {
+		<-client.commandLock
 		return nil, err
 	}
 	client.nextID++
 	id := client.nextID
-	deadline := time.Now().Add(150 * time.Second)
-	if contextDeadline, ok := ctx.Deadline(); ok && contextDeadline.Before(deadline) {
-		deadline = contextDeadline
+	done := make(chan bidiResponse, 1)
+	go func() {
+		defer func() { <-client.commandLock }()
+		result, err := client.exchange(id, method, params)
+		done <- bidiResponse{result: result, err: err}
+	}()
+	select {
+	case response := <-done:
+		return response.result, response.err
+	case <-ctx.Done():
+		return nil, ctx.Err()
 	}
+}
+
+// exchange writes the command and consumes interleaved network events until reading the response with the matching ID.
+func (client *bidiClient) exchange(id int, method string, params map[string]any) (map[string]any, error) {
+	deadline := time.Now().Add(150 * time.Second)
 	if err := client.connection.SetWriteDeadline(deadline); err != nil {
 		return nil, err
 	}
@@ -69,16 +87,9 @@ func (client *bidiClient) command(ctx context.Context, method string, params map
 	if err := client.connection.SetReadDeadline(deadline); err != nil {
 		return nil, err
 	}
-	stopCancellation := context.AfterFunc(ctx, func() {
-		_ = client.connection.Close()
-	})
-	defer stopCancellation()
 	for {
 		var message map[string]any
 		if err := client.connection.ReadJSON(&message); err != nil {
-			if ctx.Err() != nil {
-				return nil, ctx.Err()
-			}
 			return nil, err
 		}
 		client.observe(message)

@@ -13,7 +13,19 @@ func TestAutoStartDefault(t *testing.T) {
 	}
 }
 
+func unsetEnv(t *testing.T, key string) {
+	t.Helper()
+	if val, ok := os.LookupEnv(key); ok {
+		os.Unsetenv(key)
+		t.Cleanup(func() {
+			os.Setenv(key, val)
+		})
+	}
+}
+
 func TestAutoStartFromEnvFile(t *testing.T) {
+	unsetEnv(t, "AUTO_START")
+	unsetEnv(t, "WAA_AUTO_START")
 	tmpDir := t.TempDir()
 	envPath := filepath.Join(tmpDir, ".env")
 
@@ -32,6 +44,8 @@ func TestAutoStartFromEnvFile(t *testing.T) {
 }
 
 func TestWAAAutoStartAlias(t *testing.T) {
+	unsetEnv(t, "AUTO_START")
+	unsetEnv(t, "WAA_AUTO_START")
 	tmpDir := t.TempDir()
 	envPath := filepath.Join(tmpDir, ".env")
 
