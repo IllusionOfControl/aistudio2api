@@ -45,13 +45,6 @@ type LoginResult struct {
 	DriveError       string
 }
 
-// LoginVerification returns the page verification result for an existing login state.
-type LoginVerification struct {
-	Authenticated bool
-	PageURL       string
-	VerifiedAt    time.Time
-	Reason        string
-}
 
 type loginSession struct {
 	process    *browserProcess
@@ -106,40 +99,6 @@ func Login(ctx context.Context, options LoginOptions) (result LoginResult, err e
 		PageURL:          pageURL,
 		VerifiedAt:       time.Now().UTC(),
 		DriveError:       errorText(driveErr),
-	}, nil
-}
-
-// Verify validates an existing Playwright storage state using a headless isolated Camoufox instance.
-func Verify(ctx context.Context, options LoginOptions, storageStateJSON []byte) (verification LoginVerification, err error) {
-	options, err = validateLoginOptions(options)
-	if err != nil {
-		return LoginVerification{}, err
-	}
-	var state storageState
-	if err := json.Unmarshal(storageStateJSON, &state); err != nil {
-		return LoginVerification{}, fmt.Errorf("parsing storage state: %w", err)
-	}
-	if len(state.Cookies) == 0 {
-		return LoginVerification{}, errors.New("storage state contains no cookies")
-	}
-	verifyCtx, cancel := context.WithTimeout(ctx, options.Timeout)
-	defer cancel()
-	session, err := startLoginSession(verifyCtx, options, true, state)
-	if err != nil {
-		return LoginVerification{}, err
-	}
-	defer func() {
-		err = errors.Join(err, session.Close())
-	}()
-	pageURL, authenticated, reason, err := session.waitVerification(verifyCtx)
-	if err != nil {
-		return LoginVerification{}, err
-	}
-	return LoginVerification{
-		Authenticated: authenticated,
-		PageURL:       pageURL,
-		VerifiedAt:    time.Now().UTC(),
-		Reason:        reason,
 	}, nil
 }
 
@@ -280,36 +239,6 @@ func (session *loginSession) waitLogin(ctx context.Context, origins map[string]s
 	}
 }
 
-func (session *loginSession) waitVerification(ctx context.Context) (string, bool, string, error) {
-	for {
-		if err := ctx.Err(); err != nil {
-			return "", false, "", err
-		}
-		pageURL, err := session.client.evaluateString(ctx, session.contextID, "location.href")
-		if err != nil {
-			if !retryablePageEvaluation(err) {
-				return "", false, "", fmt.Errorf("reading isolated verification page: %w", err)
-			}
-			if err := waitContext(ctx, 200*time.Millisecond); err != nil {
-				return "", false, "", err
-			}
-			continue
-		}
-		if isGoogleLoginURL(pageURL) {
-			return pageURL, false, "AI Studio login expired", nil
-		}
-		ready, err := session.client.evaluateBool(ctx, session.contextID, promptReadyExpression)
-		if err != nil && !retryablePageEvaluation(err) {
-			return "", false, "", fmt.Errorf("checking isolated verification page: %w", err)
-		}
-		if err == nil && ready && strings.HasPrefix(pageURL, aiStudioOrigin+"/") {
-			return pageURL, true, "", nil
-		}
-		if err := waitContext(ctx, 200*time.Millisecond); err != nil {
-			return "", false, "", err
-		}
-	}
-}
 
 func (session *loginSession) captureCurrentOrigin(ctx context.Context, pageURL string, origins map[string]storageOrigin) {
 	parsed, err := url.Parse(pageURL)

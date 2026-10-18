@@ -566,7 +566,7 @@ func (d *BuildStreamDecoder) Decode(raw []byte) ([]Event, error) {
 			usage := *d.usage
 			events = append(events, Event{Kind: EventUsage, Usage: &usage})
 		}
-		events = append(events, Event{Kind: EventFinish, FinishReason: buildEnumName(candidate.FinishReason, "FINISH_REASON_"), FinishMessage: candidate.FinishMessage})
+		events = append(events, Event{Kind: EventFinish, FinishReason: buildFinishReason(candidate.FinishReason), FinishMessage: candidate.FinishMessage})
 		d.finished = true
 	}
 	return events, nil
@@ -587,6 +587,20 @@ func buildEnumName(value string, prefix string) string {
 		return "unspecified"
 	}
 	return strings.ToLower(value)
+}
+
+// buildFinishReason converts Gemini API finish reason to the equivalent Playground reason, prefixing reasons absent in Playground with provider_.
+func buildFinishReason(value string) string {
+	name := buildEnumName(value, "FINISH_REASON_")
+	for code := int64(0); ; code++ {
+		known := decodeFinishReason(code)
+		if known == name {
+			return name
+		}
+		if strings.HasPrefix(known, "provider_") {
+			return "provider_" + name
+		}
+	}
 }
 
 func decodeBuildPart(part buildResponsePart, index int, raw []byte) ([]Event, error) {
@@ -674,21 +688,26 @@ func decodeBuildGrounding(value buildGrounding) *GroundingMetadata {
 
 // DecodeBuildStream decodes ProxyStreamedCall response: field 1 is [["<JSON>"]...], followed optionally by google.rpc status
 func DecodeBuildStream(source io.Reader, decoder *BuildStreamDecoder, emit func(Event) error) error {
-	stream := json.NewDecoder(newSparseJSONReader(source))
+	reader := &streamReadRecorder{source: source}
+	stream := json.NewDecoder(newSparseJSONReader(reader))
 	stream.UseNumber()
+	index := 0
+	fail := func(path string, detail string) error {
+		return reader.failure(buildProxyStreamedMethod, index, &ProtocolEvidenceError{Method: buildProxyStreamedMethod, Path: path, Detail: detail})
+	}
 	if token, err := stream.Token(); err != nil || token != json.Delim('[') {
-		return &ProtocolEvidenceError{Method: buildProxyStreamedMethod, Path: "$", Detail: "root value is not array"}
+		return fail("$", "root value is not array")
 	}
 	if !stream.More() {
-		return &ProtocolEvidenceError{Method: buildProxyStreamedMethod, Path: "$", Detail: "root array missing response list"}
+		return fail("$", "root array missing response list")
 	}
 	if token, err := stream.Token(); err != nil || token != json.Delim('[') {
-		return &ProtocolEvidenceError{Method: buildProxyStreamedMethod, Path: "$[0]", Detail: "response list is not array"}
+		return fail("$[0]", "response list is not array")
 	}
-	for index := 0; stream.More(); index++ {
+	for ; stream.More(); index++ {
 		var raw json.RawMessage
 		if err := stream.Decode(&raw); err != nil {
-			return &ProtocolEvidenceError{Method: buildProxyStreamedMethod, Path: fmt.Sprintf("$[0][%d]", index), Detail: err.Error()}
+			return fail(fmt.Sprintf("$[0][%d]", index), err.Error())
 		}
 		chunk, err := buildProxyResponseBody(raw, fmt.Sprintf("$[0][%d]", index))
 		if err != nil {
@@ -705,16 +724,19 @@ func DecodeBuildStream(source io.Reader, decoder *BuildStreamDecoder, emit func(
 		}
 	}
 	if token, err := stream.Token(); err != nil || token != json.Delim(']') {
-		return &ProtocolEvidenceError{Method: buildProxyStreamedMethod, Path: "$[0]", Detail: "response list did not end properly"}
+		return fail("$[0]", "response list did not end properly")
 	}
 	for stream.More() {
 		var raw json.RawMessage
 		if err := stream.Decode(&raw); err != nil {
-			return &ProtocolEvidenceError{Method: buildProxyStreamedMethod, Path: "$", Detail: err.Error()}
+			return fail("$", err.Error())
 		}
 		if err := buildTrailerError(raw); err != nil {
 			return err
 		}
+	}
+	if err := reader.failure(buildProxyStreamedMethod, index, nil); err != nil {
+		return err
 	}
 	return decoder.End()
 }

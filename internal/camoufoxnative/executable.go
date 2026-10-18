@@ -9,8 +9,8 @@ import (
 	"strings"
 )
 
-// FindExecutable locates Camoufox from the source environment or bundled release.
-func FindExecutable(ctx context.Context) (string, error) {
+// FindExecutable locates Camoufox from the source environment or bundled release; downloads via proxy when not found, connecting directly if proxy is empty.
+func FindExecutable(ctx context.Context, proxy string) (string, error) {
 	if err := ctx.Err(); err != nil {
 		return "", err
 	}
@@ -39,7 +39,7 @@ func FindExecutable(ctx context.Context) (string, error) {
 			return path, nil
 		}
 	}
-	path, err := installCamoufox(ctx, name)
+	path, err := installCamoufox(ctx, name, proxy)
 	if err != nil {
 		return "", fmt.Errorf("automatically preparing Camoufox: %w", err)
 	}

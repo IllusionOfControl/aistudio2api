@@ -767,8 +767,8 @@ func (s *PooledService) UploadInlineMediaToLease(
 	if target == nil || target.Account() == nil || target.pool != s.pool {
 		return nil, nil, fmt.Errorf("target account lease is not initialized")
 	}
-	if target.Channel() == ChannelBuild {
-		// Gemini API requests proxied by Build carry inlineData directly
+	if target.Channel() == ChannelBuild || target.Channel() == ChannelAssistant {
+		// Gemini API requests proxied by Build carry inlineData directly; the coding assistant uploads inline data as attachment references upon send
 		return contents, temporary, nil
 	}
 	if temporary == nil {

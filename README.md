@@ -15,8 +15,9 @@
 
 <p>
   Playground + Build Dual Quota Channels &nbsp;•&nbsp;
-  High-Concurrency Multi-Account &nbsp;•&nbsp;
-  Camoufox and Pure Go WAA Backends<br>
+  Build Coding Assistant Channel &nbsp;•&nbsp;
+  High-Concurrency Multi-Account<br>
+  Camoufox and Pure Go WAA Backends &nbsp;•&nbsp;
   Claude Code, Codex, and Other Agent Clients &nbsp;•&nbsp;
   Nano Banana, Veo, TTS, and Omni
 </p>
@@ -28,6 +29,7 @@
 ## Core Capabilities
 
 - **Dual Quota Channels**: Every account has separate Playground and Build app proxy quotas, and `UPSTREAM_CHANNELS` enables either or both; when one channel hits its limit, the same account continues on the other
+- **Build Chat Models**: Selectable models from the Build chat panel provide `<model>-build` variants (e.g. `gemini-3.8-flash-build`), served by Build coding assistant with its system prompt and counting toward Build chat quotas (free requests or Google AI subscription quotas). ⚠️ Requests on these models carry Build coding assistant system prompt injection, influencing answer style, formatting, and persona.
 - **High-Concurrency Multi-Account**: Detects Free, Pro, Ultra, and Plus benefits and routes across accounts by the live model catalog with round-robin or fill-first
 - **Two WAA Backends**: Camoufox holds the official WAA lifecycle by default; with `WAA_BACKEND=go`, pure Go generates the official proof and no browser is downloaded or launched at runtime
 - **Four API Protocols**: OpenAI Chat Completions, OpenAI Responses, Anthropic Messages, and Gemini GenerateContent; Responses supports context compaction through `/v1/responses/compact` and `compaction` or `compaction_trigger` input items
@@ -46,13 +48,14 @@
 - **Files and Transcribe**: File upload, metadata, content, deletion, and audio transcription
 - **Live and Robotics**: WebSocket text, audio, JPEG images, media end, tool calls, resumption, and interruption
 - **Anti-Fingerprinting**: Camoufox holds the official WAA lifecycle with a stable browser fingerprint and network exit per account
-- **GUI Launcher**: Manage accounts, service controls, live logs, models, requests, usage statistics, and configuration in the web UI
+- **GUI Launcher**: Manage accounts, service controls, live logs, models, requests, usage statistics, and configuration in the web UI, with dark and light themes
+- **Online Updates**: The admin dashboard "Version" page displays latest releases and changelogs, with one-click download, verification, and relaunch across Windows, Linux, and macOS
 - **Modular Architecture**: Go handles protocols, scheduling, APIs, and management; Camoufox hosts WAA and isolated login
 
 ## System Requirements
 
-- **Windows Release Runtime**: Windows 10 or later, `aistudio2api.exe`
-- **Linux Release Runtime**: Extract `linux-amd64.tar.gz` and run `./aistudio2api`; Camoufox needs the Firefox system libraries, on Debian/Ubuntu run `sudo apt install libgtk-3-0 libasound2 libnss3 libdbus-glib-1-2 libxtst6 libxrandr2 libgbm1 libxkbcommon0 libpango-1.0-0 libcairo2 libxcomposite1 libxdamage1 libxfixes3 fonts-liberation`
+- **Windows Release Runtime**: Windows 10 or later, `aistudio2api.exe` and `start.bat`
+- **Linux Release Runtime**: Extract `linux-amd64.tar.gz` and run `./aistudio2api`; Camoufox needs Firefox system libraries; on Debian/Ubuntu run `sudo apt install libgtk-3-0 libasound2 libnss3 libdbus-glib-1-2 libxtst6 libxrandr2 libgbm1 libxkbcommon0 libpango-1.0-0 libcairo2 libxcomposite1 libxdamage1 libxfixes3 xvfb`
 - **Source Build**: Go 1.26.0+, Node.js 22.13+ or 24+, and its bundled npm
 - **Operating System**: Windows, macOS, Linux
 - **Memory**: 2GB+ available memory for one account; each resident prewarmed account adds about 0.6GB
@@ -79,6 +82,8 @@ Run the executable directly from PowerShell or terminal:
 ```
 
 The first launch downloads Camoufox for the current platform to `runtime/camoufox/`. Set `CAMOUFOX_PATH` to use an existing executable instead.
+
+On first startup, the Camoufox version for the current platform is automatically downloaded to `runtime/camoufox/`, routed through the first proxy in `PROXY`, or system proxy when unset; interrupted downloads resume from existing bytes on next launch. You can also specify an existing executable path using `CAMOUFOX_PATH`.
 
 ### Method 2: Linux and macOS Source Build
 
@@ -183,7 +188,7 @@ Account actions depend on state:
 3. "Stop service" cancels an in-progress launch or active requests and closes WAA workers while the management UI and Logs remain available
 4. Click "Start service" again to resume the APIs
 
-Starting again loads the latest data-plane settings from `.env`; the account selection strategy applies as soon as it is saved. Changes to `LISTEN_ADDR` or `PROXY_API_KEY` require restarting the management process.
+Starting the service again loads the latest configuration from `.env`; account selection strategy and worker capacity apply immediately upon saving. Changes to `LISTEN_ADDR` or `PROXY_API_KEY` require restarting the management process.
 
 Press `Ctrl+C` in the launch window or close that window to exit the manager. Closing the browser tab does not stop the manager.
 
@@ -222,7 +227,7 @@ curl http://127.0.0.1:2048/v1/chat/completions \
 | Anthropic Messages | `http://127.0.0.1:2048` | `PROXY_API_KEY` from `.env` |
 | Gemini | `http://127.0.0.1:2048` | `PROXY_API_KEY` from `.env` |
 
-Read model names from `GET /v1/models` or `GET /v1beta/models`. When `PROXY_API_KEY` is empty, only pages on this machine can call the API from a browser; web clients and some desktop clients need `PROXY_API_KEY` set.
+Read model names from `GET /v1/models` or `GET /v1beta/models`. When `PROXY_API_KEY` is empty, only pages on this machine can call the API from a browser; web clients and some desktop clients need `PROXY_API_KEY` set. Separate multiple keys with commas; any of them is accepted.
 
 For Cherry Studio:
 
@@ -428,7 +433,7 @@ The model catalog follows AI Studio updates; clients read the current values fro
 
 Public endpoints implement `generateContent`, `countTokens`, `embedContent`, `batchEmbedContents`, and `predictLongRunning`; `bidiGenerateContent` and `bidiGenerateMusic` models are called through `/v1/live`. `/v1/models` and `/v1beta/models` preserve the live upstream catalogs across accounts; scheduling uses explicit model ID, method, and capability fields plus current account runtime state.
 
-Models that no enabled account's subscription covers (such as models open only to Google AI Ultra) are still listed in the catalog without `channels`, and calls return 403 naming the required subscription. Models with the `output_continuation` capability (such as Gemini 4 Argon) accept output limits up to `input_token_limit` just as on the official site; outputs exceeding 32,768 tokens are automatically continued across rounds and merged into a single response. Model names can include a thinking suffix, such as `gemini-4-argon(low)`: the parenthesized value can be `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, `auto`, or a thinking budget token count, taking precedence over thinking parameters in the request body.
+Models that no enabled account's subscription covers (such as models open only to Google AI Ultra) are still listed in the catalog without `channels`, and calls return 403 naming the required subscription. Models with the `output_continuation` capability (such as Gemini 4 Argon) accept output limits up to `input_token_limit` just as on the official site; outputs exceeding 32,768 tokens are automatically continued across rounds and merged into a single response. Model names can include a thinking suffix, such as `gemini-4-argon(low)`: the parenthesized value can be `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, `auto`, or a thinking budget token count, taking precedence over thinking parameters in the request body. Hardcoded model names in clients can be mapped to catalog models using `MODEL_MAPPING` (e.g. `MODEL_MAPPING=claude-haiku-5-5:gemini-3.8-flash`), and aliases appear in the model catalog with the target model's capabilities.
 
 ## Project Architecture
 
@@ -460,26 +465,29 @@ cp .env.example .env
 | --- | --- | --- |
 | `AISTUDIO_AUTH_STATES` | `auth` | Account file, directory, or comma-separated paths |
 | `LISTEN_ADDR` | `127.0.0.1:2048` | Management UI and API listen address |
-| `PROXY_API_KEY` | empty | Public API key |
+| `PROXY_API_KEY` | empty | Public API key, multiple keys separated by commas |
 | `AUTO_START` | `false` | Start the generation service when the manager starts |
 | `REQUEST_BODY_LOG` | `false` | Store public API request and response bodies, each truncated to 64 KiB, keeping the latest 1000 |
+| `LOG_FILE` | `true` | Simultaneously write service logs to `runtime/logs/`, rotated at 10 MB per file |
+| `LOG_MAX_TOTAL_MB` | `500` | Log directory total size limit in MB, deletes oldest files when exceeded (minimum 20) |
 | `ADMIN_AUTH_ENABLED` | `false` | Enable username/password login for the console |
 | `ADMIN_USERNAME` | `admin` | Administrator username |
 | `ADMIN_PASSWORD` | empty | Administrator password, required when login is enabled |
-| `PROXY` | empty | HTTP, HTTPS, or SOCKS5 proxy used by Chrome import, login, and accounts without an override |
+| `PROXY` | empty | HTTP, HTTPS, or SOCKS5 proxy used by Chrome import, login, and accounts without an override; multiple proxies form a proxy pool |
 | `INIT_TIMEOUT` | `2m` | Per-account WAA initialization timeout |
-| `REQUEST_TIMEOUT` | `5m` | Maximum request execution time, multiplied by the number of rounds for auto-continued requests |
+| `REQUEST_TIMEOUT` | `30m` | Maximum request execution time, multiplied by continuation rounds for auto-continuation models |
 | `WARM_WORKER_LIMIT` | `5` | Number of resident prewarmed accounts |
 | `MAX_ACTIVE_WORKERS` | `10` | Maximum workers active during peak load |
-| `WARM_STARTUP_CONCURRENCY` | `5` | Camoufox workers cold-started concurrently, shared by prewarming and on-demand scaling; unlimited with `WAA_BACKEND=go` |
+| `WARM_STARTUP_CONCURRENCY` | `5` | Camoufox workers cold-started concurrently, shared by prewarming and scaling; unlimited with `WAA_BACKEND=go` |
 | `PER_ACCOUNT_CONCURRENCY` | `2` | Concurrent requests allowed per account |
 | `ROUTING_STRATEGY` | `round-robin` | `round-robin` rotates accounts; `fill-first` reuses the first available account |
 | `UPSTREAM_CHANNELS` | `playground,build` | Upstream channels for generation requests; either one can be used alone |
+| `MODEL_MAPPING` | empty | Comma-separated alias:model_id mappings |
 | `BUILD_NATIVE_NONSTREAM` | `true` | Prefer native Build unary calls for non-streaming requests; log any fallback to stream collection |
 | `WAA_BACKEND` | `camoufox` | `camoufox` runs WAA in a Camoufox page; `go` runs WAA inside the service process and neither downloads nor starts Camoufox |
 | `TEMPORARY_CHAT` | `false` | Use Temporary Chat for the WAA prewarm page |
 
-The service loads every account from `AISTUDIO_AUTH_STATES`. `WARM_WORKER_LIMIT` sets the resident warm pool, `MAX_ACTIVE_WORKERS` caps peak worker count, `WARM_STARTUP_CONCURRENCY` controls how many Camoufox workers cold-start at once, and `PER_ACCOUNT_CONCURRENCY` controls request slots per account.
+The service loads every account from `AISTUDIO_AUTH_STATES`. `WARM_WORKER_LIMIT` sets the resident warm pool, `MAX_ACTIVE_WORKERS` caps peak worker count, `WARM_STARTUP_CONCURRENCY` controls how many Camoufox workers cold-start at once, and `PER_ACCOUNT_CONCURRENCY` controls request slots per account. These four parameters take effect immediately upon saving in the settings panel, terminating excess idle workers when the ceiling is lowered and topping up prewarming when the target is raised.
 
 ### Port Configuration
 
@@ -496,10 +504,11 @@ Use an HTTPS reverse proxy that preserves `Host` and sets `X-Forwarded-Proto: ht
 
 HTTP, HTTPS, and SOCKS5 proxies are supported. For proxies that require authentication, include the credentials in the URL, for example `socks5://user:password@host:1080`:
 
-1. Set the global proxy under Service Configuration
-2. Edit an account to set an account-specific proxy
-3. The account proxy is used for login, WAA, and business requests
-4. For authenticated proxies, the program gives Camoufox a credential-free SOCKS5 relay on the loopback address; the credentials are not written to the browser profile. While the relay runs, other local processes can also use the proxy through it
+1. Set the global proxy under Service Configuration; when empty, the system proxy is used (checking `HTTPS_PROXY` first, then Windows system proxy settings). The actual egress used by the generation service is displayed under the proxy input box
+2. Multiple global proxies can be specified separated by commas to form a proxy pool: accounts without a dedicated proxy bind to the available proxy with the fewest accounts, persisting in account state across restarts. When a proxy encounters 3 consecutive network errors or fails scheduled health checks, its accounts are rebound to other healthy proxies and rejoin allocation once recovered. Service Configuration displays status and bound account counts for each proxy, and account cards display each account's egress
+3. Edit an account to set an account-specific proxy
+4. The account proxy is used for login, WAA, and business requests
+5. For authenticated proxies, the program gives Camoufox a credential-free SOCKS5 relay on the loopback address; the credentials are not written to the browser profile. While the relay runs, other local processes can also use the proxy through it
 
 ### Authentication File Management
 
@@ -516,7 +525,7 @@ Authentication files are stored in `auth/` by default:
 
 The lowercase Google email is the account directory, management UI identity, and log source. `.leases` coordinates account-directory access, while the runtime lease in the user cache allows one WAA Worker per email on the current computer.
 
-The Accounts page supports Chrome batch import and isolated Camoufox login. `ready` accounts can be edited, disabled, verified, and deleted; `auth_required` accounts can log in again.
+The Accounts page supports Chrome batch import and isolated Camoufox login. `ready` accounts can be edited, disabled, immediately refreshed, and deleted; `auth_required` accounts can log in again. "Refresh All" immediately reads benefits and model catalogs for all enabled accounts, which is also checked every 10 minutes in the background. Accounts whose benefits have never been read report as unknown along with the last error cause.
 
 ## Documentation
 
@@ -577,9 +586,10 @@ Common runtime states:
 | --- | --- |
 | The page does not open automatically | Open the address configured by `LISTEN_ADDR` in `.env` |
 | `service_stopped` | Click "Start service" in the management UI |
+| `service_starting` | Generation service is starting; try again shortly |
 | No account is available | Add, enable, or log in to an account from Accounts |
 | Camoufox preparation fails | Check access to GitHub Releases or set `CAMOUFOX_PATH` |
-| Linux account warmup `exit status 255` | Install the Camoufox runtime libraries, see the apt command in “System Requirements” |
+| Linux account warmup `exit status 255` | Install the Camoufox runtime libraries, see the apt command in "System Requirements" |
 
 ## Contributing
 

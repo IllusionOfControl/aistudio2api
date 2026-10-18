@@ -48,6 +48,7 @@ type setupOptions struct {
 	profiles     setupStrings
 	emails       setupStrings
 	proxy        string
+	egress       string
 	locale       string
 	localeSet    bool
 	timezone     string
@@ -92,7 +93,7 @@ func Run(ctx context.Context, cfg config.Config, args []string) error {
 	}
 
 	if options.login {
-		driver, err := defaultSetupLoginDriver(ctx, cfg)
+		driver, err := defaultSetupLoginDriver(ctx, cfg, options.egress)
 		if err != nil {
 			return err
 		}
@@ -249,11 +250,8 @@ func importIsolatedLogin(
 	defer os.RemoveAll(loginDirectory)
 
 	result, err := driver.Login(ctx, aistudio.IsolatedLoginRequest{
-		AccountID: "setup",
-		Directory: loginDirectory,
-		Proxy:     options.proxy,
-		Locale:    options.locale,
-		Timezone:  options.timezone,
+		AccountID: "setup", Directory: loginDirectory, Proxy: options.egress,
+		Locale: options.locale, Timezone: options.timezone,
 	})
 	if err != nil {
 		return err
@@ -295,11 +293,7 @@ func importChromeAccounts(ctx context.Context, cfg config.Config, target account
 	}
 
 	results, err := chromeauth.Import(ctx, chromeauth.ImportOptions{
-		ChromeRoot: root,
-		Proxy:      options.proxy,
-		Profiles:   options.profiles,
-		Emails:     options.emails,
-		AccountIDs: accountIDs,
+		ChromeRoot: root, Proxy: options.egress, Profiles: options.profiles, Emails: options.emails, AccountIDs: accountIDs,
 	})
 	if err != nil {
 		return err
@@ -308,7 +302,7 @@ func importChromeAccounts(ctx context.Context, cfg config.Config, target account
 	modelCounts := make([]int, len(results))
 	for index := range results {
 		verifyContext, cancel := context.WithTimeout(ctx, cfg.RequestTimeout)
-		verification, verifyErr := chromeauth.Verify(verifyContext, &results[index].State, options.proxy)
+		verification, verifyErr := chromeauth.Verify(verifyContext, &results[index].State, options.egress)
 		cancel()
 
 		if verifyErr != nil {
@@ -404,7 +398,7 @@ func parseSetupFlags(args []string, cfg config.Config) (setupOptions, error) {
 	storageState := flags.String("storage-state", "", "Playwright storage state file")
 	login := flags.Bool("login", false, "Log in using isolated Camoufox browser")
 	chromeRoot := flags.String("chrome-root", "", "Chrome User Data directory")
-	proxy := flags.String("proxy", cfg.Proxy, "Fixed HTTP, HTTPS, or SOCKS5 proxy for accounts")
+	proxy := flags.String("proxy", "", "Fixed HTTP, HTTPS, or SOCKS5 proxy for accounts")
 	locale := flags.String("locale", aistudio.DefaultAccountLocale(), "Account locale")
 	timezone := flags.String("timezone", aistudio.DefaultAccountTimezone(), "Account timezone")
 	remote := flags.String("remote", "", "Remote instance origin, accounts are uploaded to this instance")
@@ -423,6 +417,10 @@ func parseSetupFlags(args []string, cfg config.Config) (setupOptions, error) {
 		proxy:  strings.TrimSpace(*proxy),
 		locale: strings.TrimSpace(*locale), timezone: strings.TrimSpace(*timezone),
 		token: strings.TrimSpace(*token),
+	}
+	options.egress = options.proxy
+	if proxies := config.ProxyList(cfg.Proxy); options.egress == "" && len(proxies) > 0 {
+		options.egress = proxies[0]
 	}
 	if strings.TrimSpace(*remote) != "" {
 		origin, err := remoteOrigin(*remote)
@@ -478,8 +476,8 @@ func defaultSetupLabel(storageState string) string {
 	return parent
 }
 
-func defaultSetupLoginDriver(ctx context.Context, cfg config.Config) (aistudio.IsolatedLoginDriver, error) {
-	camoufoxPath, err := camoufoxnative.FindExecutable(ctx)
+func defaultSetupLoginDriver(ctx context.Context, cfg config.Config, egress string) (aistudio.IsolatedLoginDriver, error) {
+	camoufoxPath, err := camoufoxnative.FindExecutable(ctx, egress)
 	if err != nil {
 		return nil, err
 	}

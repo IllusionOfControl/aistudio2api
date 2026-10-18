@@ -70,28 +70,6 @@ func (driver *NativeLoginDriver) Login(ctx context.Context, request IsolatedLogi
 	}, nil
 }
 
-// Verify uses headless isolated Camoufox to verify existing authentication state
-func (driver *NativeLoginDriver) Verify(ctx context.Context, request IsolatedLoginRequest, state StorageState) (LoginVerification, error) {
-	if driver == nil {
-		return LoginVerification{}, errors.New("pure-Go Camoufox login driver is not initialized")
-	}
-	if err := state.Validate(); err != nil {
-		return LoginVerification{}, err
-	}
-	encoded, err := json.Marshal(state)
-	if err != nil {
-		return LoginVerification{}, fmt.Errorf("encode isolated verification state: %w", err)
-	}
-	verification, err := camoufoxnative.Verify(ctx, driver.options(request), encoded)
-	if err != nil {
-		return LoginVerification{}, err
-	}
-	return LoginVerification{
-		Authenticated: verification.Authenticated,
-		VerifiedAt:    verification.VerifiedAt,
-		Reason:        verification.Reason,
-	}, nil
-}
 
 func (driver *NativeLoginDriver) options(request IsolatedLoginRequest) camoufoxnative.LoginOptions {
 	return camoufoxnative.LoginOptions{

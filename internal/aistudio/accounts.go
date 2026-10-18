@@ -14,10 +14,10 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
-	"slices"
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	appconfig "github.com/Mag1cFall/AIStudio2API/internal/config"
@@ -78,6 +78,11 @@ type AllCoolingError struct {
 
 func (e *AllCoolingError) Error() string {
 	return fmt.Sprintf("all eligible accounts for model %s are cooling down, earliest recovery time %s", e.ModelID, e.Until.Local().Format(time.RFC3339))
+}
+
+// RetryAt returns the earliest recovery time.
+func (e *AllCoolingError) RetryAt(time.Time) time.Time {
+	return e.Until
 }
 
 // HTTPStatus returns public status code corresponding to quota exhaustion.
@@ -143,6 +148,7 @@ type accountRuntimeState struct {
 	ModelAccess        map[string]ModelAccess     `json:"model_access,omitempty"`
 	BenefitTier        BenefitTier                `json:"benefit_tier,omitempty"`
 	CatalogFingerprint string                     `json:"catalog_fingerprint,omitempty"`
+	Proxy              string                     `json:"proxy,omitempty"`
 }
 
 // ModelAccessState represents the tested access qualification of an account for a single model
@@ -187,8 +193,10 @@ type Account struct {
 	authCheckedAt         time.Time
 	modelAccessGeneration uint64
 	stateMessage          string
+	catalogError          string
 	initializedAt         time.Time
 	buildModels           []Model
+	boundProxy            atomic.Pointer[string]
 }
 
 // AccountStatus represents the sanitized account status used by the management interface
@@ -198,6 +206,7 @@ type AccountStatus struct {
 	State       AccountState             `json:"state"`
 	Enabled     bool                     `json:"enabled"`
 	Proxy       string                   `json:"proxy"`
+	Egress      string                   `json:"egress"`
 	Locale      string                   `json:"locale"`
 	Timezone    string                   `json:"timezone"`
 	Models      []string                 `json:"models"`
@@ -572,10 +581,27 @@ func (c AccountConfig) Validate() error {
 	return nil
 }
 
-// EffectiveProxy returns the account fixed proxy or global proxy
+// EffectiveProxy returns the account fixed proxy, pool-bound proxy, or global proxy.
 func (a *Account) EffectiveProxy(globalProxy string) string {
 	if a != nil && strings.TrimSpace(a.Config.Proxy) != "" {
 		return strings.TrimSpace(a.Config.Proxy)
+	}
+	return a.PoolProxy(globalProxy)
+}
+
+// SetPoolProxy sets the proxy pool binding used before the account joins the account pool.
+func (a *Account) SetPoolProxy(proxy string) {
+	if proxy = strings.TrimSpace(proxy); proxy != "" {
+		a.boundProxy.Store(&proxy)
+	}
+}
+
+// PoolProxy returns the account's proxy pool binding, or the global proxy when unbound.
+func (a *Account) PoolProxy(globalProxy string) string {
+	if a != nil {
+		if bound := a.boundProxy.Load(); bound != nil && *bound != "" {
+			return *bound
+		}
 	}
 	return strings.TrimSpace(globalProxy)
 }
@@ -690,7 +716,7 @@ func callableFirst(models []Model) []Model {
 			ordered = append(ordered, model)
 		}
 	}
-	return slices.Concat(ordered, agents, restricted)
+	return append(append(ordered, agents...), restricted...)
 }
 
 // CanonicalModelID converts model aliases from the live catalog to canonical model IDs accepted upstream.
@@ -1796,6 +1822,7 @@ func (p *AccountPool) SetCatalog(accountID string, tier BenefitTier, models []Mo
 			}
 			account.BenefitTier = tier
 			account.Models = cloneAccountModels(models)
+			account.catalogError = ""
 			account.initializedAt = time.Now()
 			if account.State == AccountUnavailable {
 				account.State = AccountReady
@@ -2061,6 +2088,63 @@ func (p *AccountPool) MarkCooldownIfGeneration(
 	return err
 }
 
+// ModelRequiresSubscription checks whether a model in the account's live catalog is only available with Pro or Ultra subscription tier.
+func (p *AccountPool) ModelRequiresSubscription(accountID string, modelID string) bool {
+	modelID = strings.TrimPrefix(strings.TrimSpace(modelID), "models/")
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	account := p.byID[accountID]
+	if account == nil {
+		return false
+	}
+	for _, model := range account.Models {
+		if modelMatchesID(model, modelID) {
+			return !modelAllowedByTier(model, BenefitTierFree)
+		}
+	}
+	return false
+}
+
+// MarkQuotaCooldownIfGeneration records quota cooldown in the current catalog generation and returns the effective cooldown expiration; returns zero time if escalated cooldown is superseded.
+func (p *AccountPool) MarkQuotaCooldownIfGeneration(
+	accountID string,
+	modelAccessScope string,
+	generation uint64,
+	checkedAt time.Time,
+	cooldown QuotaCooldown,
+) (time.Time, error) {
+	if !cooldown.Escalate {
+		return cooldown.Until, p.MarkCooldownIfGeneration(accountID, modelAccessScope, generation, checkedAt, cooldown.Until, cooldown.Reason)
+	}
+	checkedAt = checkedAt.UTC()
+	if checkedAt.IsZero() {
+		return time.Time{}, fmt.Errorf("cooldown check time cannot be zero")
+	}
+	modelAccessScope = strings.TrimSpace(modelAccessScope)
+	if modelAccessScope == "" {
+		modelAccessScope = globalCooldownKey
+	}
+	var until time.Time
+	_, err := p.updateRuntime(accountID, func(account *Account, runtimeState *accountRuntimeState) (bool, func(*Account), error) {
+		if generation != account.modelAccessGeneration {
+			return false, nil, nil
+		}
+		modelAccessScope = canonicalAccountModelID(account, modelAccessScope)
+		currentAccess := runtimeState.ModelAccess[modelAccessScope]
+		if !currentAccess.CheckedAt.Before(checkedAt) {
+			return false, nil, nil
+		}
+		previous, exists := runtimeState.Cooldowns[modelAccessScope]
+		next := planLimitCooldown(previous, exists, time.Now(), cooldown.Reason)
+		until = next.Until
+		currentAccess.CheckedAt = checkedAt
+		runtimeState.ModelAccess[modelAccessScope] = currentAccess
+		runtimeState.Cooldowns[modelAccessScope] = next
+		return true, nil, nil
+	})
+	return until, err
+}
+
 // ClearCooldownIfGeneration clears scope cooldown in the current catalog generation
 func (p *AccountPool) ClearCooldownIfGeneration(
 	accountID string,
@@ -2252,6 +2336,15 @@ func (p *AccountPool) MarkAuthRequired(accountID string, reason string) error {
 	return p.setAccountState(accountID, AccountAuthRequired, reason)
 }
 
+// recordCatalogFailure records the error from the most recent attempt to read account benefits or catalog.
+func (p *AccountPool) recordCatalogFailure(accountID string, err error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if account := p.byID[accountID]; account != nil {
+		account.catalogError = err.Error()
+	}
+}
+
 // MarkUnavailable marks an account as failed during initialization or runtime
 func (p *AccountPool) MarkUnavailable(accountID string, reason string) error {
 	return p.setAccountState(accountID, AccountUnavailable, reason)
@@ -2289,18 +2382,27 @@ func (p *AccountPool) Status() []AccountStatus {
 			models = append(models, model.ID)
 		}
 		sort.Strings(models)
+		tier := account.BenefitTier.String()
+		message := account.stateMessage
+		if account.runtime.CatalogFingerprint == "" {
+			tier = "Unknown"
+			if message == "" {
+				message = account.catalogError
+			}
+		}
 		status := AccountStatus{
 			ID:          account.ID,
 			Label:       account.Config.Label,
 			State:       state,
 			Enabled:     account.Config.Enabled,
 			Proxy:       account.Config.Proxy,
+			Egress:      account.EffectiveProxy(""),
 			Locale:      account.Config.Locale,
 			Timezone:    account.Config.Timezone,
 			Models:      models,
-			BenefitTier: account.BenefitTier.String(),
+			BenefitTier: tier,
 			Cooldowns:   cloneCooldowns(account.runtime.Cooldowns),
-			Message:     account.stateMessage,
+			Message:     message,
 		}
 		if !account.LastUsed.IsZero() {
 			status.LastUsed = timePointer(account.LastUsed)
@@ -2569,7 +2671,7 @@ func accountBootstrapModels(account *Account) []string {
 func waaBootstrapModelEligible(account *Account, modelID string) bool {
 	for _, model := range account.Models {
 		if !modelMatchesID(model, modelID) || !hasMethod(model, "generateContent") ||
-			!modelAllowedByTier(model, account.BenefitTier) || !model.Capabilities["chat_model"] {
+			!modelAllowedByTier(model, account.BenefitTier) || !model.Capabilities["chat_model"] || model.Capabilities["assistant_route"] {
 			continue
 		}
 		return true
@@ -2638,6 +2740,14 @@ func (p *AccountPool) selectionIndicesLocked(selection AccountSelection) ([]int,
 func (p *AccountPool) SetRoutingStrategy(strategy string) {
 	p.mu.Lock()
 	p.routingStrategy = strategy
+	p.mu.Unlock()
+}
+
+// SetPerAccountConcurrency sets the concurrent request limit per account and notifies waiting requests.
+func (p *AccountPool) SetPerAccountConcurrency(limit int) {
+	p.mu.Lock()
+	p.perAccountConcurrency = limit
+	p.notifyLocked()
 	p.mu.Unlock()
 }
 
@@ -3180,6 +3290,7 @@ func cloneRuntime(value accountRuntimeState) accountRuntimeState {
 		ModelAccess:        make(map[string]ModelAccess, len(value.ModelAccess)),
 		BenefitTier:        value.BenefitTier,
 		CatalogFingerprint: value.CatalogFingerprint,
+		Proxy:              value.Proxy,
 	}
 	for key, cooldown := range value.Cooldowns {
 		result.Cooldowns[key] = cooldown

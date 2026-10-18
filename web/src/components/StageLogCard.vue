@@ -5,7 +5,7 @@ import type { LogRow, LogStageState } from '@/logs'
 import UiIcon from './UiIcon.vue'
 
 const props = defineProps<{ row: LogRow }>()
-const { t, locale } = useI18n()
+const { t, locale, logText } = useI18n()
 const stage = computed(() => props.row.stage!)
 // detailsRendered tracks whether steps list has been expanded; unexpanded lists are not rendered
 const detailsRendered = ref(false)
@@ -32,7 +32,7 @@ function renderDetails(event: Event): void {
       <span class="stage-state" :class="`state-${stage.state}`">{{
         stage.state === 'running' ? progress : t(stateKeys[stage.state])
       }}</span>
-      <strong>{{ stage.name }}</strong>
+      <strong>{{ logText(stage.name) }}</strong>
       <span v-if="stage.state !== 'running'" class="stage-progress">{{ progress }}</span>
     </div>
     <p
@@ -40,7 +40,7 @@ function renderDetails(event: Event): void {
       class="stage-detail"
       :class="{ 'stage-error': stage.state === 'failed' }"
     >
-      {{ stage.detail }}
+      {{ logText(stage.detail) }}
     </p>
     <details class="stage-details" @toggle="renderDetails">
       <summary>
@@ -50,7 +50,7 @@ function renderDetails(event: Event): void {
       <ol v-if="detailsRendered" class="stage-timeline">
         <li v-for="(event, index) in row.events" :key="index">
           <time>{{ new Date(event.time).toLocaleTimeString(locale, { hour12: false }) }}</time>
-          <span>{{ event.message }}</span>
+          <span>{{ logText(event.message) }}</span>
         </li>
       </ol>
     </details>
@@ -68,7 +68,7 @@ function renderDetails(event: Event): void {
   gap: 8px 12px;
 }
 .stage-heading strong {
-  color: #e6edf3;
+  color: var(--color-gray-200);
   font-weight: 600;
   overflow-wrap: anywhere;
 }
@@ -81,33 +81,33 @@ function renderDetails(event: Event): void {
   font-variant-numeric: tabular-nums;
 }
 .state-running {
-  color: #79c0ff;
+  color: var(--color-blue-400);
 }
 .state-completed {
-  color: #56d4a0;
-  background: #56d4a00c;
+  color: var(--color-green-400);
+  background: color-mix(in oklab, var(--color-green-400) 8%, transparent);
 }
 .state-cancelled {
-  color: #e3b341;
+  color: var(--color-yellow-400);
 }
 .state-failed,
 .stage-error {
-  color: #ff7b72;
+  color: var(--color-red-400);
 }
 .stage-progress {
-  color: #8b949e;
+  color: var(--color-gray-400);
   font-size: 12px;
   font-variant-numeric: tabular-nums;
 }
 .stage-detail {
   margin: 4px 0 0;
-  color: #c9d1d9;
+  color: var(--color-fg);
   white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
 .stage-details {
   margin-top: 5px;
-  color: #8b949e;
+  color: var(--color-gray-400);
   font-size: 11px;
 }
 .stage-details summary {
@@ -128,15 +128,15 @@ function renderDetails(event: Event): void {
   display: none;
 }
 .stage-details summary:hover {
-  color: #c9d1d9;
-  background: #30363d66;
+  color: var(--color-fg);
+  background: color-mix(in oklab, var(--color-line) 40%, transparent);
 }
 .stage-details summary:focus-visible {
-  outline: 1px solid #79c0ff;
+  outline: 1px solid var(--color-blue-400);
   outline-offset: 2px;
 }
 .stage-disclosure-icon {
-  color: #6e7681;
+  color: var(--color-gray-500);
   transition: transform 120ms ease;
 }
 details[open] > summary > .stage-disclosure-icon {
@@ -154,7 +154,7 @@ details[open] > summary > .stage-disclosure-icon {
   }
 }
 .stage-timeline {
-  border-left: 1px solid #30363d;
+  border-left: 1px solid var(--color-line);
   padding-left: 12px;
   margin: 10px 0;
 }
@@ -166,7 +166,7 @@ details[open] > summary > .stage-disclosure-icon {
 }
 .stage-timeline time {
   flex-shrink: 0;
-  color: #6e7681;
+  color: var(--color-gray-500);
 }
 .stage-timeline span {
   min-width: 0;

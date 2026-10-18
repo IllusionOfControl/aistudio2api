@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"math"
 	"math/rand/v2"
 	"os"
@@ -314,6 +315,94 @@ var windowsProfile = func() windowsProfileData {
 	return profile
 }()
 
+// windowsWebGLJSON contains WebGL2-compatible Windows entries and their weights from Camoufox official WebGL data.
+//
+//go:embed windows_webgl.json
+var windowsWebGLJSON []byte
+
+// windowsWebGLProfile represents a Windows graphics card WebGL configuration and its selection weight.
+type windowsWebGLProfile struct {
+	Weight float64        `json:"weight"`
+	Config map[string]any `json:"config"`
+}
+
+var windowsWebGLProfiles = func() []windowsWebGLProfile {
+	var profiles []windowsWebGLProfile
+	if err := json.Unmarshal(windowsWebGLJSON, &profiles); err != nil {
+		panic(err)
+	}
+	return profiles
+}()
+
+// windowsWebGL samples a Windows WebGL configuration based on official launcher weights.
+func windowsWebGL() map[string]any {
+	total := 0.0
+	for _, profile := range windowsWebGLProfiles {
+		total += profile.Weight
+	}
+	point := rand.Float64() * total
+	selected := windowsWebGLProfiles[len(windowsWebGLProfiles)-1]
+	for _, profile := range windowsWebGLProfiles {
+		if point < profile.Weight {
+			selected = profile
+			break
+		}
+		point -= profile.Weight
+	}
+	return maps.Clone(selected.Config)
+}
+
+// windowsFontsJSON contains Windows Firefox font preferences, Camoufox package Windows font family groupings, and Windows font substitution tables.
+//
+//go:embed windows_fonts.json
+var windowsFontsJSON []byte
+
+// windowsFontTable represents preferences, font family groupings, and substitution tables needed to resolve fonts as Windows on Linux.
+type windowsFontTable struct {
+	Prefs       map[string]any    `json:"prefs"`
+	Families    [][]string        `json:"families"`
+	Substitutes map[string]string `json:"substitutes"`
+}
+
+var windowsFontData = func() windowsFontTable {
+	var table windowsFontTable
+	if err := json.Unmarshal(windowsFontsJSON, &table); err != nil {
+		panic(err)
+	}
+	for key, value := range table.Prefs {
+		if number, ok := value.(float64); ok {
+			table.Prefs[key] = int(number)
+		}
+	}
+	return table
+}()
+
+// windowsFontAliases returns other font family names whose font files in the distribution bundle contain declared names.
+func windowsFontAliases(fonts []string) []string {
+	declared := map[string]bool{}
+	for _, font := range fonts {
+		declared[strings.ToLower(font)] = true
+	}
+	allowed := map[string]bool{}
+	var names []string
+	for _, family := range windowsFontData.Families {
+		hit := slices.ContainsFunc(family, func(name string) bool { return declared[strings.ToLower(name)] })
+		for _, name := range family {
+			key := strings.ToLower(name)
+			if declared[key] {
+				continue
+			}
+			if previous, seen := allowed[key]; seen {
+				allowed[key] = previous && hit
+				continue
+			}
+			allowed[key] = hit
+			names = append(names, name)
+		}
+	}
+	return slices.DeleteFunc(names, func(name string) bool { return !allowed[strings.ToLower(name)] })
+}
+
 // windowsEssentialFonts are essential fonts that must be included in the Windows font subset
 var windowsEssentialFonts = []string{
 	"Arial", "Times New Roman", "Courier New", "Verdana", "Georgia",
@@ -324,9 +413,7 @@ var windowsEssentialFonts = []string{
 // windowsMarkerFonts are marker fonts identifying Windows systems
 var windowsMarkerFonts = []string{"Segoe UI", "Tahoma", "Cambria Math", "Nirmala UI"}
 
-var voiceSlugPattern = regexp.MustCompile(`[^a-z0-9]+`)
-
-// windowsFontSubset generates a subset of essential fonts plus 30% to 78% of remaining fonts per official launcher rules
+// windowsFontSubset generates a subset of essential fonts plus 30% to 78% of remaining fonts per official launcher rules.
 func windowsFontSubset() []string {
 	var result, rest []string
 	for _, font := range windowsProfile.Fonts {
@@ -348,8 +435,8 @@ func windowsFontSubset() []string {
 	return result
 }
 
-// windowsFonts checks whether all fonts in the list are from the official Windows font inventory
-func windowsFonts(value any) bool {
+// fontList reads the font name list from config.
+func fontList(value any) []string {
 	var fonts []string
 	switch items := value.(type) {
 	case []string:
@@ -360,6 +447,12 @@ func windowsFonts(value any) bool {
 			fonts = append(fonts, font)
 		}
 	}
+	return fonts
+}
+
+// windowsFonts checks whether all fonts in the list are from the official Windows font inventory.
+func windowsFonts(value any) bool {
+	fonts := fontList(value)
 	if len(fonts) == 0 {
 		return false
 	}
@@ -378,11 +471,10 @@ func windowsVoices(locale string) []map[string]any {
 		last := strings.LastIndex(entry, ":")
 		separator := strings.LastIndex(entry[:last], ":")
 		name, language := entry[:separator], entry[separator+1:last]
-		slug := strings.Trim(voiceSlugPattern.ReplaceAllString(strings.ToLower(name), "."), ".")
 		voices = append(voices, map[string]any{
 			"name":           name,
 			"lang":           language,
-			"voiceUri":       "urn:moz-tts:sapi:" + slug,
+			"voiceUri":       "urn:moz-tts:sapi:" + name + "?" + language,
 			"isDefault":      false,
 			"isLocalService": entry[last+1:] == "local",
 		})
@@ -451,7 +543,7 @@ func applyScreenXY(config map[string]any, screen fingerprints.ScreenFingerprint)
 	}
 }
 
-// normalizeCamoufoxConfig normalizes nil values, window geometry, fonts, voices, media devices, and noise seeds per official launcher rules
+// normalizeCamoufoxConfig normalizes nil values, window geometry, fonts, voices, WebGL, media devices, and noise seeds per official launcher rules.
 func normalizeCamoufoxConfig(config map[string]any) {
 	for key, value := range config {
 		derived := strings.HasPrefix(key, "navigator.") || strings.HasPrefix(key, "screen.") ||
@@ -468,6 +560,9 @@ func normalizeCamoufoxConfig(config map[string]any) {
 	}
 	language, _ := config["navigator.language"].(string)
 	config["voices"] = windowsVoices(language)
+	if _, ok := config["webGl:renderer"]; !ok {
+		maps.Copy(config, windowsWebGL())
+	}
 	hasMediaDevices := false
 	for key := range config {
 		hasMediaDevices = hasMediaDevices || strings.HasPrefix(key, "mediaDevices:")

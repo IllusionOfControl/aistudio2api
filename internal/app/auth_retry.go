@@ -145,6 +145,15 @@ func (transport *authRetryTransport) DeleteDrive(
 	return drive.DeleteDrive(ctx, accountID, token, fileID)
 }
 
+// UploadAssistantFile delegates assistant file upload to the underlying authenticated transport.
+func (transport *authRetryTransport) UploadAssistantFile(ctx context.Context, accountID string, blob aistudio.Blob) (string, error) {
+	uploader, ok := transport.transport.(aistudio.AssistantUploader)
+	if !ok {
+		return "", fmt.Errorf("transport does not support assistant file upload")
+	}
+	return uploader.UploadAssistantFile(ctx, accountID, blob)
+}
+
 // newAuthRuntimeRefresher creates a production authentication refresher.
 func newAuthRuntimeRefresher(
 	workers *accountWorkerManager,

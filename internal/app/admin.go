@@ -23,16 +23,18 @@ import (
 
 // runtimeAdmin projects the authoritative runtime state.
 type runtimeAdmin struct {
-	lifecycle  context.Context
-	pool       *aistudio.AccountPool
-	store      *aistudio.AccountStore
-	service    *trackedService
-	requests   *requestRegistry
-	login      aistudio.IsolatedLoginDriver
-	workers    *accountWorkerManager
-	headers    *accountHeaderProvider
-	configPath string
-	config     config.Config
+	lifecycle   context.Context
+	pool        *aistudio.AccountPool
+	store       *aistudio.AccountStore
+	service     *trackedService
+	requests    *requestRegistry
+	login       aistudio.IsolatedLoginDriver
+	workers     *accountWorkerManager
+	headers     *accountHeaderProvider
+	configPath  string
+	config      config.Config
+	proxies     *aistudio.ProxyPool
+	globalProxy string
 }
 
 // requestRegistry stores active requests and event subscriptions.
@@ -409,7 +411,9 @@ func (admin *runtimeAdmin) addAccount(
 			return api.AdminAccount{}, errors.Join(err, admin.store.Delete(account))
 		}
 	}
-
+	if strings.TrimSpace(account.Config.Proxy) == "" {
+		account.SetPoolProxy(admin.proxies.Next())
+	}
 	if err := admin.headers.Add(account); err != nil {
 		return api.AdminAccount{}, errors.Join(err, admin.store.Delete(account))
 	}
@@ -430,7 +434,9 @@ func (admin *runtimeAdmin) addAccount(
 		return api.AdminAccount{}, err
 	}
 	publishLease = nil
-
+	if _, err := admin.proxies.Assign(); err != nil {
+		return api.AdminAccount{}, err
+	}
 	admin.syncAccountModelCatalog(ctx, account)
 
 	return admin.account(account.ID)
@@ -458,6 +464,9 @@ func (admin *runtimeAdmin) UpdateAccount(ctx context.Context, accountID string, 
 
 	account := lease.Account()
 	enabling := accountConfig.Enabled && !account.Config.Enabled
+	if accountConfig.Proxy == "" && !admin.proxies.Available(account.PoolProxy("")) {
+		account.SetPoolProxy(admin.proxies.Next())
+	}
 	headerUpdate, err := admin.headers.prepareUpdate(account, accountConfig)
 	if err != nil {
 		return api.AdminAccount{}, errors.Join(err, lease.Release())
@@ -483,7 +492,9 @@ func (admin *runtimeAdmin) UpdateAccount(ctx context.Context, accountID string, 
 	if err := lease.Release(); err != nil {
 		return api.AdminAccount{}, err
 	}
-
+	if _, err := admin.proxies.Assign(); err != nil {
+		return api.AdminAccount{}, err
+	}
 	admin.syncModelCache()
 	if enabling {
 		admin.syncAccountModelCatalog(ctx, account)
@@ -615,68 +626,20 @@ func keepAuthExtension(next *aistudio.StorageState, current aistudio.StorageStat
 	return next.SetAuthExtension(extension)
 }
 
-func (admin *runtimeAdmin) VerifyAccount(ctx context.Context, accountID string) (api.AdminAccount, error) {
-	lease, err := admin.pool.AcquireAccount(ctx, accountID)
+// RefreshAccount immediately reads account benefits and model catalog in the service lifecycle without aborting if the admin page disconnects.
+func (admin *runtimeAdmin) RefreshAccount(_ context.Context, accountID string) (api.AdminAccountRefresh, error) {
+	refresh, err := admin.service.refreshAccountState(admin.service.lifecycle, accountID, true)
 	if err != nil {
-		return api.AdminAccount{}, accountOperationError(err)
+		return api.AdminAccountRefresh{}, accountOperationError(err)
 	}
-
-	account := lease.Account()
-	startedAt := time.Now()
-	admin.requests.log(account.Config.Label, "INFO", "Account verification | Visiting AI Studio")
-
-	verification, err := admin.login.Verify(ctx, admin.loginRequest(account, account.Directory), account.StorageState)
-	if err == nil && !verification.Authenticated && admin.workers != nil && admin.workers.refresher != nil {
-		renewCtx := aistudio.ContextWithAccountLease(ctx, lease)
-		if admin.workers.refresher.Available(renewCtx) && admin.workers.refresher.Refresh(renewCtx) == nil {
-			admin.requests.log(account.Config.Label, "INFO", "Account verification | Re-visiting AI Studio after renewal")
-			verification, err = admin.login.Verify(ctx, admin.loginRequest(account, account.Directory), account.StorageState)
-		}
-	}
+	account, err := admin.account(accountID)
 	if err != nil {
-		admin.requests.log(account.Config.Label, "ERROR", fmt.Sprintf(
-			"Account verification failed | duration=%s | error=%s",
-			time.Since(startedAt).Round(time.Millisecond), strings.TrimSpace(err.Error()),
-		))
-		return api.AdminAccount{}, errors.Join(err, lease.Release())
+		return api.AdminAccountRefresh{}, err
 	}
-
-	err = admin.service.changeModels(func() error {
-		if verification.Authenticated {
-			return errors.Join(
-				admin.pool.MarkReady(account.ID),
-				admin.pool.ResetModelAccess(account.ID),
-				admin.pool.SetCatalog(account.ID, account.BenefitTier, nil),
-			)
-		}
-
-		reason := strings.TrimSpace(verification.Reason)
-		if reason == "" {
-			reason = "AI Studio login expired"
-		}
-
-		return admin.pool.MarkAuthRequired(account.ID, reason)
-	})
-	if err != nil {
-		return api.AdminAccount{}, errors.Join(err, lease.Release())
-	}
-
-	if err := lease.Release(); err != nil {
-		return api.AdminAccount{}, err
-	}
-
-	if verification.Authenticated {
-		admin.syncAccountModelCatalog(ctx, account)
-	} else {
-		admin.service.publishModelAccess()
-	}
-
-	admin.requests.log(account.Config.Label, "INFO", fmt.Sprintf(
-		"Account verification completed | authenticated=%t | duration=%s",
-		verification.Authenticated, time.Since(startedAt).Round(time.Millisecond),
-	))
-
-	return admin.account(account.ID)
+	return api.AdminAccountRefresh{
+		Account: account, PreviousTier: refresh.PreviousTier.String(), Tier: refresh.Tier.String(),
+		PreviousModels: refresh.PreviousModels, Models: refresh.Models,
+	}, nil
 }
 
 // StartService starts the generation service using the manager's lifecycle.
@@ -843,20 +806,31 @@ func (admin *runtimeAdmin) account(accountID string) (api.AdminAccount, error) {
 	return api.AdminAccount{}, accountOperationError(fmt.Errorf("%w: %s", aistudio.ErrAccountNotFound, accountID))
 }
 
+func (admin *runtimeAdmin) proxyPoolStatus() []api.AdminProxy {
+	statuses := admin.proxies.Status()
+	pool := make([]api.AdminProxy, 0, len(statuses))
+	for _, status := range statuses {
+		pool = append(pool, api.AdminProxy{
+			Proxy: status.Proxy, Available: status.Available, Accounts: status.Accounts, CheckedAt: status.CheckedAt, Error: status.Error,
+		})
+	}
+	return pool
+}
+
 func (admin *runtimeAdmin) effectiveProxy(accountProxy string) string {
 	if proxy := strings.TrimSpace(accountProxy); proxy != "" {
 		return proxy
 	}
-	return strings.TrimSpace(admin.config.Proxy)
+	if proxy := admin.proxies.Next(); proxy != "" {
+		return proxy
+	}
+	return admin.globalProxy
 }
 
 func (admin *runtimeAdmin) loginRequest(account *aistudio.Account, directory string) aistudio.IsolatedLoginRequest {
 	return aistudio.IsolatedLoginRequest{
-		AccountID: account.ID,
-		Directory: directory,
-		Proxy:     admin.effectiveProxy(account.Config.Proxy),
-		Locale:    account.Config.Locale,
-		Timezone:  account.Config.Timezone,
+		AccountID: account.ID, Directory: directory, Proxy: account.EffectiveProxy(admin.globalProxy),
+		Locale: account.Config.Locale, Timezone: account.Config.Timezone,
 	}
 }
 
@@ -865,16 +839,9 @@ func adminAccountDTO(status aistudio.AccountStatus) api.AdminAccount {
 	copy(models, status.Models)
 
 	return api.AdminAccount{
-		ID:          status.ID,
-		Label:       status.Label,
-		Enabled:     status.Enabled,
-		State:       string(status.State),
-		Proxy:       status.Proxy,
-		Locale:      status.Locale,
-		Timezone:    status.Timezone,
-		Models:      models,
-		BenefitTier: status.BenefitTier,
-		Message:     status.Message,
+		ID: status.ID, Label: status.Label, Enabled: status.Enabled, State: string(status.State),
+		Proxy: status.Proxy, Egress: status.Egress, Locale: status.Locale, Timezone: status.Timezone,
+		Models: models, BenefitTier: status.BenefitTier, Message: status.Message,
 	}
 }
 
@@ -910,11 +877,11 @@ func (admin *runtimeAdmin) RuntimeConfig(context.Context) (api.RuntimeConfig, er
 	if err != nil {
 		return api.RuntimeConfig{}, err
 	}
-
-	return runtimeConfigDTO(cfg), nil
+	value := runtimeConfigDTO(cfg)
+	value.ActiveProxy = admin.config.Proxy
+	value.ProxyPool = admin.proxyPoolStatus()
+	return value, nil
 }
-
-
 
 func (admin *runtimeAdmin) Cooldowns(context.Context) ([]api.AdminCooldown, error) {
 	statuses := admin.pool.Status()
@@ -957,6 +924,8 @@ func (admin *runtimeAdmin) Cooldowns(context.Context) ([]api.AdminCooldown, erro
 			modelID, build := strings.CutPrefix(key, string(aistudio.ChannelBuild)+":")
 			if build {
 				channel = string(aistudio.ChannelBuild)
+			} else if admin.pool.AssistantModel(modelID) {
+				channel = string(aistudio.ChannelAssistant)
 			}
 			cooldowns = append(cooldowns, api.AdminCooldown{
 				AccountID: account.ID, AccountLabel: account.Label, Channel: channel,
@@ -1572,6 +1541,8 @@ func runtimeConfigDTO(cfg config.Config) api.RuntimeConfig {
 		AdminPasswordSet:       cfg.AdminPassword != "",
 		SavedAdminPassword:     cfg.AdminPassword,
 		BuildNativeNonstream:   cfg.BuildNativeNonstream,
+		LogFile:                cfg.LogFile,
+		LogMaxTotalMB:          cfg.LogMaxTotalMB,
 		AuthStates:             cfg.AuthStates,
 		ListenAddr:             cfg.ListenAddr,
 		APIKey:                 cfg.ProxyAPIKey,
@@ -1586,6 +1557,7 @@ func runtimeConfigDTO(cfg config.Config) api.RuntimeConfig {
 		PerAccountConcurrency:  cfg.PerAccountConcurrency,
 		RoutingStrategy:        cfg.RoutingStrategy,
 		UpstreamChannels:       cfg.UpstreamChannels,
+		ModelMapping:           cfg.ModelMapping,
 		TemporaryChat:          cfg.TemporaryChat,
 		Headless:               cfg.Headless,
 		WAABackend:             cfg.WAABackend,

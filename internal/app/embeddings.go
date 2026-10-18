@@ -12,6 +12,7 @@ import (
 
 // Embed tracks account, channel, and input tokens used for Build channel embedding
 func (service *trackedService) Embed(ctx context.Context, request aistudio.EmbeddingRequest) (aistudio.EmbeddingResult, error) {
+	request.Model = service.mappedModel(request.Model)
 	api.SetAccessLogTarget(ctx, request.Model, "")
 	api.StartAccessLog(ctx)
 	request.Model = service.pool.CanonicalModelID(request.Model)

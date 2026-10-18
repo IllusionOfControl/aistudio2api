@@ -126,6 +126,11 @@ type RPCError struct {
 	RetryDelay time.Duration
 }
 
+// ContextOverflow returns whether the error indicates upstream input token count exceeded the model limit.
+func (e *RPCError) ContextOverflow() bool {
+	return e.StatusCode == http.StatusBadRequest && strings.Contains(e.Message, "input token count exceeds the maximum number of tokens allowed")
+}
+
 // Error returns a structured upstream error
 func (e *RPCError) Error() string {
 	if e.Code != 0 {
@@ -137,6 +142,14 @@ func (e *RPCError) Error() string {
 // HTTPStatus returns the upstream HTTP status
 func (e *RPCError) HTTPStatus() int {
 	return e.StatusCode
+}
+
+// RetryAt returns the retry time specified by upstream, or zero time when no retry delay is provided.
+func (e *RPCError) RetryAt(now time.Time) time.Time {
+	if e.RetryDelay <= 0 {
+		return time.Time{}
+	}
+	return now.Add(e.RetryDelay)
 }
 
 func (c *Client) do(ctx context.Context, method string, accountID string, requestID string, body []byte, streaming bool) (*RPCResponse, error) {

@@ -393,7 +393,7 @@ Scheduling selection sequence:
 3. If active workers lack capacity, start standby account workers up to `MAX_ACTIVE_WORKERS`; when at capacity, launch replacement workers before terminating least recently used idle workers.
 4. If worker startup fails or requests cancel, retain existing workers; if old worker termination fails, retain both instances in capacity accounting; queue requests when all candidates are busy.
 
-HTTP 403 Code 7 preserves verified status for that model/scope. Requests unpinned to an account retry across subsequent candidate accounts prior to the first upstream semantic event; pinned requests, resource-bound operations, and active streams forward the upstream error. HTTP 404 Code 5 with `Ambiguous request for service ''`, local worker crashes, or worker replacements trigger worker recreation and a single replay.
+HTTP 403 Code 7 preserves verified status for that model/scope. Requests unpinned to an account retry across subsequent candidate accounts prior to the first upstream semantic event, as do unpinned non-streaming requests experiencing upstream stream interruption mid-flight; pinned requests, resource-bound operations, and active streams forward the upstream error. HTTP 404 Code 5 with `Ambiguous request for service ''`, local worker crashes, or worker replacements trigger worker recreation and a single replay.
 
 Credential persistence uses `authGeneration` and `checkedAt`; model verification and cooldowns use `modelAccessGeneration` and `checked_at`. Updates apply only when generations match and timestamps are not older than current state. Catalog, tier, or credential modifications increment respective generation counters.
 

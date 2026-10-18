@@ -362,10 +362,11 @@ func (store *Store) scan(ctx context.Context, part segment, filters api.UsageFil
 	return errors.Join(rows.Err(), rows.Close())
 }
 
-// cost stores estimated USD cost based on API unit pricing along with per-bucket cost breakdowns
+// cost stores estimated USD cost based on API unit pricing along with per-bucket cost breakdowns and unpriced models with tokens
 type cost struct {
-	total   float64
-	buckets []float64
+	total    float64
+	buckets  []float64
+	unpriced map[string]bool
 }
 
 // scanCost scans raw records to accumulate filtered costs in [from, to) based on model pricing; accumulates into buckets when starts is non-empty
@@ -376,12 +377,15 @@ func (store *Store) scanCost(ctx context.Context, from, to int64, starts []int64
 	if err != nil {
 		return cost{}, err
 	}
-	result := cost{buckets: make([]float64, len(starts))}
+	result := cost{buckets: make([]float64, len(starts)), unpriced: map[string]bool{}}
 	var at, input, cached, output int64
 	var model string
 	for rows.Next() {
 		if err := rows.Scan(&at, &model, &input, &cached, &output); err != nil {
 			return cost{}, errors.Join(err, rows.Close())
+		}
+		if input+output > 0 && !pricing.Priced(model) {
+			result.unpriced[model] = true
 		}
 		value := pricing.Cost(model, input, cached, output)
 		result.total += value
@@ -464,9 +468,11 @@ func (store *Store) Usage(ctx context.Context, query api.UsageQuery) (api.UsageR
 	if err != nil {
 		return api.UsageReport{}, err
 	}
+	unpriced := slices.AppendSeq([]string{}, maps.Keys(current.unpriced))
+	slices.Sort(unpriced)
 	report := api.UsageReport{
 		From: query.From.UTC(), To: query.To.UTC(), BucketSeconds: int64(query.Bucket / time.Second), GeneratedAt: now.UTC(),
-		Totals: totals.stats(), Previous: previous.stats(), Cost: current.total, PreviousCost: before.total, StackBy: query.Stack,
+		Totals: totals.stats(), Previous: previous.stats(), Cost: current.total, PreviousCost: before.total, UnpricedModels: unpriced, StackBy: query.Stack,
 		Recent:  api.UsageRecent{Minutes: int(recentWindow / time.Minute), Requests: recent.requests, Tokens: recent.totalTokens},
 		Buckets: make([]api.UsageBucket, len(starts)), Groups: map[string][]api.UsageGroup{}, Pairs: []api.UsagePair{},
 	}

@@ -1,7 +1,7 @@
 export type Locale = 'zh-CN' | 'zh-TW' | 'en' | 'ja' | 'ko' | 'fr' | 'de'
 
 export type TabID =
-  'logs' | 'accounts' | 'models' | 'requests' | 'usage' | 'settings' | 'playground'
+  'logs' | 'accounts' | 'models' | 'requests' | 'usage' | 'settings' | 'playground' | 'version'
 
 export type AccountState =
   'ready' | 'busy' | 'cooldown' | 'auth_required' | 'unavailable' | 'disabled'
@@ -12,11 +12,28 @@ export interface Account {
   enabled: boolean
   state: AccountState
   proxy: string
+  egress: string
   locale: string
   timezone: string
   models: string[]
   benefit_tier: string
   message: string
+}
+
+export interface ProxyPoolEntry {
+  proxy: string
+  available: boolean
+  accounts: number
+  checked_at?: string
+  error?: string
+}
+
+export interface AccountRefresh {
+  account: Account
+  previous_tier: string
+  tier: string
+  previous_models: number
+  models: number
 }
 
 export interface AccountDraft {
@@ -65,6 +82,19 @@ export interface ServiceStatus {
   version: string
   active_requests: number
   accounts: AccountCounters
+}
+
+export interface UpdateStatus {
+  current: string
+  latest?: string
+  available: boolean
+  mode: 'binary' | 'container' | 'development'
+  notes?: string
+  url?: string
+  published_at?: string
+  checked_at?: string
+  error?: string
+  updating: boolean
 }
 
 export interface AdminLog {
@@ -122,7 +152,7 @@ export interface Model {
   channels?: UpstreamChannel[]
 }
 
-export type UpstreamChannel = 'playground' | 'build'
+export type UpstreamChannel = 'playground' | 'build' | 'assistant'
 
 export interface Cooldown {
   account_id: string
@@ -148,6 +178,8 @@ export interface RequestSummary {
 export interface ServiceConfig {
   auto_start: boolean
   request_body_log: boolean
+  log_file: boolean
+  log_max_total_mb: number
   admin_auth_enabled: boolean
   admin_username: string
   admin_password?: string
@@ -161,6 +193,8 @@ export interface ServiceConfig {
   management_restart_required: boolean
   service_restart_required: boolean
   proxy: string
+  active_proxy: string
+  proxy_pool: ProxyPoolEntry[]
   init_timeout: string
   request_timeout: string
   warm_worker_limit: number
@@ -169,6 +203,7 @@ export interface ServiceConfig {
   per_account_concurrency: number
   routing_strategy: 'round-robin' | 'fill-first'
   upstream_channels: UpstreamChannel[]
+  model_mapping: string
   waa_backend: 'camoufox' | 'go'
   temporary_chat: boolean
   headless: boolean
@@ -233,6 +268,7 @@ export interface UsageReport {
   previous: UsageStats
   cost: number
   previous_cost: number
+  unpriced_models: string[]
   recent: { minutes: number; requests: number; tokens: number }
   buckets: UsageBucket[]
   stack_by: UsageDimension

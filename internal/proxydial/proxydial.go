@@ -25,19 +25,26 @@ type connectDialer struct {
 	direct      *net.Dialer
 }
 
+// Address returns the dial address of the proxy, defaulting omitted ports for HTTP and HTTPS proxies.
+func Address(proxyURL *url.URL) string {
+	if proxyURL.Port() != "" {
+		return proxyURL.Host
+	}
+	switch strings.ToLower(proxyURL.Scheme) {
+	case "http":
+		return net.JoinHostPort(proxyURL.Hostname(), "80")
+	case "https":
+		return net.JoinHostPort(proxyURL.Hostname(), "443")
+	}
+	return proxyURL.Host
+}
+
 // Dialer returns a dialer establishing TCP connections through proxy, supporting HTTP/HTTPS CONNECT and SOCKS5 with authentication
 func Dialer(proxyURL *url.URL) (proxy.ContextDialer, error) {
 	direct := &net.Dialer{Timeout: connectTimeout, KeepAlive: 30 * time.Second}
-	proxyTarget := proxyURL.Host
-	if proxyURL.Port() == "" {
-		switch strings.ToLower(proxyURL.Scheme) {
-		case "http":
-			proxyTarget = net.JoinHostPort(proxyURL.Hostname(), "80")
-		case "https":
-			proxyTarget = net.JoinHostPort(proxyURL.Hostname(), "443")
-		case "socks5":
-			return nil, fmt.Errorf("SOCKS5 proxy URL missing port")
-		}
+	proxyTarget := Address(proxyURL)
+	if proxyURL.Port() == "" && strings.EqualFold(proxyURL.Scheme, "socks5") {
+		return nil, fmt.Errorf("SOCKS5 proxy URL missing port")
 	}
 	if strings.EqualFold(proxyURL.Scheme, "socks5") {
 		var auth *proxy.Auth

@@ -7,6 +7,8 @@ import (
 	"io"
 	"maps"
 	"net/http"
+	"net/url"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -42,23 +44,49 @@ func newRuntime(
 	if err := launchCtx.Err(); err != nil {
 		return nil, nil, nil, err
 	}
-	camoufoxPath, login, err := prepareWAABackend(launchCtx, cfg, requests, len(accounts))
+	egress := "direct"
+	proxyList := config.ProxyList(cfg.Proxy)
+	if len(proxyList) == 0 {
+		if system := systemProxy(); system != "" {
+			proxyList = []string{system}
+			egress = redactedProxy(system) + " | source=system_proxy"
+		}
+	} else {
+		redacted := make([]string, 0, len(proxyList))
+		for _, proxy := range proxyList {
+			redacted = append(redacted, redactedProxy(proxy))
+		}
+		egress = strings.Join(redacted, ",")
+	}
+	globalProxy := ""
+	if len(proxyList) > 0 {
+		globalProxy = proxyList[0]
+	}
+	cfg.Proxy = strings.Join(proxyList, ",")
+	camoufoxPath, login, err := prepareWAABackend(launchCtx, cfg, requests, len(accounts), globalProxy)
 	if err != nil {
 		return nil, nil, nil, err
 	}
-
-	requests.log("service", "INFO", "Runtime assembly | 3/3 | Creating protocol clients")
-
+	requests.log("service", "INFO", "Runtime assembly | 3/3 | Creating protocol clients | egress="+egress)
 	pool := aistudio.NewAccountPool(accounts, cfg.PerAccountConcurrency)
 	pool.SetRoutingStrategy(cfg.RoutingStrategy)
 	pool.SetUpstreamChannels(upstreamChannels(cfg.UpstreamChannels))
-	headers, err := newAccountHeaderProvider(accounts, cfg.Proxy)
+	proxies := aistudio.NewProxyPool(pool, proxyList)
+	if len(proxyList) > 1 {
+		if _, err := proxies.Probe(launchCtx, checkProxy); err != nil {
+			return nil, nil, nil, err
+		}
+	}
+	if _, err := proxies.Assign(); err != nil {
+		return nil, nil, nil, err
+	}
+	headers, err := newAccountHeaderProvider(accounts, globalProxy)
 	if err != nil {
 		return nil, nil, nil, err
 	}
 
 	transport, err := aistudio.NewMakerSuiteHTTPTransport(aistudio.HTTPTransportOptions{
-		Pool: pool, Signer: aistudio.NewSigner(), Headers: headers, GlobalProxy: cfg.Proxy,
+		Pool: pool, Signer: aistudio.NewSigner(), Headers: headers, GlobalProxy: globalProxy,
 	})
 	if err != nil {
 		headers.Close()
@@ -66,7 +94,7 @@ func newRuntime(
 	}
 
 	workers := newAccountWorkerManager(
-		pool, accounts, requests, camoufoxPath, cfg.Proxy, cfg.InitTimeout,
+		pool, accounts, requests, camoufoxPath, globalProxy, cfg.InitTimeout,
 		cfg.WarmWorkerLimit, cfg.MaxActiveWorkers, cfg.WarmStartupConcurrency, cfg.TemporaryChat, cfg.Headless,
 	)
 
@@ -85,8 +113,7 @@ func newRuntime(
 		headers.Close()
 		return nil, nil, nil, errors.Join(err, workers.Close())
 	}
-
-	refresher := newAuthRuntimeRefresher(workers, headers, requests, cfg.Proxy)
+	refresher := newAuthRuntimeRefresher(workers, headers, requests, globalProxy)
 	workers.refresher = refresher
 	client, err := aistudio.NewClient(aistudio.ClientOptions{
 		Transport:       &authRetryTransport{transport: transport, refresher: refresher},
@@ -108,14 +135,22 @@ func newRuntime(
 	pooled.BuildNativeNonstream = cfg.BuildNativeNonstream
 	service := newTrackedService(lifecycle, pooled, pool, requests, workers, cfg.RequestTimeout)
 	service.buildNativeNonstream = cfg.BuildNativeNonstream
+	service.modelMapping, _ = config.ParseModelMapping(cfg.ModelMapping)
 	admin := newRuntimeAdmin(lifecycle, pool, store, service, requests, login, workers, headers, cfg)
-
+	admin.proxies, admin.globalProxy = proxies, globalProxy
+	service.proxies, service.rebindAccounts = proxies, admin.rebindAccounts
+	workers.proxyFailed = service.reportProxyFailure
+	probeCtx, stopProbe := context.WithCancel(lifecycle)
+	if len(proxyList) > 1 {
+		go admin.probeProxies(probeCtx)
+	}
 	requests.log("service", "INFO", fmt.Sprintf(
 		"Protocol runtime ready | accounts=%d | duration=%s",
 		len(accounts), time.Since(startedAt).Round(time.Millisecond),
 	))
 
 	closeRuntime := func() error {
+		stopProbe()
 		err := workers.Close()
 		transport.CloseIdleConnections()
 		headers.Close()
@@ -127,34 +162,34 @@ func newRuntime(
 
 // accountWorkerManager manages resident WAA workers per account.
 type accountWorkerManager struct {
-	mu              sync.RWMutex
-	fillMu          sync.Mutex
-	rebalanceMu     sync.Mutex
-	pool            *aistudio.AccountPool
-	accounts        map[string]*accountWorker
-	openings        map[string]chan struct{}
-	requests        *requestRegistry
-	refresher       *authRuntimeRefresher
-	camoufox        string
-	globalProxy     string
-	initTimeout     time.Duration
-	warmTarget      int
-	maxActive       int
-	warmConcurrency int
-	startupSlots    chan struct{}
-	temporaryChat   bool
-	headless        bool
-	lifecycle       context.Context
-	cancel          context.CancelFunc
-	closed          bool
-	signalMu        sync.Mutex
-	signal          chan struct{}
-	dispatch        *dispatchQueue
-	victimMu        sync.Mutex
-	victims         map[string]struct{}
-	backgroundMu    sync.Mutex
-	background      context.Context
-	stopBackground  context.CancelFunc
+	mu             sync.RWMutex
+	fillMu         sync.Mutex
+	rebalanceMu    sync.Mutex
+	pool           *aistudio.AccountPool
+	accounts       map[string]*accountWorker
+	openings       map[string]chan struct{}
+	requests       *requestRegistry
+	refresher      *authRuntimeRefresher
+	proxyFailed    func(proxy string, accountID string, err error)
+	camoufox       string
+	globalProxy    string
+	initTimeout    time.Duration
+	warmTarget     atomic.Int64
+	maxActive      atomic.Int64
+	startup        startupLimiter
+	temporaryChat  bool
+	headless       bool
+	lifecycle      context.Context
+	cancel         context.CancelFunc
+	closed         bool
+	signalMu       sync.Mutex
+	signal         chan struct{}
+	dispatch       *dispatchQueue
+	victimMu       sync.Mutex
+	victims        map[string]struct{}
+	backgroundMu   sync.Mutex
+	background     context.Context
+	stopBackground context.CancelFunc
 }
 
 type accountWorker struct {
@@ -261,6 +296,7 @@ func (preparer *accountWorkerPreparer) current() bool {
 type accountWorkerInitError struct {
 	err         error
 	authHandled bool
+	proxy       string
 }
 
 func (err *accountWorkerInitError) Error() string {
@@ -285,21 +321,17 @@ func newAccountWorkerManager(
 	temporaryChat bool,
 	headless bool,
 ) *accountWorkerManager {
-	if camoufoxPath == "" {
-		warmConcurrency = max(maxActive, 1)
-	}
 	lifecycle, cancel := context.WithCancel(context.Background())
 
 	manager := &accountWorkerManager{
 		pool: pool, accounts: make(map[string]*accountWorker, len(accounts)), requests: requests, camoufox: camoufoxPath,
-		globalProxy: globalProxy, initTimeout: initTimeout,
-		warmTarget: warmTarget, maxActive: maxActive, warmConcurrency: warmConcurrency, temporaryChat: temporaryChat,
-		headless:     headless,
-		startupSlots: make(chan struct{}, max(warmConcurrency, 1)),
-		openings:     make(map[string]chan struct{}),
-		lifecycle:    lifecycle, cancel: cancel, signal: make(chan struct{}), dispatch: newDispatchQueue(),
+		globalProxy: globalProxy, initTimeout: initTimeout, temporaryChat: temporaryChat,
+		headless:  headless,
+		openings:  make(map[string]chan struct{}),
+		lifecycle: lifecycle, cancel: cancel, signal: make(chan struct{}), dispatch: newDispatchQueue(),
 		victims: make(map[string]struct{}),
 	}
+	manager.setLimits(warmTarget, maxActive, warmConcurrency)
 	manager.background, manager.stopBackground = context.WithCancel(lifecycle)
 	for _, account := range accounts {
 		if account == nil {
@@ -312,6 +344,36 @@ func newAccountWorkerManager(
 	return manager
 }
 
+// SetCapacity sets resident worker target, peak worker limit, and Camoufox startup concurrency, then terminates idle workers exceeding peak limit.
+func (manager *accountWorkerManager) SetCapacity(warmTarget int, maxActive int, startupConcurrency int) {
+	manager.setLimits(warmTarget, maxActive, startupConcurrency)
+	manager.dispatch.wakeHeads()
+	go func() {
+		for manager.reapIdleWorker(time.Now().Add(-workerIdleTimeout)) {
+		}
+	}()
+}
+
+// setLimits saves worker count limits; for pure-Go backend, concurrently starting workers are only bounded by peak limit.
+func (manager *accountWorkerManager) setLimits(warmTarget int, maxActive int, startupConcurrency int) {
+	if manager.camoufox == "" {
+		startupConcurrency = maxActive
+	}
+	manager.warmTarget.Store(int64(warmTarget))
+	manager.maxActive.Store(int64(maxActive))
+	manager.startup.setLimit(max(startupConcurrency, 1))
+}
+
+// warmLimit returns resident worker count target.
+func (manager *accountWorkerManager) warmLimit() int {
+	return int(manager.warmTarget.Load())
+}
+
+// activeLimit returns peak worker limit.
+func (manager *accountWorkerManager) activeLimit() int {
+	return int(manager.maxActive.Load())
+}
+
 // expandInBackground starts a worker for the account in the background; once ready, queued requests are woken by scheduling signal
 func (manager *accountWorkerManager) expandInBackground(accountID string, modelID string) {
 	ctx := manager.backgroundContext()
@@ -322,6 +384,10 @@ func (manager *accountWorkerManager) expandInBackground(accountID string, modelI
 			return
 		}
 		manager.requests.log(accountID, "WARN", fmt.Sprintf("WAA worker background expansion failed | error=%v", err))
+		var startup *accountWorkerInitError
+		if manager.proxyFailed != nil && errors.As(err, &startup) && proxyNetworkError(ctx, err) {
+			manager.proxyFailed(startup.proxy, accountID, err)
+		}
 	}()
 }
 
@@ -422,11 +488,12 @@ func (manager *accountWorkerManager) reapIdleWorkers() {
 	}
 }
 
-// reapIdleWorker closes one surplus idle worker whose last usage was before the specified cutoff, and returns whether it was closed
+// reapIdleWorker closes one surplus idle worker and returns whether it was closed: immediately closes when exceeding peak limit, otherwise closes only workers whose last usage was before cutoff.
 func (manager *accountWorkerManager) reapIdleWorker(before time.Time) bool {
 	manager.rebalanceMu.Lock()
 	defer manager.rebalanceMu.Unlock()
-	if len(manager.openings) > 0 || len(manager.WarmAccountIDs()) <= manager.warmTarget {
+	warm := len(manager.WarmAccountIDs())
+	if len(manager.openings) > 0 || warm <= manager.warmLimit() {
 		return false
 	}
 	victim := manager.idleWarmVictim("")
@@ -437,7 +504,8 @@ func (manager *accountWorkerManager) reapIdleWorker(before time.Time) bool {
 	account := manager.accounts[victim]
 	manager.mu.RUnlock()
 	_, lastUsed := manager.pool.Activity(victim)
-	if lastUsed.After(before) || account != nil && time.Unix(0, account.readyAt.Load()).After(before) {
+	if warm <= manager.activeLimit() &&
+		(lastUsed.After(before) || account != nil && time.Unix(0, account.readyAt.Load()).After(before)) {
 		return false
 	}
 	evicted, err := manager.evictIdleWorker(manager.lifecycle, victim)
@@ -447,7 +515,7 @@ func (manager *accountWorkerManager) reapIdleWorker(before time.Time) bool {
 	}
 	if evicted {
 		manager.requests.log("service", "INFO", fmt.Sprintf(
-			"WAA worker idle eviction | workers=%d/%d", len(manager.WarmAccountIDs()), manager.maxActive,
+			"WAA worker idle eviction | workers=%d/%d", len(manager.WarmAccountIDs()), manager.activeLimit(),
 		))
 	}
 	return evicted
@@ -757,7 +825,7 @@ func (manager *accountWorkerManager) workerConfigFor(
 ) camoufoxnative.Options {
 	proxy := strings.TrimSpace(config.Proxy)
 	if proxy == "" {
-		proxy = strings.TrimSpace(manager.globalProxy)
+		proxy = account.PoolProxy(manager.globalProxy)
 	}
 
 	return camoufoxnative.Options{
@@ -891,8 +959,7 @@ func (manager *accountWorkerManager) PrewarmTarget() int {
 			available++
 		}
 	}
-
-	return min(manager.warmTarget, available)
+	return min(manager.warmLimit(), available)
 }
 
 func (manager *accountWorkerManager) classifyBootstrapCandidates(
@@ -1100,14 +1167,12 @@ func (manager *accountWorkerManager) startReservedWorker(
 		ownsLease = true
 		manager.clearRuntimeBusy(account)
 	}
-	select {
-	case manager.startupSlots <- struct{}{}:
-	case <-ctx.Done():
+	if err := manager.startup.acquire(ctx); err != nil {
 		if ownsLease {
 			_ = runtimeLease.Release()
 		}
 		account.startupMu.Unlock()
-		return nil, ctx.Err()
+		return nil, err
 	}
 	manager.requests.log(label, "INFO", "WAA worker startup | 1/7 | Initializing page | page_model="+bootstrapModel)
 	initCtx, cancel := context.WithTimeout(ctx, manager.initTimeout)
@@ -1118,7 +1183,7 @@ func (manager *accountWorkerManager) startReservedWorker(
 	}
 	worker, initErr := newWAAWorker(initCtx, account.id, options)
 	cancel()
-	<-manager.startupSlots
+	manager.startup.release()
 	if initErr != nil {
 		if ownsLease {
 			_ = runtimeLease.Release()
@@ -1131,7 +1196,7 @@ func (manager *accountWorkerManager) startReservedWorker(
 			"WAA worker startup failed | page_model=%s | duration=%s | error=%s",
 			bootstrapModel, time.Since(startedAt).Round(time.Millisecond), strings.TrimSpace(initErr.Error()),
 		))
-		return nil, &accountWorkerInitError{err: initErr}
+		return nil, &accountWorkerInitError{err: initErr, proxy: options.Proxy}
 	}
 
 	return &accountWorkerPreparer{
@@ -1401,7 +1466,7 @@ func (manager *accountWorkerManager) ensureWorker(
 		}
 
 		_, replacing := occupied[accountID]
-		if replacing || occupancy.slots < manager.maxActive {
+		if replacing || occupancy.slots < manager.activeLimit() {
 			opening := make(chan struct{})
 			manager.openings[accountID] = opening
 			manager.rebalanceMu.Unlock()
@@ -1417,10 +1482,9 @@ func (manager *accountWorkerManager) ensureWorker(
 			manager.finishOpening(accountID, opening)
 			warmCount := len(manager.WarmAccountIDs())
 			manager.rebalanceMu.Unlock()
-
-			if err == nil && warmCount > manager.warmTarget {
+			if err == nil && warmCount > manager.warmLimit() {
 				manager.requests.log("service", "INFO", fmt.Sprintf(
-					"WAA worker scaled up on demand | workers=%d/%d", warmCount, manager.maxActive,
+					"WAA worker scaled up on demand | workers=%d/%d", warmCount, manager.activeLimit(),
 				))
 			}
 			return preparer, err
@@ -1489,9 +1553,9 @@ func (manager *accountWorkerManager) ensureWorker(
 				if activationErr != nil {
 					return nil, activationErr
 				}
-				if warmCount > manager.warmTarget {
+				if warmCount > manager.warmLimit() {
 					manager.requests.log("service", "INFO", fmt.Sprintf(
-						"WAA worker replaced on demand | workers=%d/%d", warmCount, manager.maxActive,
+						"WAA worker replaced on demand | workers=%d/%d", warmCount, manager.activeLimit(),
 					))
 				}
 				return pending, nil
@@ -1633,7 +1697,8 @@ func (manager *accountWorkerManager) fillWarm(ctx context.Context, first chan<- 
 		}
 
 		warm := manager.WarmAccountIDs()
-		if len(warm) >= manager.warmTarget {
+		limit := manager.warmLimit()
+		if len(warm) >= limit {
 			manager.requests.log("service", "INFO", fmt.Sprintf(
 				"WAA worker prewarming completed | workers=%d/%d | duration=%s",
 				len(warm), manager.PrewarmTarget(), time.Since(startedAt).Round(time.Millisecond),
@@ -1641,10 +1706,8 @@ func (manager *accountWorkerManager) fillWarm(ctx context.Context, first chan<- 
 			notify(nil)
 			return
 		}
-
-		remaining := manager.warmTarget - len(warm)
-		batchSize := min(manager.warmConcurrency, remaining)
-
+		remaining := limit - len(warm)
+		batchSize := min(manager.startup.size(), remaining)
 		groups, err := manager.classifyBootstrapCandidates(ctx, warm)
 		var runtimeBusyErr error
 		if err != nil {
@@ -1916,7 +1979,7 @@ func (provider *accountHeaderProvider) prepareUpdate(
 
 	proxy := strings.TrimSpace(config.Proxy)
 	if proxy == "" {
-		proxy = strings.TrimSpace(provider.globalProxy)
+		proxy = account.PoolProxy(provider.globalProxy)
 	}
 
 	client, err := aistudio.NewProxyHTTPClient(proxy)
@@ -2030,6 +2093,9 @@ func (provider *accountHeaderProvider) ProtocolHeaders(ctx context.Context, acco
 // trackedService tracks generation requests and their exclusive account leases.
 type trackedService struct {
 	buildNativeNonstream bool
+	modelMapping         []config.ModelAlias
+	proxies              *aistudio.ProxyPool
+	rebindAccounts       func([]string)
 	lifecycle            context.Context
 	service              aistudio.Service
 	catalog              modelCatalogService
@@ -2053,11 +2119,13 @@ type trackedService struct {
 	modelChangeMu        sync.Mutex
 	modelRevision        uint64
 	modelApplied         uint64
+	stateRefreshMu       sync.Mutex
+	stateRefreshAt       map[string]time.Time
 }
 
 type modelCatalogService interface {
 	RefreshAccountModels(context.Context, string) ([]aistudio.Model, error)
-	RefreshAccountTier(context.Context, string) (aistudio.BenefitTier, aistudio.BenefitTier, error)
+	RefreshAccountState(context.Context, string, bool) (aistudio.AccountRefresh, error)
 	CachedModels() []aistudio.Model
 }
 
@@ -2072,18 +2140,15 @@ func newTrackedService(
 ) *trackedService {
 	catalog := service.(modelCatalogService)
 	return &trackedService{
-		lifecycle:    lifecycle,
-		service:      service,
-		catalog:      catalog,
-		pool:         pool,
-		requests:     requests,
-		workers:      workers,
-		timeout:      timeout,
-		modelRetries: make(map[string]struct{}),
+		lifecycle: lifecycle, service: service, catalog: catalog, pool: pool, requests: requests, workers: workers,
+		timeout: timeout, modelRetries: make(map[string]struct{}), stateRefreshAt: make(map[string]time.Time),
 	}
 }
 
-type serviceStoppedError struct{}
+// serviceStoppedError indicates the generation service is not running; launching indicates it is currently starting.
+type serviceStoppedError struct {
+	launching bool
+}
 
 var errServiceTransitioning = errors.New("generation service is transitioning states")
 
@@ -2092,12 +2157,15 @@ const (
 	serviceLaunching
 	serviceRunning
 	modelCatalogRetryInterval        = 30 * time.Second
-	benefitTierRefreshInterval       = 10 * time.Minute
+	accountStateRefreshInterval      = 10 * time.Minute
 	modelCatalogShutdownTimeout      = 2 * time.Second
 	serviceTransitionShutdownTimeout = 12 * time.Second
 )
 
-func (*serviceStoppedError) Error() string {
+func (e *serviceStoppedError) Error() string {
+	if e.launching {
+		return "AIStudio2API generation service is starting"
+	}
 	return "AIStudio2API service is stopped"
 }
 
@@ -2105,7 +2173,10 @@ func (*serviceStoppedError) HTTPStatus() int {
 	return http.StatusServiceUnavailable
 }
 
-func (*serviceStoppedError) ErrorCode() string {
+func (e *serviceStoppedError) ErrorCode() string {
+	if e.launching {
+		return "service_starting"
+	}
 	return "service_stopped"
 }
 
@@ -2462,9 +2533,64 @@ func (service *trackedService) finishStop(transitionDone chan struct{}, modelRef
 	service.lifecycleMu.Unlock()
 }
 
-// Models returns the public catalog that enabled channels can provide.
+// Models returns the public catalog that enabled channels can provide; returns service stopped error when generation service is not running and catalog is empty.
 func (service *trackedService) Models(context.Context) ([]aistudio.Model, error) {
-	return service.pool.PublicModels(service.modelSnapshot()), nil
+	models := service.modelSnapshot()
+	if len(models) == 0 && service.state.Load() != serviceRunning {
+		return nil, &serviceStoppedError{launching: service.state.Load() == serviceLaunching}
+	}
+	return service.withAliases(service.pool.PublicModels(models)), nil
+}
+
+// withAliases adds aliases from MODEL_MAPPING whose targets are in the catalog to the public catalog; fields are copied from the target model, aliases with the same name as a catalog ID replace that entry, and earlier definitions take precedence for duplicate aliases.
+func (service *trackedService) withAliases(models []aistudio.Model) []aistudio.Model {
+	index := make(map[string]int, len(models))
+	for i, model := range models {
+		index[model.ID] = i
+	}
+	targets := slices.Clone(models)
+	done := make(map[string]bool)
+	for _, alias := range service.modelMapping {
+		if done[alias.Alias] {
+			continue
+		}
+		done[alias.Alias] = true
+		target, _, _ := aistudio.ApplyModelSuffix(alias.Model, aistudio.GenerationConfig{})
+		model, ok := api.LookupPublicModel(targets, target)
+		if !ok {
+			continue
+		}
+		model.ID = alias.Alias
+		if i, ok := index[alias.Alias]; ok {
+			models[i] = model
+			continue
+		}
+		index[alias.Alias] = len(models)
+		models = append(models, model)
+	}
+	return models
+}
+
+// mappedModel returns the target model name mapped by an alias in MODEL_MAPPING; if the alias includes a thinking suffix, it replaces any suffix on the target; returns original name if not an alias.
+func (service *trackedService) mappedModel(name string) string {
+	trimmed := strings.TrimPrefix(strings.TrimSpace(name), "models/")
+	for _, alias := range service.modelMapping {
+		if alias.Alias == trimmed {
+			return alias.Model
+		}
+	}
+	open := strings.LastIndex(trimmed, "(")
+	if open <= 0 || !strings.HasSuffix(trimmed, ")") {
+		return name
+	}
+	base := strings.TrimSpace(trimmed[:open])
+	for _, alias := range service.modelMapping {
+		if alias.Alias == base {
+			target, _, _ := aistudio.ApplyModelSuffix(alias.Model, aistudio.GenerationConfig{})
+			return target + trimmed[open:]
+		}
+	}
+	return name
 }
 
 // catalogModels returns the complete catalog and available channels for each model used by the admin page
@@ -2661,6 +2787,19 @@ func (service *trackedService) applyCachedModelCatalog() {
 	}
 }
 
+// ApplyCapacity applies capacity settings to future scheduling and tops up prewarming when resident worker count is increased.
+func (service *trackedService) ApplyCapacity(warmTarget int, maxActive int, startupConcurrency int, perAccountConcurrency int) {
+	service.pool.SetPerAccountConcurrency(perAccountConcurrency)
+	service.workers.SetCapacity(warmTarget, maxActive, startupConcurrency)
+	service.lifecycleMu.Lock()
+	dataContext := service.dataContext
+	running := service.state.Load() == serviceRunning && dataContext != nil && dataContext.Err() == nil
+	service.lifecycleMu.Unlock()
+	if running && len(service.workers.WarmAccountIDs()) < warmTarget {
+		service.workers.StartPrewarm(dataContext)
+	}
+}
+
 func (service *trackedService) syncAccountModels(ctx context.Context, accountID string) ([]aistudio.Model, error) {
 	models, err := service.refreshAccountModelCatalog(ctx, accountID)
 
@@ -2671,18 +2810,18 @@ func (service *trackedService) syncAccountModels(ctx context.Context, accountID 
 	return models, err
 }
 
-// retryModelCatalogs retries unsynced account catalogs every 30 seconds and checks enabled account benefit tiers every 10 minutes
+// retryModelCatalogs retries unsynced account catalogs every 30 seconds and inspects enabled account benefits and catalogs every 10 minutes.
 func (service *trackedService) retryModelCatalogs(ctx context.Context) {
 	ticker := time.NewTicker(modelCatalogRetryInterval)
 	defer ticker.Stop()
-	tierTicker := time.NewTicker(benefitTierRefreshInterval)
-	defer tierTicker.Stop()
+	stateTicker := time.NewTicker(accountStateRefreshInterval)
+	defer stateTicker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-tierTicker.C:
-			service.refreshAccountTiers(ctx)
+		case <-stateTicker.C:
+			service.refreshAccountStates(ctx)
 		case <-ticker.C:
 			if !service.retryAccountModelCatalogs(ctx) {
 				return
@@ -2691,22 +2830,52 @@ func (service *trackedService) retryModelCatalogs(ctx context.Context) {
 	}
 }
 
-// refreshAccountTiers concurrently fetches benefit tiers for enabled accounts, publishing account and model events and logging changes
-func (service *trackedService) refreshAccountTiers(ctx context.Context) {
+// refreshAccountStates concurrently reads benefits and model catalogs for enabled accounts; accounts without free slots skip this round.
+func (service *trackedService) refreshAccountStates(ctx context.Context) {
 	var refreshes sync.WaitGroup
 	for _, accountID := range service.modelCatalogAccountIDs() {
-		refreshes.Go(func() {
-			requestCtx, cancel := service.lifecycleRequestContext(ctx)
-			defer cancel()
-			previous, tier, err := service.catalog.RefreshAccountTier(requestCtx, accountID)
-			if err != nil || previous == tier || ctx.Err() != nil {
-				return
-			}
-			service.publishModelAccess()
-			service.requests.log(accountID, "INFO", fmt.Sprintf("Account benefit tier updated | tier=%s→%s", previous, tier))
-		})
+		refreshes.Go(func() { _, _ = service.refreshAccountState(ctx, accountID, false) })
 	}
 	refreshes.Wait()
+}
+
+// refreshAccountState reads account benefits and model catalog, publishing account and model events and logging on failure or change.
+func (service *trackedService) refreshAccountState(ctx context.Context, accountID string, wait bool) (aistudio.AccountRefresh, error) {
+	requestCtx, cancel := service.lifecycleRequestContext(ctx)
+	defer cancel()
+	refresh, err := service.catalog.RefreshAccountState(requestCtx, accountID, wait)
+	if ctx.Err() != nil || refresh.Skipped {
+		return refresh, err
+	}
+	if err != nil {
+		service.publishModelAccess()
+		service.requests.log(accountID, "WARN", "Account state refresh failed | error="+err.Error())
+		return refresh, err
+	}
+	if refresh.PreviousTier == refresh.Tier && !refresh.ModelsChanged {
+		return refresh, nil
+	}
+	service.modelSyncMu.Lock()
+	service.applyCachedModelCatalog()
+	service.modelSyncMu.Unlock()
+	service.publishModelAccess()
+	service.requests.log(accountID, "INFO", fmt.Sprintf(
+		"Account state updated | tier=%s→%s | models=%d→%d", refresh.PreviousTier, refresh.Tier, refresh.PreviousModels, refresh.Models,
+	))
+	return refresh, nil
+}
+
+// refreshAccountStateAfterLimit reads account benefits and catalog in the background after a subscription model hits quota limits, at most once per minute per account.
+func (service *trackedService) refreshAccountStateAfterLimit(accountID string) {
+	now := time.Now()
+	service.stateRefreshMu.Lock()
+	if now.Sub(service.stateRefreshAt[accountID]) < time.Minute {
+		service.stateRefreshMu.Unlock()
+		return
+	}
+	service.stateRefreshAt[accountID] = now
+	service.stateRefreshMu.Unlock()
+	go func() { _, _ = service.refreshAccountState(service.lifecycle, accountID, false) }()
 }
 
 func (service *trackedService) retryAccountModelCatalogs(ctx context.Context) bool {
@@ -2916,7 +3085,7 @@ func (service *trackedService) observedDataRequestContext(
 
 // CountTokens returns authoritative input token counts from upstream.
 func (service *trackedService) CountTokens(ctx context.Context, request aistudio.TokenCountRequest) (aistudio.TokenCount, error) {
-	model, _, err := aistudio.ApplyModelSuffix(request.Model, aistudio.GenerationConfig{})
+	model, _, err := aistudio.ApplyModelSuffix(service.mappedModel(request.Model), aistudio.GenerationConfig{})
 	if err != nil {
 		return aistudio.TokenCount{}, err
 	}
@@ -2935,6 +3104,7 @@ func (service *trackedService) CountTokens(ctx context.Context, request aistudio
 
 // GenerateVideo creates a long-running Veo task.
 func (service *trackedService) GenerateVideo(ctx context.Context, request aistudio.VideoRequest) (aistudio.VideoOperation, error) {
+	request.Model = service.mappedModel(request.Model)
 	api.SetAccessLogTarget(ctx, request.Model, "")
 	request.Model = service.pool.CanonicalModelID(request.Model)
 	requestCtx, cancel, err := service.dataRequestContext(ctx)
@@ -3193,9 +3363,9 @@ func (service *trackedService) acquireWarmLease(ctx context.Context, selection a
 			continue
 		}
 		warmCandidates := len(warmAvailable) + len(groups.WarmBusy)
-		coolingVictim := len(active) >= service.workers.maxActive &&
+		coolingVictim := len(active) >= service.workers.activeLimit() &&
 			service.workers.idleWarmVictimFor("", selection.ModelID, true) != ""
-		if len(groups.StandbyReady) > 0 && (len(active) < service.workers.maxActive || coolingVictim) && warmCandidates > 0 && !fixedAccount {
+		if len(groups.StandbyReady) > 0 && (len(active) < service.workers.activeLimit() || coolingVictim) && warmCandidates > 0 && !fixedAccount {
 			standby := groups.StandbyReady
 			if cold := service.workers.coldAccounts(standby); len(cold) > 0 {
 				standby = cold
@@ -3206,10 +3376,10 @@ func (service *trackedService) acquireWarmLease(ctx context.Context, selection a
 			}
 			continue
 		}
-		if len(groups.StandbyReady) > 0 && (len(active) < service.workers.maxActive ||
+		if len(groups.StandbyReady) > 0 && (len(active) < service.workers.activeLimit() ||
 			warmCandidates == 0 && service.workers.idleWarmVictim("") != "") {
 			standby := groups.StandbyReady
-			if len(active) < service.workers.maxActive {
+			if len(active) < service.workers.activeLimit() {
 				if cold := service.workers.coldAccounts(standby); len(cold) > 0 {
 					standby = cold
 				}
@@ -3249,6 +3419,10 @@ func (service *trackedService) acquireWarmLease(ctx context.Context, selection a
 					return nil, err
 				}
 				continue
+			}
+			var startup *accountWorkerInitError
+			if errors.As(promoteErr, &startup) && proxyNetworkError(ctx, promoteErr) {
+				service.reportProxyFailure(startup.proxy, lease.Account().Config.Label, promoteErr)
 			}
 			if fixedAccount {
 				return nil, promoteErr
@@ -3444,7 +3618,7 @@ func inlineMediaInput(contents []aistudio.Content) (int, int64) {
 // Generate acquires an exclusive account and streams canonical events.
 func (service *trackedService) Generate(ctx context.Context, request aistudio.GenerateRequest) (<-chan aistudio.Event, error) {
 	generationStartedAt := time.Now()
-	model, config, suffixErr := aistudio.ApplyModelSuffix(request.Model, request.Config)
+	model, config, suffixErr := aistudio.ApplyModelSuffix(service.mappedModel(request.Model), request.Config)
 	request.Model, request.Config = model, config
 	api.SetAccessLogTarget(ctx, request.Model, "")
 	api.SetAccessLogGenerationConfig(ctx, request.Config)
@@ -3525,7 +3699,7 @@ func (service *trackedService) generateWithRetry(
 	recoveredWorker := make(map[string]struct{})
 	recoveryAccountID := ""
 	copyFiles := false
-
+	var buildRejection *rejectedBuildAttempt
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		request.Contents = originalContents
 		selectionAccountID := requestedAccountID
@@ -3553,12 +3727,14 @@ func (service *trackedService) generateWithRetry(
 		if continuationRounds > 1 {
 			selection.PlaygroundOnly = true
 		}
-		if !selection.PlaygroundOnly && service.pool.BuildEnabled() && aistudio.RequestNeedsBuildSchema(request) {
+		assistant := service.pool.AssistantModel(modelID)
+		if !assistant && !selection.PlaygroundOnly && service.pool.BuildEnabled() && aistudio.RequestNeedsBuildSchema(request) {
 			selection.Channel = aistudio.ChannelBuild
 		}
 		fallbackReason := ""
 		if request.Unary {
 			switch {
+			case assistant:
 			case selection.PlaygroundOnly:
 				fallbackReason = "request contains Playground-specific capabilities or file references"
 			case selection.Channel != "":
@@ -3569,6 +3745,11 @@ func (service *trackedService) generateWithRetry(
 			default:
 				selection.PreferredChannel = aistudio.ChannelBuild
 			}
+		}
+		if buildRejection != nil && buildRejection.accountID == selectionAccountID {
+			selection.PlaygroundOnly = true
+			selection.PreferredChannel = ""
+			fallbackReason = "Build rejected request parameters"
 		}
 		if (unbound || fileBound) && len(attempted) > 0 {
 			enabled, _ := service.pool.EnabledAccounts()
@@ -3612,6 +3793,7 @@ func (service *trackedService) generateWithRetry(
 		err = nil
 		source = nil
 		request.AccountID = lease.Account().ID
+		attemptProxy := service.proxies.Binding(request.AccountID)
 		workerGeneration := service.workers.WorkerGeneration(request.AccountID)
 		attempted[request.AccountID] = struct{}{}
 
@@ -3747,7 +3929,16 @@ func (service *trackedService) generateWithRetry(
 			if err == nil {
 				api.SetAccessLogFirstEvent(requestCtx, time.Since(generationStartedAt))
 				api.SetAccessLogTarget(requestCtx, first.ProviderModel, accountLabel)
+				if request.Unary {
+					source, err = collectGenerateEvents(requestCtx, source)
+				}
+			}
+			if err == nil {
 				temporaryCopies = attemptCopies
+				service.proxies.ReportSuccess(attemptProxy)
+				if buildRejection != nil && buildRejection.accountID == request.AccountID {
+					service.coolRejectedBuild(buildRejection, modelID, accountLabel)
+				}
 				break
 			}
 		}
@@ -3759,6 +3950,9 @@ func (service *trackedService) generateWithRetry(
 			Account: accountLabel, Channel: string(lease.Channel()), Error: err.Error(),
 			DurationMS: time.Since(attemptStartedAt).Milliseconds(),
 		})
+		if proxyNetworkError(requestCtx, err) {
+			service.reportProxyFailure(attemptProxy, accountLabel, err)
+		}
 		workerFailed := service.workers.WorkerFailed(request.AccountID)
 		waaRuntimeFailed := aistudio.DefinitiveWAARuntimeFailure(err)
 		workerReplaced := errors.Is(err, errAccountWorkerReplaced)
@@ -3780,25 +3974,39 @@ func (service *trackedService) generateWithRetry(
 				modelAccessScope = ""
 				scopeLabel = "global"
 			}
-			stateErr := service.pool.MarkCooldownIfGeneration(
-				request.AccountID, modelAccessScope, lease.ModelAccessGeneration(), lease.CheckedAt(),
-				cooldown.Until, cooldown.Reason,
+			until, stateErr := service.pool.MarkQuotaCooldownIfGeneration(
+				request.AccountID, modelAccessScope, lease.ModelAccessGeneration(), lease.CheckedAt(), cooldown,
 			)
 			if stateErr != nil {
 				err = errors.Join(err, stateErr)
 				retryable = false
 			} else {
-				service.requests.log(accountLabel, "WARN", fmt.Sprintf(
-					"Account cooldown | type=%s | scope=%s | reset=%s",
-					cooldown.Kind, scopeLabel, cooldown.Until.Format(time.RFC3339),
-				))
+				if !until.IsZero() {
+					service.requests.log(accountLabel, "WARN", fmt.Sprintf(
+						"Account cooldown | type=%s | scope=%s | reset=%s",
+						cooldown.Kind, scopeLabel, until.Local().Format(time.RFC3339),
+					))
+				}
+				if service.pool.ModelRequiresSubscription(request.AccountID, modelID) {
+					service.refreshAccountStateAfterLimit(request.AccountID)
+				}
 				if !cooldown.Global && service.pool.AccountChannelAvailable(request.AccountID, selection) {
 					delete(attempted, request.AccountID)
 					maxAttempts++
 				}
 			}
 		}
-
+		var rpcErr *aistudio.RPCError
+		if lease.Channel() == aistudio.ChannelBuild && service.pool.PlaygroundEnabled() && requestCtx.Err() == nil &&
+			errors.As(err, &rpcErr) && rpcErr.StatusCode == http.StatusBadRequest && rpcErr.Code == 3 {
+			buildRejection = &rejectedBuildAttempt{
+				accountID: request.AccountID, generation: lease.ModelAccessGeneration(), checkedAt: lease.CheckedAt(), err: err,
+			}
+			recoveryAccountID = request.AccountID
+			delete(attempted, request.AccountID)
+			maxAttempts++
+			retryable = true
+		}
 		releaseErr := lease.Release()
 		lease = nil
 		if releaseErr != nil {
@@ -3868,6 +4076,34 @@ func (service *trackedService) generateWithRetry(
 	)
 }
 
+// rejectedBuildAttempt represents an attempt rejected by Build with invalid arguments and being retried by Playground on the same account.
+type rejectedBuildAttempt struct {
+	accountID  string
+	generation uint64
+	checkedAt  time.Time
+	err        error
+}
+
+// coolRejectedBuild escalates cooldown for the model's Build channel after the first event returns from Playground retry on the same account.
+func (service *trackedService) coolRejectedBuild(rejection *rejectedBuildAttempt, modelID string, accountLabel string) {
+	cooldown, ok := aistudio.BuildRejectionCooldown(rejection.err)
+	if !ok {
+		return
+	}
+	scope := aistudio.ChannelCooldownScope(aistudio.ChannelBuild, modelID)
+	until, err := service.pool.MarkQuotaCooldownIfGeneration(rejection.accountID, scope, rejection.generation, rejection.checkedAt, cooldown)
+	if err != nil {
+		service.requests.log(accountLabel, "WARN", fmt.Sprintf("Account cooldown | type=%s | scope=%s | error=%s", cooldown.Kind, scope, err))
+		return
+	}
+	if until.IsZero() {
+		return
+	}
+	service.requests.log(accountLabel, "WARN", fmt.Sprintf(
+		"Account cooldown | type=%s | scope=%s | reset=%s", cooldown.Kind, scope, until.Local().Format(time.RFC3339),
+	))
+}
+
 var errStreamClosedBeforeFirstEvent = errors.New("AI Studio stream closed before first event")
 var errStreamClosedBeforeFinish = errors.New("AI Studio stream closed before finish")
 
@@ -3912,11 +4148,41 @@ func firstGenerateEvent(ctx context.Context, source <-chan aistudio.Event, onWai
 	}
 }
 
+// collectGenerateEvents gathers upstream events after the first event of non-streaming requests, returning upstream stream interruption errors for retry with another account.
+func collectGenerateEvents(ctx context.Context, source <-chan aistudio.Event) (<-chan aistudio.Event, error) {
+	var events []aistudio.Event
+	for {
+		select {
+		case event, ok := <-source:
+			if !ok {
+				replay := make(chan aistudio.Event, len(events))
+				for _, event := range events {
+					replay <- event
+				}
+				close(replay)
+				return replay, nil
+			}
+			var interrupted *aistudio.StreamInterruptedError
+			if event.Kind == aistudio.EventError && errors.As(event.Err, &interrupted) {
+				for range source {
+				}
+				return nil, event.Err
+			}
+			events = append(events, event)
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+}
+
 func retryableGenerateAccountError(ctx context.Context, err error) bool {
 	if errors.Is(err, errStreamClosedBeforeFirstEvent) || errors.Is(err, aistudio.ErrAccountCoolingDown) {
 		return true
 	}
-
+	var interrupted *aistudio.StreamInterruptedError
+	if errors.As(err, &interrupted) {
+		return ctx.Err() == nil
+	}
 	var workerInitError *accountWorkerInitError
 	if errors.As(err, &workerInitError) {
 		return ctx.Err() == nil
@@ -3925,7 +4191,10 @@ func retryableGenerateAccountError(ctx context.Context, err error) bool {
 	if ctx.Err() == nil && errors.Is(err, context.DeadlineExceeded) {
 		return true
 	}
-
+	var transportError *url.Error
+	if errors.As(err, &transportError) {
+		return ctx.Err() == nil
+	}
 	var rpcError *aistudio.RPCError
 	if !errors.As(err, &rpcError) {
 		return false
@@ -3957,7 +4226,7 @@ func (service *trackedService) dataRequestContextFor(ctx context.Context, timeou
 	service.lifecycleMu.Lock()
 	if service.state.Load() != serviceRunning || service.dataContext == nil {
 		service.lifecycleMu.Unlock()
-		return nil, nil, &serviceStoppedError{}
+		return nil, nil, &serviceStoppedError{launching: service.state.Load() == serviceLaunching}
 	}
 	requestCtx, cancel := context.WithTimeout(ctx, timeout)
 	stopData := context.AfterFunc(service.dataContext, cancel)

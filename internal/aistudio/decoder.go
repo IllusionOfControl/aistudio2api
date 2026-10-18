@@ -46,6 +46,45 @@ func (e *PromptFeedbackError) Unwrap() error {
 	return ErrInvalidArgument
 }
 
+// StreamInterruptedError indicates upstream connection interrupted before the stream completed.
+type StreamInterruptedError struct {
+	Method string
+	Frames int
+	Err    error
+}
+
+// Error returns the frame count received before interruption along with the read error.
+func (e *StreamInterruptedError) Error() string {
+	return fmt.Sprintf("AI Studio %s upstream stream interrupted (received %d frames): %v", e.Method, e.Frames, e.Err)
+}
+
+// Unwrap returns the underlying read error.
+func (e *StreamInterruptedError) Unwrap() error {
+	return e.Err
+}
+
+// streamReadRecorder records non-EOF errors when reading generation streams.
+type streamReadRecorder struct {
+	source io.Reader
+	err    error
+}
+
+func (reader *streamReadRecorder) Read(buffer []byte) (int, error) {
+	count, err := reader.source.Read(buffer)
+	if err != nil && err != io.EOF {
+		reader.err = err
+	}
+	return count, err
+}
+
+// failure returns a StreamInterruptedError if a read error occurred, or the decode error otherwise.
+func (reader *streamReadRecorder) failure(method string, frames int, decodeErr error) error {
+	if reader.err == nil {
+		return decodeErr
+	}
+	return &StreamInterruptedError{Method: method, Frames: frames, Err: reader.err}
+}
+
 type sparseJSONReader struct {
 	source        *bufio.Reader
 	pending       []byte
@@ -130,30 +169,34 @@ func decodeJSONValue(raw []byte) (json.RawMessage, error) {
 }
 
 func decodeGenerateItems(source io.Reader, consume func(json.RawMessage) error) error {
-	decoder := json.NewDecoder(newSparseJSONReader(source))
+	reader := &streamReadRecorder{source: source}
+	decoder := json.NewDecoder(newSparseJSONReader(reader))
 	decoder.UseNumber()
+	index := 0
+	fail := func(path string, err error) error {
+		return reader.failure("GenerateContent", index, &ProtocolEvidenceError{Method: "GenerateContent", Path: path, Detail: err.Error()})
+	}
 	rootStart, err := decoder.Token()
 	if err != nil {
-		return &ProtocolEvidenceError{Method: "GenerateContent", Path: "$", Detail: err.Error()}
+		return fail("$", err)
 	}
 	if delimiter, ok := rootStart.(json.Delim); !ok || delimiter != '[' {
 		return &ProtocolEvidenceError{Method: "GenerateContent", Path: "$", Detail: "root value is not an array"}
 	}
 	if !decoder.More() {
-		return &ProtocolEvidenceError{Method: "GenerateContent", Path: "$", Detail: "root array missing field 1"}
+		return reader.failure("GenerateContent", index, &ProtocolEvidenceError{Method: "GenerateContent", Path: "$", Detail: "root array missing field 1"})
 	}
 	fieldStart, err := decoder.Token()
 	if err != nil {
-		return &ProtocolEvidenceError{Method: "GenerateContent", Path: "$[0]", Detail: err.Error()}
+		return fail("$[0]", err)
 	}
 	if delimiter, ok := fieldStart.(json.Delim); !ok || delimiter != '[' {
 		return &ProtocolEvidenceError{Method: "GenerateContent", Path: "$[0]", Detail: "field 1 is not a repeated array"}
 	}
-	index := 0
 	for decoder.More() {
 		var raw json.RawMessage
 		if err := decoder.Decode(&raw); err != nil {
-			return &ProtocolEvidenceError{Method: "GenerateContent", Path: fmt.Sprintf("$[0][%d]", index), Detail: err.Error()}
+			return fail(fmt.Sprintf("$[0][%d]", index), err)
 		}
 		if err := consume(append(json.RawMessage(nil), raw...)); err != nil {
 			return err
@@ -162,7 +205,7 @@ func decodeGenerateItems(source io.Reader, consume func(json.RawMessage) error) 
 	}
 	if token, err := decoder.Token(); err != nil || token != json.Delim(']') {
 		if err != nil {
-			return &ProtocolEvidenceError{Method: "GenerateContent", Path: "$[0]", Detail: err.Error()}
+			return fail("$[0]", err)
 		}
 		return &ProtocolEvidenceError{Method: "GenerateContent", Path: "$[0]", Detail: "field 1 did not close properly"}
 	}
@@ -170,13 +213,13 @@ func decodeGenerateItems(source io.Reader, consume func(json.RawMessage) error) 
 	for decoder.More() {
 		var raw json.RawMessage
 		if err := decoder.Decode(&raw); err != nil {
-			return &ProtocolEvidenceError{Method: "GenerateContent", Path: fmt.Sprintf("$[%d]", fieldIndex), Detail: err.Error()}
+			return fail(fmt.Sprintf("$[%d]", fieldIndex), err)
 		}
 		fieldIndex++
 	}
 	if token, err := decoder.Token(); err != nil || token != json.Delim(']') {
 		if err != nil {
-			return &ProtocolEvidenceError{Method: "GenerateContent", Path: "$", Detail: err.Error()}
+			return fail("$", err)
 		}
 		return &ProtocolEvidenceError{Method: "GenerateContent", Path: "$", Detail: "root array did not close properly"}
 	}
@@ -185,7 +228,7 @@ func decodeGenerateItems(source io.Reader, consume func(json.RawMessage) error) 
 		if err == nil {
 			return &ProtocolEvidenceError{Method: "GenerateContent", Path: "$", Detail: "extra root value after response", Raw: extra}
 		}
-		return &ProtocolEvidenceError{Method: "GenerateContent", Path: "$", Detail: err.Error()}
+		return fail("$", err)
 	}
 	return nil
 }

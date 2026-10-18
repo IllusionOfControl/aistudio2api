@@ -18,6 +18,7 @@ import (
 type managedService interface {
 	aistudio.Service
 	State() string
+	ApplyCapacity(warmTarget int, maxActive int, startupConcurrency int, perAccountConcurrency int)
 }
 
 // runtimeGeneration holds a complete runtime assembled from a single configuration snapshot.
@@ -76,6 +77,7 @@ type runtimeManager struct {
 	current          *runtimeGeneration
 	startCancel      context.CancelFunc
 	ledger           *requestdb.Store
+	logs             *logOutput
 }
 
 // newRuntimeManager creates a process-level manager and initializes the first generation service.
@@ -391,6 +393,17 @@ func (manager *runtimeManager) Transcribe(ctx context.Context, request aistudio.
 	return service.Transcribe(ctx, request)
 }
 
+// egressProxy returns the proxy used by the management process for external access: the first proxy in PROXY, or system proxy when unset.
+func (manager *runtimeManager) egressProxy() string {
+	manager.mu.RLock()
+	proxies := config.ProxyList(manager.current.config.Proxy)
+	manager.mu.RUnlock()
+	if len(proxies) > 0 {
+		return proxies[0]
+	}
+	return systemProxy()
+}
+
 // Status returns the status of the current generation service.
 func (manager *runtimeManager) Status(ctx context.Context) (api.AdminStatus, error) {
 	manager.mu.RLock()
@@ -462,12 +475,11 @@ func (manager *runtimeManager) LoginAccount(ctx context.Context, id string) (api
 	return manager.current.admin.LoginAccount(ctx, id)
 }
 
-// VerifyAccount verifies an account in the current generation service.
-func (manager *runtimeManager) VerifyAccount(ctx context.Context, id string) (api.AdminAccount, error) {
+// RefreshAccount immediately refreshes account state in the current generation service.
+func (manager *runtimeManager) RefreshAccount(ctx context.Context, id string) (api.AdminAccountRefresh, error) {
 	manager.mu.RLock()
 	defer manager.mu.RUnlock()
-
-	return manager.current.admin.VerifyAccount(ctx, id)
+	return manager.current.admin.RefreshAccount(ctx, id)
 }
 
 // ClearLogs clears process-level admin logs.
@@ -487,6 +499,7 @@ func (manager *runtimeManager) RuntimeConfig(ctx context.Context) (api.RuntimeCo
 
 	return value, err
 }
+
 
 
 
@@ -561,35 +574,22 @@ func sameDataConfig(value api.RuntimeConfig, active config.Config, overrides dat
 	}
 
 	saved := config.Config{
-		AuthStates:             value.AuthStates,
-		Proxy:                  value.Proxy,
-		InitTimeout:            initTimeout,
-		RequestTimeout:         requestTimeout,
-		WarmWorkerLimit:        value.WarmWorkerLimit,
-		MaxActiveWorkers:       value.MaxActiveWorkers,
-		WarmStartupConcurrency: value.WarmStartupConcurrency,
-		PerAccountConcurrency:  value.PerAccountConcurrency,
-		TemporaryChat:          value.TemporaryChat,
-		UpstreamChannels:       value.UpstreamChannels,
-		WAABackend:             value.WAABackend,
-		AutoStart:              value.AutoStart,
-		BuildNativeNonstream:   value.BuildNativeNonstream,
+		AuthStates: value.AuthStates, Proxy: value.Proxy,
+		InitTimeout: initTimeout, RequestTimeout: requestTimeout, TemporaryChat: value.TemporaryChat,
+		UpstreamChannels:     value.UpstreamChannels,
+		ModelMapping:         value.ModelMapping,
+		WAABackend:           value.WAABackend,
+		BuildNativeNonstream: value.BuildNativeNonstream,
+		AutoStart:            value.AutoStart,
 	}
 	overrides.Apply(&saved)
-
-	return saved.AuthStates == active.AuthStates &&
-		saved.Proxy == active.Proxy &&
-		saved.InitTimeout == active.InitTimeout &&
-		saved.RequestTimeout == active.RequestTimeout &&
-		saved.WarmWorkerLimit == active.WarmWorkerLimit &&
-		saved.MaxActiveWorkers == active.MaxActiveWorkers &&
-		saved.WarmStartupConcurrency == active.WarmStartupConcurrency &&
-		saved.PerAccountConcurrency == active.PerAccountConcurrency &&
+	return saved.AuthStates == active.AuthStates && saved.Proxy == active.Proxy &&
+		saved.InitTimeout == active.InitTimeout && saved.RequestTimeout == active.RequestTimeout &&
 		saved.TemporaryChat == active.TemporaryChat &&
-		slices.Equal(saved.UpstreamChannels, active.UpstreamChannels) &&
+		slices.Equal(saved.UpstreamChannels, active.UpstreamChannels) && saved.ModelMapping == active.ModelMapping &&
 		saved.WAABackend == active.WAABackend &&
-		saved.AutoStart == active.AutoStart &&
-		saved.BuildNativeNonstream == active.BuildNativeNonstream
+		saved.BuildNativeNonstream == active.BuildNativeNonstream &&
+		saved.AutoStart == active.AutoStart
 }
 
 var _ aistudio.Service = (*runtimeManager)(nil)

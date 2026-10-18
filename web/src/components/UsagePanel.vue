@@ -312,16 +312,27 @@ const kpis = computed(() => {
     {
       label: t('usage.cost'),
       icon: 'cost' as const,
-      value: usd(value.cost),
-      raw: value.cost,
-      help: t('usage.costHelp'),
+      value: value.cost === 0 && value.unpriced_models.length > 0 ? '—' : usd(value.cost),
+      raw: value.cost === 0 && value.unpriced_models.length > 0 ? null : value.cost,
+      help:
+        value.unpriced_models.length > 0
+          ? `${t('usage.costHelp')} · ${t('usage.unpriced')} ${value.unpriced_models.join(', ')}`
+          : t('usage.costHelp'),
       details: [
-        { label: t('usage.input'), value: compact(totals.input_tokens) },
-        { label: t('usage.cached'), value: compact(totals.cached_tokens) },
         {
-          label: t('usage.output'),
-          value: compact(totals.reasoning_tokens + totals.reply_tokens),
+          label: t('usage.cacheHitRate'),
+          value:
+            totals.input_tokens > 0 ? percent(totals.cached_tokens / totals.input_tokens) : '—',
         },
+        ...(value.cost === 0 && value.unpriced_models.length > 0
+          ? [
+              {
+                label: t('usage.unpriced'),
+                value: value.unpriced_models.join(', '),
+                tone: 'text-amber-300',
+              },
+            ]
+          : []),
       ],
       delta: delta(relative(value.cost, value.previous_cost), (item) => percent(item), 'none'),
       spark: buckets.map((bucket) => bucket.cost),
@@ -461,7 +472,7 @@ const statusOptions = computed(() =>
 
       <template v-if="status === 'loading'">
         <div
-          class="grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-6"
+          class="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-6"
           aria-hidden="true"
         >
           <div v-for="index in 6" :key="index" class="h-32 animate-pulse rounded-lg bg-panel"></div>
@@ -509,7 +520,7 @@ const statusOptions = computed(() =>
             </button>
           </div>
           <template v-else>
-            <div class="grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-6">
+            <div class="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-6">
               <KpiCard
                 v-for="kpi in kpis"
                 :key="kpi.label"

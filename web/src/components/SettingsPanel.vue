@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { ref } from 'vue'
 import { channelLabelKey, useI18n } from '@/i18n'
+import { maskedProxy } from '@/proxy'
 import type { ServiceConfig } from '@/types'
 import UiIcon from './UiIcon.vue'
 
@@ -23,7 +24,7 @@ async function copyApiKey(): Promise<void> {
   try {
     await navigator.clipboard.writeText(props.config.proxy_api_key)
     copied.value = true
-    emit('notice', t('settings.copied'), 'success')
+    emit('notice', t('common.copied'), 'success')
     setTimeout(() => {
       copied.value = false
     }, 2000)
@@ -67,7 +68,7 @@ async function copyApiKey(): Promise<void> {
               :class="config.admin_auth_enabled ? 'text-emerald-400' : 'text-gray-400'"
               class="text-xs font-medium"
             >
-              {{ config.admin_auth_enabled ? t('settings.enabled') : t('settings.disabled') }}
+              {{ config.admin_auth_enabled ? t('common.enable') : t('common.disable') }}
             </span>
           </div>
           <div v-if="config.admin_auth_enabled" class="flex items-center justify-between px-4 py-3">
@@ -80,7 +81,7 @@ async function copyApiKey(): Promise<void> {
       <!-- General & Network -->
       <div>
         <h3 class="mb-2 text-xs font-semibold uppercase tracking-wider text-gray-400">
-          {{ t('settings.networkSection') }}
+          {{ t('settings.section.network') }}
         </h3>
         <div class="divide-y divide-[#30363d] rounded-lg border border-[#30363d] bg-[#161b22]">
           <!-- Listen Address -->
@@ -114,17 +115,42 @@ async function copyApiKey(): Promise<void> {
                   type="button"
                   @click="copyApiKey"
                 >
-                  {{ copied ? t('settings.copied') : t('settings.copyKey') }}
+                  {{ copied ? t('common.copied') : t('common.copy') }}
                 </button>
               </template>
             </div>
           </div>
 
           <!-- Proxy -->
-          <div class="flex items-center justify-between px-4 py-3">
+          <div class="flex flex-col gap-1.5 px-4 py-3 sm:flex-row sm:items-center sm:justify-between">
             <span class="text-sm text-gray-300">{{ t('settings.proxy') }}</span>
-            <span v-if="config.proxy" class="font-mono text-sm text-white">{{ config.proxy }}</span>
-            <span v-else class="text-xs text-gray-500">{{ t('settings.noProxy') }}</span>
+            <div class="text-right">
+              <span v-if="config.proxy" class="font-mono text-sm text-white">{{ config.proxy }}</span>
+              <span v-else class="text-xs text-gray-500">{{ t('settings.proxyDirect') }}</span>
+              <p v-if="config.active_proxy && config.active_proxy !== config.proxy" class="text-xs text-gray-500">
+                {{ t('settings.activeProxy') }}: {{ config.active_proxy }}
+              </p>
+            </div>
+          </div>
+
+          <!-- Proxy Pool -->
+          <div v-if="config.proxy_pool && config.proxy_pool.length > 1" class="px-4 py-3">
+            <span class="text-xs text-gray-400">{{ t('settings.proxyPool') }}</span>
+            <ul class="mt-2 space-y-1 text-xs">
+              <li
+                v-for="entry in config.proxy_pool"
+                :key="entry.proxy"
+                class="flex flex-wrap items-center gap-x-2 gap-y-0.5"
+              >
+                <span class="font-mono text-gray-300">{{ maskedProxy(entry.proxy) }}</span>
+                <span :class="entry.available ? 'text-green-400' : 'text-red-400'">
+                  {{ entry.available ? t('settings.proxyAvailable') : t('settings.proxyUnavailable') }}
+                </span>
+                <span class="text-gray-500">
+                  {{ t('settings.proxyAccounts').replace('{count}', String(entry.accounts)) }}
+                </span>
+              </li>
+            </ul>
           </div>
 
           <!-- Auth States -->
@@ -138,7 +164,7 @@ async function copyApiKey(): Promise<void> {
       <!-- Workers & Scheduling -->
       <div>
         <h3 class="mb-2 text-xs font-semibold uppercase tracking-wider text-gray-400">
-          {{ t('settings.concurrencySection') }}
+          {{ t('settings.section.capacity') }}
         </h3>
         <div class="divide-y divide-[#30363d] rounded-lg border border-[#30363d] bg-[#161b22]">
           <!-- Routing Strategy -->
@@ -172,7 +198,7 @@ async function copyApiKey(): Promise<void> {
                   : 'bg-amber-500/20 text-amber-300'
               "
             >
-              {{ config.headless ? t('settings.enabled') : t('settings.disabled') }}
+              {{ config.headless ? t('common.enable') : t('common.disable') }}
             </span>
           </div>
 
@@ -187,7 +213,7 @@ async function copyApiKey(): Promise<void> {
                   : 'bg-gray-500/20 text-gray-400'
               "
             >
-              {{ config.temporary_chat ? t('settings.enabled') : t('settings.disabled') }}
+              {{ config.temporary_chat ? t('common.enable') : t('common.disable') }}
             </span>
           </div>
 
@@ -220,7 +246,7 @@ async function copyApiKey(): Promise<void> {
                   : 'bg-gray-500/20 text-gray-400'
               "
             >
-              {{ config.auto_start ? t('settings.enabled') : t('settings.disabled') }}
+              {{ config.auto_start ? t('common.enable') : t('common.disable') }}
             </span>
           </div>
 
@@ -238,7 +264,7 @@ async function copyApiKey(): Promise<void> {
                   : 'bg-gray-500/20 text-gray-400'
               "
             >
-              {{ config.request_body_log ? t('settings.enabled') : t('settings.disabled') }}
+              {{ config.request_body_log ? t('common.enable') : t('common.disable') }}
             </span>
           </div>
 
@@ -270,7 +296,7 @@ async function copyApiKey(): Promise<void> {
                   : 'bg-gray-500/20 text-gray-400'
               "
             >
-              {{ config.build_native_nonstream ? t('settings.enabled') : t('settings.disabled') }}
+              {{ config.build_native_nonstream ? t('common.enable') : t('common.disable') }}
             </span>
           </div>
 

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -12,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Mag1cFall/AIStudio2API/internal/proxydial"
 	"github.com/gofrs/flock"
 	"github.com/gorilla/websocket"
 )
@@ -64,31 +66,109 @@ func Start(ctx context.Context, options Options) (*Worker, error) {
 		return nil, err
 	}
 	options.CacheDirectory = cacheDirectory
-	options.reportStartup(StartupLaunchingBrowser)
-	process, endpoint, err := launchBrowser(ctx, options, fingerprint)
-	if err != nil {
-		return nil, errors.Join(err, releaseAccountCache(cacheLock))
-	}
-	worker := &Worker{process: process, cacheLock: cacheLock}
+	worker := &Worker{cacheLock: cacheLock}
 	failed := true
 	defer func() {
 		if failed {
 			_ = worker.abort()
 		}
 	}()
-	options.reportStartup(StartupConnectingBiDi)
-	dialer := websocket.Dialer{HandshakeTimeout: 30 * time.Second}
-	connection, _, err := dialer.DialContext(ctx, endpoint, nil)
-	if err != nil {
-		return nil, fmt.Errorf("connecting to Camoufox BiDi: %w", err)
+	for {
+		err := worker.launch(ctx, options, fingerprint)
+		if err == nil {
+			break
+		}
+		if !errors.Is(err, errBrowserStartupStalled) {
+			return nil, err
+		}
+		if err := worker.closeBrowser(); err != nil {
+			return nil, err
+		}
 	}
-	worker.connection = connection
-	worker.client = newBiDiClient(connection)
 	if err := worker.bootstrap(ctx, options, state); err != nil {
 		return nil, err
 	}
 	failed = false
 	return worker, nil
+}
+
+// browserStartupTimeout is the maximum wait time for Camoufox to start up and respond to session.new.
+const browserStartupTimeout = 30 * time.Second
+
+// errBrowserStartupStalled indicates Camoufox did not complete startup within browserStartupTimeout.
+var errBrowserStartupStalled = errors.New("Camoufox startup stalled")
+
+// ErrProxyUnreachable indicates proxy connection failed while worker was loading AI Studio.
+var ErrProxyUnreachable = errors.New("proxy unreachable")
+
+// proxyWatchInterval is the interval for checking proxy connectivity while loading AI Studio.
+const proxyWatchInterval = 2 * time.Second
+
+// watchProxy periodically checks proxy connectivity until the returned context ends, cancelling it with ErrProxyUnreachable on failure.
+func watchProxy(ctx context.Context, proxy string) (context.Context, func()) {
+	watchCtx, cancel := context.WithCancelCause(ctx)
+	stop := func() { cancel(nil) }
+	parsed, err := url.Parse(strings.TrimSpace(proxy))
+	if err != nil || parsed.Host == "" {
+		return watchCtx, stop
+	}
+	address := proxydial.Address(parsed)
+	go func() {
+		ticker := time.NewTicker(proxyWatchInterval)
+		defer ticker.Stop()
+		dialer := net.Dialer{Timeout: proxyWatchInterval}
+		for {
+			select {
+			case <-watchCtx.Done():
+				return
+			case <-ticker.C:
+			}
+			connection, err := dialer.DialContext(watchCtx, "tcp", address)
+			if err != nil {
+				if watchCtx.Err() == nil {
+					cancel(fmt.Errorf("%w %s: %v", ErrProxyUnreachable, address, err))
+				}
+				return
+			}
+			_ = connection.Close()
+		}
+	}()
+	return watchCtx, stop
+}
+
+// launch starts Camoufox, connects BiDi, and creates session.
+func (worker *Worker) launch(ctx context.Context, options Options, fingerprint map[string]any) error {
+	options.reportStartup(StartupLaunchingBrowser)
+	process, endpoint, err := launchBrowser(ctx, options, fingerprint)
+	if err != nil {
+		return err
+	}
+	worker.process = process
+	options.reportStartup(StartupConnectingBiDi)
+	dialer := websocket.Dialer{HandshakeTimeout: 30 * time.Second}
+	connection, _, err := dialer.DialContext(ctx, endpoint, nil)
+	if err != nil {
+		return fmt.Errorf("connecting to Camoufox BiDi: %w", err)
+	}
+	worker.connection = connection
+	worker.client = newBiDiClient(connection)
+	sessionCtx, cancel := context.WithTimeout(ctx, browserStartupTimeout)
+	defer cancel()
+	if _, err := worker.client.command(sessionCtx, "session.new", map[string]any{"capabilities": map[string]any{}}); err != nil {
+		if ctx.Err() == nil && errors.Is(err, context.DeadlineExceeded) {
+			return errBrowserStartupStalled
+		}
+		return err
+	}
+	return nil
+}
+
+// closeBrowser closes incomplete Camoufox instance while preserving account profile lock.
+func (worker *Worker) closeBrowser() error {
+	_ = worker.connection.Close()
+	err := worker.process.Close()
+	worker.connection, worker.client, worker.process = nil, nil, nil
+	return err
 }
 
 func (worker *Worker) abort() error {
@@ -202,9 +282,6 @@ func (worker *Worker) Close() error {
 
 func (worker *Worker) bootstrap(ctx context.Context, options Options, storage storageState) error {
 	client := worker.client
-	if _, err := client.command(ctx, "session.new", map[string]any{"capabilities": map[string]any{}}); err != nil {
-		return err
-	}
 	tree, err := client.command(ctx, "browsingContext.getTree", map[string]any{"maxDepth": 0})
 	if err != nil {
 		return err
@@ -230,17 +307,29 @@ func (worker *Worker) bootstrap(ctx context.Context, options Options, storage st
 	if options.TemporaryChat {
 		target += "&temporary=true"
 	}
-	if _, err := client.command(ctx, "browsingContext.navigate", map[string]any{
+	pageCtx, stopWatch := watchProxy(ctx, options.Proxy)
+	defer stopWatch()
+	if _, err := client.command(pageCtx, "browsingContext.navigate", map[string]any{
 		"context": contextID,
 		"url":     target,
 		"wait":    "interactive",
 	}); err != nil && !strings.Contains(err.Error(), "NS_ERROR_ABORT") {
+		if cause := context.Cause(pageCtx); errors.Is(cause, ErrProxyUnreachable) {
+			return cause
+		}
+		if strings.Contains(err.Error(), "NS_ERROR_PROXY_") {
+			return fmt.Errorf("%w: navigating to AI Studio: %v", ErrProxyUnreachable, err)
+		}
 		return fmt.Errorf("navigating to AI Studio: %w", err)
 	}
-	if err := client.waitFor(ctx, contextID, workerPageReadyExpression, 120*time.Second); err != nil {
+	if err := client.waitFor(pageCtx, contextID, workerPageReadyExpression, 120*time.Second); err != nil {
+		if cause := context.Cause(pageCtx); errors.Is(cause, ErrProxyUnreachable) {
+			return cause
+		}
 		pageURL, _ := client.evaluateString(ctx, contextID, "location.href")
 		return fmt.Errorf("AI Studio prompt textarea not ready url=%s: %w", pageURL, err)
 	}
+	stopWatch()
 	pageURL, err := client.evaluateString(ctx, contextID, "location.href")
 	if err != nil {
 		return err

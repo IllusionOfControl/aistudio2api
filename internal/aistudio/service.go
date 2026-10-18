@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"reflect"
 	"slices"
 	"sort"
 	"strings"
@@ -103,16 +104,21 @@ func NewWorkerProtectedTransport(options WorkerProtectedTransportOptions) (*Work
 	}, nil
 }
 
-// DoProtected writes fresh proof and sends GenerateContent or Build proxy requests via Camoufox
+// DoProtected writes fresh proof and sends GenerateContent, Build proxy, or coding assistant requests via Camoufox
 func (t *WorkerProtectedTransport) DoProtected(ctx context.Context, request GenerateRequest, rpc RPCRequest) (*RPCResponse, error) {
 	var prompt, page string
 	var err error
 	proofField := 5
-	if rpc.Method == buildProxyStreamedMethod || rpc.Method == buildProxyUnaryMethod {
+	switch rpc.Method {
+	case buildProxyStreamedMethod, buildProxyUnaryMethod:
 		prompt, err = buildBindingPrompt(rpc.Body)
 		page = contentsText(request.Contents)
 		proofField = buildProofField
-	} else {
+	case assistantOfflineMethod:
+		prompt, err = bindingPrompt(request)
+		page = contentsText(request.Contents)
+		proofField = assistantProofField
+	default:
 		prompt, err = bindingPrompt(request)
 		page = prompt
 	}
@@ -350,25 +356,44 @@ func (s *PooledService) RefreshAccountModels(ctx context.Context, accountID stri
 	return models, nil
 }
 
-// RefreshAccountTier fetches account benefit tier using a normal concurrency slot. If the tier changes, it updates the pool preserving the existing catalog, and returns the previous and current tier; skips if no slot is free.
-func (s *PooledService) RefreshAccountTier(ctx context.Context, accountID string) (BenefitTier, BenefitTier, error) {
-	lease, _, err := s.pool.TryAcquireFor(ctx, AccountSelection{AccountID: strings.TrimSpace(accountID)})
+// AccountRefresh represents benefit tier and model count before and after an account refresh; ModelsChanged indicates catalog entries changed for the account.
+type AccountRefresh struct {
+	PreviousTier   BenefitTier
+	Tier           BenefitTier
+	PreviousModels int
+	Models         int
+	ModelsChanged  bool
+	Skipped        bool
+}
+
+// RefreshAccountState reads account benefits and model catalog, marking account as requiring login if expired; when wait is true, waits for exclusive lease and refreshes accounts in any state, otherwise uses free slot of ready accounts only and skips if none available.
+func (s *PooledService) RefreshAccountState(ctx context.Context, accountID string, wait bool) (AccountRefresh, error) {
+	accountID = strings.TrimSpace(accountID)
+	var lease *AccountLease
+	var err error
+	if wait {
+		lease, err = s.pool.AcquireAccount(ctx, accountID)
+	} else {
+		lease, _, err = s.pool.TryAcquireFor(ctx, AccountSelection{AccountID: accountID})
+	}
 	if lease == nil {
-		return BenefitTierFree, BenefitTierFree, err
+		return AccountRefresh{Skipped: err == nil}, err
 	}
 	account := lease.Account()
-	tier, err := s.client.BenefitTierForAccount(ContextWithAccountLease(ctx, lease), account.ID)
 	s.pool.mu.Lock()
-	previous := account.BenefitTier
-	models := cloneAccountModels(account.Models)
+	refresh := AccountRefresh{PreviousTier: account.BenefitTier, PreviousModels: len(account.Models)}
+	previous := slices.Clone(account.Models)
 	s.pool.mu.Unlock()
-	if err == nil && tier != previous {
-		err = s.pool.SetCatalog(account.ID, tier, models)
-	}
+	models, err := s.modelsForLease(ContextWithAccountLease(ctx, lease), lease)
 	if err != nil {
-		return previous, previous, errors.Join(err, lease.Release())
+		return refresh, errors.Join(err, lease.Release())
 	}
-	return previous, tier, lease.Release()
+	s.pool.mu.Lock()
+	refresh.Tier = account.BenefitTier
+	refresh.ModelsChanged = !reflect.DeepEqual(previous, account.Models)
+	s.pool.mu.Unlock()
+	refresh.Models = len(models)
+	return refresh, lease.Release()
 }
 
 // CachedModels returns the union of recently synced catalogs for enabled accounts
@@ -484,36 +509,28 @@ func (s *PooledService) markRetryableFailure(lease *AccountLease, modelAccessSco
 		return lease.MarkAuthenticationRequired(err.Error())
 	}
 	now := time.Now()
-	until := now.Add(30 * time.Second)
-	reason := err.Error()
-	if cooldown, ok := QuotaCooldownForError(err, now); ok {
-		until = cooldown.Until
-		reason = cooldown.Reason
-		if cooldown.Global {
-			modelAccessScope = ""
-		}
+	cooldown, ok := QuotaCooldownForError(err, now)
+	if !ok {
+		cooldown = QuotaCooldown{Until: now.Add(30 * time.Second), Reason: err.Error()}
 	}
-	return s.pool.MarkCooldownIfGeneration(
-		accountID, modelAccessScope, lease.ModelAccessGeneration(), lease.CheckedAt(),
-		until, reason,
+	if cooldown.Global {
+		modelAccessScope = ""
+	}
+	_, markErr := s.pool.MarkQuotaCooldownIfGeneration(
+		accountID, modelAccessScope, lease.ModelAccessGeneration(), lease.CheckedAt(), cooldown,
 	)
+	return markErr
 }
 
 func (s *PooledService) modelsForLease(ctx context.Context, lease *AccountLease) ([]Model, error) {
 	account := lease.Account()
 	tier, err := s.client.BenefitTierForAccount(ContextWithAccountLease(ctx, lease), account.ID)
 	if err != nil {
-		if DefinitiveAuthenticationFailure(err) {
-			err = errors.Join(err, lease.MarkAuthenticationRequired(err.Error()))
-		}
-		return nil, err
+		return nil, s.catalogFailure(lease, err)
 	}
 	models, err := s.client.ModelsForAccount(ContextWithAccountLease(ctx, lease), account.ID)
 	if err != nil {
-		if DefinitiveAuthenticationFailure(err) {
-			err = errors.Join(err, lease.MarkAuthenticationRequired(err.Error()))
-		}
-		return nil, err
+		return nil, s.catalogFailure(lease, err)
 	}
 	if err := errors.Join(
 		lease.MarkAuthenticationValid(),
@@ -536,6 +553,15 @@ func (s *PooledService) modelsForLease(ctx context.Context, lease *AccountLease)
 		}
 	}
 	return models, nil
+}
+
+// catalogFailure marks accounts with invalid authentication as requiring login, and records other failures as the account's most recent catalog read error.
+func (s *PooledService) catalogFailure(lease *AccountLease, err error) error {
+	if DefinitiveAuthenticationFailure(err) {
+		return errors.Join(err, lease.MarkAuthenticationRequired(err.Error()))
+	}
+	s.pool.recordCatalogFailure(lease.Account().ID, err)
+	return err
 }
 
 // CountTokens counts tokens using an exclusive account supporting the target model
@@ -754,7 +780,7 @@ func forwardEventsWithLease(
 				if cooldown.Global {
 					scope = ""
 				}
-				if err := pool.MarkCooldownIfGeneration(accountID, scope, accessGeneration, checkedAt, cooldown.Until, cooldown.Reason); err != nil {
+				if _, err := pool.MarkQuotaCooldownIfGeneration(accountID, scope, accessGeneration, checkedAt, cooldown); err != nil {
 					event.Err = errors.Join(event.Err, err)
 				}
 			}

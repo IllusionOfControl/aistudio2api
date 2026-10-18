@@ -319,8 +319,8 @@ func truncateMiddle(text string, tokens int) string {
 	return strings.ToValidUTF8(text[:side], "") + marker + strings.ToValidUTF8(text[len(text)-side:], "")
 }
 
-// compactResponses summarizes history before the verbatim preserved portion, returning the compaction item, prior user messages, and summary token usage
-func (s *server) compactResponses(ctx context.Context, request responsesRequest, previous responseHistory, id string) (map[string]any, []json.RawMessage, *aistudio.Usage, error) {
+// compactResponses summarizes history before the verbatim preserved portion, returning the compaction item, prior user messages, developer/system messages from that portion, and summary token usage
+func (s *server) compactResponses(ctx context.Context, request responsesRequest, previous responseHistory, id string) (map[string]any, []json.RawMessage, []json.RawMessage, *aistudio.Usage, error) {
 	var items []json.RawMessage
 	for _, item := range slices.Concat(previous.Items, responsesInputItems(request.Input, id)) {
 		items = append(items, item.Raw)
@@ -330,20 +330,37 @@ func (s *server) compactResponses(ctx context.Context, request responsesRequest,
 	}
 	window, err := splitCompaction(items)
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, nil, nil, err
 	}
 	work := slices.Concat(window.recent, window.after)
 	cut := compactionCut(work)
 	summary := window.summary
 	var usage *aistudio.Usage
-	if cut > 0 {
-		if summary, usage, err = s.compactionSummary(ctx, request, work[:cut], window.summary, id); err != nil {
-			return nil, nil, nil, err
+	if conversation := conversationItems(work[:cut]); len(conversation) > 0 {
+		if summary, usage, err = s.compactionSummary(ctx, request, conversation, window.summary, id); err != nil {
+			return nil, nil, nil, nil, err
 		}
 	}
 	payload, _ := json.Marshal(compactionPayload{Version: 1, Summary: summary, Items: work[cut:]})
 	item := map[string]any{"id": "cmp_" + id, "type": "compaction", "encrypted_content": string(payload)}
-	return item, retainedUserMessages(slices.Concat(window.before, work[:cut])), usage, nil
+	compacted := slices.Concat(window.before, work[:cut])
+	instructions := slices.DeleteFunc(slices.Clone(compacted), func(item json.RawMessage) bool { return !instructionItem(item) })
+	return item, retainedUserMessages(compacted), instructions, usage, nil
+}
+
+// instructionItem checks whether an item is a developer or system message.
+func instructionItem(item json.RawMessage) bool {
+	var head struct {
+		Type string `json:"type"`
+		Role string `json:"role"`
+	}
+	_ = json.Unmarshal(item, &head)
+	return (head.Type == "message" || head.Type == "") && (head.Role == "developer" || head.Role == "system")
+}
+
+// conversationItems returns items with developer and system messages removed, as clients re-send these instructions on every request.
+func conversationItems(items []json.RawMessage) []json.RawMessage {
+	return slices.DeleteFunc(slices.Clone(items), instructionItem)
 }
 
 // compactionSummary generates non-streaming summary using the requested model, instructions, and tools with tool calling disabled, prior summary as first user turn, and summary prompt as final user turn
@@ -397,10 +414,10 @@ func (s *server) handleResponsesCompact(w http.ResponseWriter, r *http.Request) 
 		}
 		return
 	}
-	item, retained, usage, err := s.compactResponses(r.Context(), request, prepared.previous, id)
+	item, retained, _, usage, err := s.compactResponses(r.Context(), request, prepared.previous, id)
 	if err != nil {
 		if shouldWriteRequestError(r, err) {
-			writeOpenAIError(w, statusFromError(err), openAIErrorCode(err), err.Error())
+			writeOpenAIRequestError(w, err)
 		}
 		return
 	}
@@ -429,7 +446,7 @@ func (s *server) handleCompactionTrigger(w http.ResponseWriter, r *http.Request,
 		if err := streamHeaders(w); err != nil {
 			return
 		}
-		writer = &responsesStreamWriter{w: w, id: id, created: created, request: request}
+		writer = newResponsesWriter(w, id, created, request)
 		for _, eventType := range []string{"response.created", "response.in_progress"} {
 			if err := writer.emit(eventType, map[string]any{"response": responseShell(id, created, "in_progress", request)}); err != nil {
 				return
@@ -439,7 +456,7 @@ func (s *server) handleCompactionTrigger(w http.ResponseWriter, r *http.Request,
 			return
 		}
 	}
-	item, retained, usage, err := s.compactResponses(r.Context(), request, prepared.previous, id)
+	item, retained, _, usage, err := s.compactResponses(r.Context(), request, prepared.previous, id)
 	if err != nil {
 		if !shouldWriteRequestError(r, err) {
 			return
@@ -447,7 +464,7 @@ func (s *server) handleCompactionTrigger(w http.ResponseWriter, r *http.Request,
 		if writer != nil {
 			_ = writer.failed(err)
 		} else {
-			writeOpenAIError(w, statusFromError(err), openAIErrorCode(err), err.Error())
+			writeOpenAIRequestError(w, err)
 		}
 		return
 	}

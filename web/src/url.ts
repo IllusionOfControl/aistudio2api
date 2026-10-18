@@ -16,22 +16,37 @@ function writeQuery(values: Record<string, string | null>): void {
   if (url.href !== window.location.href) window.history.replaceState(null, '', url)
 }
 
-// useQueryParam syncs in-page state with address bar query params, updating on navigation
+// bindQuery synchronizes in-page state with address bar query parameters.
+// Does not write when equal to fallback, updates on browser forward/back navigation, and restores on cached page reactivate.
+function bindQuery<T extends string>(name: string, read: () => T, fallback: T): Ref<T> {
+  const state = ref(read()) as Ref<T>
+  const write = (value: T): void => writeQuery({ [name]: value === fallback ? null : value })
+  watch(state, write)
+  onActivated(() => write(state.value))
+  const sync = (): void => {
+    state.value = read()
+  }
+  window.addEventListener('popstate', sync)
+  onUnmounted(() => window.removeEventListener('popstate', sync))
+  return state
+}
+
+// useQueryParam stores in-page state using restricted query parameter values.
 export function useQueryParam<T extends string>(
   name: string,
   allowed: readonly T[],
   fallback: T,
 ): Ref<T> {
-  const state = ref(queryValue(name, allowed, fallback)) as Ref<T>
-  const write = (value: T): void => writeQuery({ [name]: value === fallback ? null : value })
-  watch(state, write)
-  onActivated(() => write(state.value))
-  const sync = (): void => {
-    state.value = queryValue(name, allowed, fallback)
-  }
-  window.addEventListener('popstate', sync)
-  onUnmounted(() => window.removeEventListener('popstate', sync))
-  return state
+  return bindQuery(name, () => queryValue(name, allowed, fallback), fallback)
+}
+
+// useQueryText stores in-page state using arbitrary text query parameters.
+export function useQueryText(name: string, fallback = ''): Ref<string> {
+  return bindQuery(
+    name,
+    () => new URLSearchParams(window.location.search).get(name) ?? fallback,
+    fallback,
+  )
 }
 
 // useTabParam stores current page as tab query parameter, clearing previous query parameters on tab switch

@@ -125,17 +125,9 @@ type IsolatedLoginResult struct {
 	DriveError   string
 }
 
-// LoginVerification represents verification result of login state by an isolated runtime
-type LoginVerification struct {
-	Authenticated bool      `json:"authenticated"`
-	VerifiedAt    time.Time `json:"verified_at"`
-	Reason        string    `json:"reason,omitempty"`
-}
-
-// IsolatedLoginDriver defines the contract for isolated browser login and verification
+// IsolatedLoginDriver defines the contract for isolated browser login.
 type IsolatedLoginDriver interface {
 	Login(context.Context, IsolatedLoginRequest) (IsolatedLoginResult, error)
-	Verify(context.Context, IsolatedLoginRequest, StorageState) (LoginVerification, error)
 }
 
 // SupportedLoginMethods returns the login methods currently available for publishing

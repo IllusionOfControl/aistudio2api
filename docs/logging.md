@@ -2,6 +2,8 @@
 
 The management dashboard and system console share the same set of structured events. The web UI aggregates logs per request, while the console outputs line-by-line JSON to standard error. Log sources are identified as `service`, `request`, or the Google email address of the executing account.
 
+When `LOG_FILE=true`, console JSON logs are simultaneously written to `runtime/logs/aistudio2api.log`. Each file rotates at 10 MB with rotated filenames stamped with local time; when total directory size exceeds `LOG_MAX_TOTAL_MB`, the oldest files are deleted. Both settings take effect immediately upon saving in the settings panel.
+
 The management API pushes historical snapshots and real-time increments via `GET /api/events`. Authentication operations that are not yet bound to a formal account (such as account creation) use the `auth` source.
 
 ## Log Structure
@@ -63,10 +65,21 @@ Accounts with empty catalogs, single-account sync failures, or empty responses e
 INFO  account@example.com  Model catalog updated | models=39
 ```
 
-The same loop checks `GetAiStudioBenefitTier` for all `enabled`, `ready`, or `busy` accounts every 10 minutes, with accounts whose concurrency slots are occupied skipping the round. When tier changes, scheduling and public channels update:
+The same loop concurrently reads benefits and `ListModels` catalogs every 10 minutes for all `enabled`, `ready`, or `busy` accounts, skipping accounts with full concurrency slots; subscription models also refresh that account upon encountering quota errors. When benefits or model counts change, account scheduling and public catalogs update; failures record the reason, and accounts with expired login transition to login-required:
 
 ```text
-INFO  account@example.com  Account benefit tier updated | tier=Free→Ultra
+INFO  account@example.com  Account state updated | tier=Free→Ultra | models=46→47
+WARN  account@example.com  Account state refresh failed | error=...
+```
+
+Online updates write to the same card across two steps, and the management process relaunches upon completion:
+
+```text
+INFO  service  Online update | 1/2 | Downloading release package | version=v0.2.14
+INFO  service  Online update | 2/2 | Replacing executable | version=v0.2.14
+INFO  service  Online update complete | version=v0.2.14
+ERROR service  Online update failed | error=...
+```
 ```
 
 Cancellation and failure logs:
@@ -183,7 +196,7 @@ When no progress is detected across 15 consecutive seconds, diagnostic logs are 
 | `upstream first event arrived` | First semantic event decoded after waiting | `waiting`, `event`, `model` |
 | `stream stalled` | Semantic events previously received; no new events for 15s | `last_event`, `reasoning`, `content`, `upstream_bytes`, `last_network` |
 | `stream resumed` | Next semantic event decoded following stall | `stalled`, `current_event` |
-| `account fallback` | Current account failed prior to first upstream semantic event | Account source, model, and underlying reason |
+| `account fallback` | Current account failed prior to first upstream semantic event, or upstream stream interrupted during non-streaming request | Account source, model, and underlying reason on next line |
 
 `upstream_bytes` measures cumulative upstream body bytes read for the account, and `last_network` records the duration since the most recent read. `upstream_bytes=0` indicates no response body data has arrived; growing byte counts with short `last_network` values indicate incoming network data that the decoder has not yet formed into complete semantic events.
 
@@ -236,9 +249,8 @@ Management dashboard account operation events:
 
 | Event | Outcome |
 | --- | --- |
-| `account addition \| 1/2`, `2/2`, `account addition complete` | Isolated login, auth state saved, model catalog synchronized |
-| `account login \| 1/2`, `2/2`, `account login complete` | Updated credentials and worker instances for current account |
-| `account verification`, `account verification complete` | Verified AI Studio access, benefit tiers, and live catalog |
+| `account addition | 1/2`, `2/2`, `account addition complete` | Isolated login, auth state saved, model catalog synchronized |
+| `account login | 1/2`, `2/2`, `account login complete` | Updated credentials and worker instances for current account |
 | `account config updated`, `account deleted` | Account configuration and runtime objects updated |
 | `account catalog sync complete` | New catalog written to shared model catalog and scheduling states |
 | `account catalog sync retry pending` | Current sync failed; runtime retries will continue processing |
