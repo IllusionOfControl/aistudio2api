@@ -9,7 +9,6 @@ import (
 	"maps"
 	"net/http"
 	"slices"
-	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -35,6 +34,23 @@ type responsesRequest struct {
 	Metadata           map[string]string `json:"metadata"`
 	Store              *bool             `json:"store"`
 	Background         bool              `json:"background"`
+	Conversation       json.RawMessage   `json:"conversation"`
+	Prompt             json.RawMessage   `json:"prompt"`
+	Include            []string          `json:"include"`
+	ContextManagement  []struct {
+		Type             string `json:"type"`
+		CompactThreshold *int64 `json:"compact_threshold"`
+	} `json:"context_management"`
+}
+
+// compactThreshold returns the trigger token count for compaction in context_management, or 0 if none is configured.
+func (request responsesRequest) compactThreshold() int64 {
+	for _, entry := range request.ContextManagement {
+		if entry.Type == "compaction" && entry.CompactThreshold != nil {
+			return *entry.CompactThreshold
+		}
+	}
+	return 0
 }
 
 type responsesTool struct {
@@ -83,6 +99,8 @@ type responseRecord struct {
 	Input      []storedItem
 	Output     []storedItem
 	Background bool
+	// Stream contains the event log of background streaming responses.
+	Stream *streamLog
 }
 
 // storedItem is an ID-bearing Responses input or output item
@@ -160,8 +178,10 @@ func (store *responseStateStore) Store(id string, previous responseHistory, resu
 			state.Record.Input = append(append([]storedItem(nil), previous.Items...), state.Record.Input...)
 		}
 	}
+	if _, exists := store.states[id]; !exists {
+		store.order = append(store.order, id)
+	}
 	store.states[id] = state
-	store.order = append(store.order, id)
 	for len(store.order) > responseStateCapacity {
 		id := store.order[0]
 		store.order = store.order[1:]
@@ -206,6 +226,17 @@ func (store *responseStateStore) Response(id string) (json.RawMessage, bool, boo
 	shell["output"], _ = json.Marshal(output)
 	encoded, _ := json.Marshal(shell)
 	return encoded, state.Record.Background, true
+}
+
+// Stream returns the event record of responses created with background and stream.
+func (store *responseStateStore) Stream(id string) (*streamLog, bool) {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	state, exists := store.states[id]
+	if !exists || state.Record == nil || state.Record.Stream == nil {
+		return nil, false
+	}
+	return state.Record.Stream, true
 }
 
 // Interaction returns stored interaction resource for Interactions API
@@ -312,6 +343,10 @@ func (s *server) handleResponses(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "model is required")
 		return
 	}
+	if rawJSONConfigured(request.Conversation) || rawJSONConfigured(request.Prompt) {
+		writeOpenAIError(w, http.StatusNotFound, "not_found", "conversation and prompt objects are not stored by this service; send the full input or previous_response_id")
+		return
+	}
 	responseID := newID("resp")
 	prepared, err := s.prepareResponses(r.Context(), &request, responseID)
 	if err != nil {
@@ -324,6 +359,21 @@ func (s *server) handleResponses(w http.ResponseWriter, r *http.Request) {
 		s.handleCompactionTrigger(w, r, request, prepared, responseID)
 		return
 	}
+	if request.Background && !request.Stream {
+		s.respondBackground(w, r, request, prepared, responseID)
+		return
+	}
+	if request.Background {
+		s.streamBackground(w, r, request, prepared, responseID)
+		return
+	}
+	compaction, err := s.compactOverThreshold(r.Context(), &request, &prepared, responseID)
+	if err != nil {
+		if shouldWriteRequestError(r, err) {
+			writeOpenAIRequestError(w, err)
+		}
+		return
+	}
 	generateRequest := prepared.generate
 	generateRequest.Unary = !request.Stream
 	events, err := s.service.Generate(r.Context(), generateRequest)
@@ -332,25 +382,25 @@ func (s *server) handleResponses(w http.ResponseWriter, r *http.Request) {
 	}
 	if err != nil {
 		if shouldWriteRequestError(r, err) {
-			writeOpenAIError(w, statusFromError(err), openAIErrorCode(err), err.Error())
+			writeOpenAIRequestError(w, err)
 		}
 		return
 	}
 	created := time.Now().Unix()
 	if request.Stream {
-		s.streamResponses(w, r, request, prepared, responseID, created, events)
+		s.streamResponses(w, r, request, prepared, responseID, created, events, compaction)
 		return
 	}
 	result, err := consumeEvents(r.Context(), events, nil)
 	if err != nil {
 		if shouldWriteRequestError(r, err) {
-			writeOpenAIError(w, statusFromError(err), openAIErrorCode(err), err.Error())
+			writeOpenAIRequestError(w, err)
 		}
 		return
 	}
-	response, err := buildResponsesObject(responseID, created, request, result)
+	response, err := buildResponsesObject(responseID, created, request, result, compaction)
 	if err != nil {
-		writeOpenAIError(w, statusFromError(err), openAIErrorCode(err), err.Error())
+		writeOpenAIRequestError(w, err)
 		return
 	}
 	if request.storesResponse() {
@@ -366,6 +416,35 @@ type responsesPreparation struct {
 	contents           []aistudio.Content
 	inlineInstructions []string
 	input              []storedItem
+	// stream is the event record for background streaming responses, saved with the response object.
+	stream *streamLog
+}
+
+// compactOverThreshold compresses input when the context_management compaction threshold is exceeded; uses developer and system messages of the compressed portion, retained items, and compaction items as input, and returns the compaction item inserted before generation.
+func (s *server) compactOverThreshold(ctx context.Context, request *responsesRequest, prepared *responsesPreparation, id string) (map[string]any, error) {
+	threshold := request.compactThreshold()
+	if threshold <= 0 {
+		return nil, nil
+	}
+	count, err := s.service.CountTokens(ctx, aistudio.TokenCountRequest{
+		Model: prepared.generate.Model, System: prepared.generate.System, Contents: prepared.generate.Contents, Tools: prepared.generate.Tools,
+	})
+	if err != nil || count.InputTokens <= threshold {
+		return nil, err
+	}
+	item, retained, instructions, _, err := s.compactResponses(ctx, *request, prepared.previous, id)
+	if err != nil {
+		return nil, err
+	}
+	encoded, _ := json.Marshal(item)
+	request.Input, _ = json.Marshal(slices.Concat(instructions, retained, []json.RawMessage{encoded}))
+	request.PreviousResponseID = ""
+	compacted, err := s.prepareResponses(ctx, request, id)
+	if err != nil {
+		return nil, err
+	}
+	*prepared = compacted
+	return item, nil
 }
 
 // prepareResponses resolves item_references, transforms request, downloads external media, and connects prior context
@@ -390,7 +469,7 @@ func (s *server) prepareResponses(ctx context.Context, request *responsesRequest
 		return prepared, nil
 	}
 	previous, ok := s.responseStates.Load(request.PreviousResponseID)
-	if !ok {
+	if !ok || previous.Interaction {
 		return responsesPreparation{}, fmt.Errorf("previous response %q was not found", request.PreviousResponseID)
 	}
 	prepared.previous = previous
@@ -415,7 +494,7 @@ func (s *server) storeResponse(id string, request responsesRequest, prepared res
 	shell := maps.Clone(response)
 	delete(shell, "output")
 	encoded, _ := json.Marshal(shell)
-	record := &responseRecord{Model: request.Model, Shell: encoded, Input: prepared.input, Background: request.Background}
+	record := &responseRecord{Model: request.Model, Shell: encoded, Input: prepared.input, Background: request.Background, Stream: prepared.stream}
 	for _, item := range response["output"].([]any) {
 		object, _ := item.(map[string]any)
 		if itemID, _ := object["id"].(string); itemID != "" {
@@ -520,7 +599,8 @@ func (request responsesRequest) toGenerateRequest(id string) (aistudio.GenerateR
 		instructions = append(instructions, request.Instructions)
 	}
 	instructions = append(instructions, inlineInstructions...)
-	tools, err := mapResponsesTools(request.Tools, request.ToolChoice)
+	additionalTools, configuredEffort := responsesInputConfig(request.Input)
+	tools, err := mapResponsesTools(slices.Concat(request.Tools, additionalTools), request.ToolChoice)
 	if err != nil {
 		return aistudio.GenerateRequest{}, nil, err
 	}
@@ -567,6 +647,9 @@ func (request responsesRequest) toGenerateRequest(id string) (aistudio.GenerateR
 		config.ReasoningEffort = reasoning.Effort
 		summary := cmp.Or(reasoning.Summary, reasoning.GenerateSummary)
 		config.HideThinking = summary == "" || summary == "none"
+	}
+	if configuredEffort != "" {
+		config.ReasoningEffort = configuredEffort
 	}
 	if len(request.Text) > 0 && string(request.Text) != "null" {
 		var text struct {
@@ -629,8 +712,10 @@ func responsesContents(raw json.RawMessage) ([]aistudio.Content, []string, error
 				return nil, nil, fmt.Errorf("compaction_trigger must be the final input item")
 			}
 			continue
+		case "additional_tools", "configuration_update":
+			continue
 		case "web_search_call", "code_interpreter_call", "image_generation_call", "file_search_call", "computer_call", "computer_call_output",
-			"mcp_call", "mcp_list_tools", "mcp_approval_request", "mcp_approval_response", "tool_search_call", "tool_search_output":
+			"mcp_call", "mcp_list_tools", "mcp_approval_request", "mcp_approval_response", "tool_search_call", "tool_search_output", "program", "program_output":
 			pendingSignature = ""
 			content, err := responsesHostedItem(kind, rawItem)
 			if err != nil {
@@ -695,13 +780,13 @@ func responsesContents(raw json.RawMessage) ([]aistudio.Content, []string, error
 			if item.Type == "apply_patch_call_output" {
 				item.Output, _ = json.Marshal(map[string]any{"status": item.Status, "output": rawJSONValue(item.Output, nil)})
 			}
-			output, err := normalizeFunctionResultContent(item.Output)
+			output, media, err := functionResultParts(item.Output, false, openAIContentParts)
 			if err != nil {
 				return nil, nil, fmt.Errorf("%s: %w", item.Type, err)
 			}
-			contents = append(contents, aistudio.Content{Role: aistudio.RoleTool, Parts: []aistudio.Part{{FunctionResult: &aistudio.FunctionResult{
+			contents = append(contents, aistudio.Content{Role: aistudio.RoleTool, Parts: append([]aistudio.Part{{FunctionResult: &aistudio.FunctionResult{
 				ID: item.CallID, Content: output,
-			}}}})
+			}}}, media...)})
 			continue
 		case "reasoning":
 			pendingSignature = item.EncryptedContent
@@ -712,15 +797,34 @@ func responsesContents(raw json.RawMessage) ([]aistudio.Content, []string, error
 		contents = append(contents, aistudio.Content{Role: aistudio.RoleAssistant, Parts: []aistudio.Part{{FunctionCall: &call}}})
 		pendingSignature = ""
 	}
-	if len(systemMedia) > 0 {
-		index := slices.IndexFunc(contents, func(content aistudio.Content) bool { return content.Role == aistudio.RoleUser })
-		if index < 0 {
-			contents = append([]aistudio.Content{{Role: aistudio.RoleUser, Parts: systemMedia}}, contents...)
-		} else {
-			contents[index].Parts = append(systemMedia, contents[index].Parts...)
+	return prependSystemMedia(contents, systemMedia), instructions, nil
+}
+
+// responsesInputConfig returns tools provided by additional_tools in input items and reasoning effort of the last configuration_update.
+func responsesInputConfig(raw json.RawMessage) ([]responsesTool, string) {
+	var items []struct {
+		Type      string          `json:"type"`
+		Tools     []responsesTool `json:"tools"`
+		Reasoning *struct {
+			Effort string `json:"effort"`
+		} `json:"reasoning"`
+	}
+	if json.Unmarshal(raw, &items) != nil {
+		return nil, ""
+	}
+	var tools []responsesTool
+	effort := ""
+	for _, item := range items {
+		switch item.Type {
+		case "additional_tools":
+			tools = append(tools, item.Tools...)
+		case "configuration_update":
+			if item.Reasoning != nil && item.Reasoning.Effort != "" {
+				effort = item.Reasoning.Effort
+			}
 		}
 	}
-	return contents, instructions, nil
+	return tools, effort
 }
 
 // responsesItemType reads type field from input item
@@ -859,76 +963,19 @@ func mapResponsesTools(tools []responsesTool, choice json.RawMessage) (aistudio.
 	return mapped, nil
 }
 
-func buildResponsesObject(id string, created int64, request responsesRequest, result generationResult) (map[string]any, error) {
-	output := make([]any, 0, 2+len(result.toolCalls)+len(result.media))
-	if result.reasoning.Len() > 0 {
-		output = append(output, map[string]any{
-			"id":     "rs_" + id,
-			"type":   "reasoning",
-			"status": "completed",
-			"summary": []any{map[string]any{
-				"type": "summary_text",
-				"text": result.reasoning.String(),
-			}},
-		})
-	}
-	output = append(output, responseCodeInterpreterItems(id, result.events)...)
-	if responsesUsesWebSearch(request.Tools) {
-		output = append(output, responseWebSearchItems(id, result.events)...)
-	}
-	if result.text.Len() > 0 {
-		output = append(output, map[string]any{
-			"id":     "msg_" + id,
-			"type":   "message",
-			"status": "completed",
-			"role":   "assistant",
-			"content": []any{map[string]any{
-				"type":        "output_text",
-				"text":        result.text.String(),
-				"annotations": responsesCitations(result.citations),
-			}},
-		})
-	}
-	for _, call := range result.toolCalls {
-		if call.ThoughtSignature != "" {
-			output = append(output, responseReasoningSignature(call))
-		}
-		output = append(output, responseFunctionCall(call, request.Tools))
-	}
-	for index, media := range result.media {
-		item, err := responseImageGenerationItem(id, index, media)
-		if err != nil {
+// buildResponsesObject constructs non-streaming response object using the same output accumulator as streaming; puts compaction at the top of outputs when present.
+func buildResponsesObject(id string, created int64, request responsesRequest, result generationResult, compaction map[string]any) (map[string]any, error) {
+	writer := newResponsesWriter(nil, id, created, request)
+	writer.compaction = compaction
+	for _, event := range result.events {
+		if err := writer.receive(event); err != nil {
 			return nil, err
 		}
-		output = append(output, item)
 	}
-	status := "completed"
-	incompleteReason := ""
-	switch openAIFinishReason(result.finishReason, false) {
-	case "length":
-		status = "incomplete"
-		incompleteReason = "max_output_tokens"
-	case "content_filter":
-		status = "incomplete"
-		incompleteReason = "content_filter"
+	if err := writer.complete(true); err != nil {
+		return nil, err
 	}
-	response := responseShell(id, created, status, request)
-	response["completed_at"] = time.Now().Unix()
-	if status == "incomplete" {
-		response["incomplete_details"] = map[string]any{"reason": incompleteReason}
-	}
-	response["output"] = output
-	response["output_text"] = result.text.String()
-	if result.providerModel != "" {
-		response["provider_model"] = result.providerModel
-	}
-	if providerReason := providerFinishReason(result.finishReason); providerReason != "" {
-		response["provider_finish_reason"] = providerReason
-	}
-	if result.usage != nil {
-		response["usage"] = responsesUsage(result.usage)
-	}
-	return response, nil
+	return writer.response(result), nil
 }
 
 func responseShell(id string, created int64, status string, request responsesRequest) map[string]any {
@@ -978,6 +1025,7 @@ func responseShell(id string, created int64, status string, request responsesReq
 		"top_p":                request.TopP,
 		"truncation":           truncation,
 		"max_output_tokens":    request.MaxOutputTokens,
+		"background":           request.Background,
 		"usage":                nil,
 	}
 }
@@ -1036,58 +1084,6 @@ func responsesNamespace(tools []responsesTool, name string) string {
 	return ""
 }
 
-func responseReasoningSignature(call aistudio.FunctionCall) map[string]any {
-	return map[string]any{
-		"id": "rs_" + call.ID, "type": "reasoning", "status": "completed",
-		"summary": []any{}, "encrypted_content": call.ThoughtSignature,
-	}
-}
-
-func responseCodeInterpreterItems(responseID string, events []aistudio.Event) []any {
-	type codeCall struct {
-		code   string
-		result *aistudio.CodeExecutionResult
-	}
-	calls := make([]codeCall, 0)
-	for _, event := range events {
-		switch event.Kind {
-		case aistudio.EventExecutableCode:
-			if event.ExecutableCode != nil {
-				calls = append(calls, codeCall{code: event.ExecutableCode.Code})
-			}
-		case aistudio.EventCodeExecutionResult:
-			if event.CodeExecutionResult != nil && len(calls) > 0 {
-				result := *event.CodeExecutionResult
-				calls[len(calls)-1].result = &result
-			}
-		}
-	}
-	items := make([]any, 0, len(calls))
-	for index, call := range calls {
-		status := "incomplete"
-		var outputs any
-		if call.result != nil {
-			status = "completed"
-			logs := call.result.Output
-			if call.result.Outcome != "OUTCOME_OK" {
-				status = "failed"
-				logs = call.result.Error
-				if logs != "" {
-					logs = "stderr:\n" + logs
-				}
-			}
-			if logs != "" {
-				outputs = []any{map[string]any{"type": "logs", "logs": logs}}
-			}
-		}
-		items = append(items, map[string]any{
-			"id": fmt.Sprintf("ci_%s_%d", responseID, index), "type": "code_interpreter_call",
-			"status": status, "code": call.code, "container_id": "aistudio", "outputs": outputs,
-		})
-	}
-	return items
-}
-
 func responseImageGenerationItem(responseID string, index int, media aistudio.Media) (map[string]any, error) {
 	if !strings.HasPrefix(media.MIME, "image/") || len(media.Data) == 0 {
 		return nil, fmt.Errorf("Responses API cannot represent media %q without inline image data", media.MIME)
@@ -1100,27 +1096,13 @@ func responseImageGenerationItem(responseID string, index int, media aistudio.Me
 	}, nil
 }
 
-func responsesCitations(citations []aistudio.Citation) []map[string]any {
-	output := make([]map[string]any, 0, len(citations))
-	for _, citation := range citations {
-		output = append(output, map[string]any{
-			"type":        "url_citation",
-			"start_index": citation.Start,
-			"end_index":   citation.End,
-			"title":       citation.Title,
-			"url":         citation.URL,
-		})
-	}
-	return output
-}
-
 func responsesUsage(usage *aistudio.Usage) map[string]any {
 	return map[string]any{
 		"input_tokens":  inputTokens(usage),
 		"output_tokens": outputTokens(usage),
 		"total_tokens":  usage.TotalTokens,
 		"input_tokens_details": map[string]any{
-			"cached_tokens": usage.CachedTokens,
+			"cached_tokens": usage.CachedTokens, "cache_write_tokens": 0,
 		},
 		"output_tokens_details": map[string]any{
 			"reasoning_tokens": usage.ReasoningTokens,
@@ -1128,207 +1110,426 @@ func responsesUsage(usage *aistudio.Usage) map[string]any {
 	}
 }
 
+// responsesOutput accumulates Responses output items in generation order: reasoning as reasoning items, body as message items, code execution, search, images, and function calls as their respective call items; when encrypted_content is requested, function call signatures are written to the preceding reasoning item.
+type responsesOutput struct {
+	id        string
+	request   responsesRequest
+	tools     []responsesTool
+	items     []map[string]any
+	reasoning map[string]any
+	message   map[string]any
+	code      map[string]any
+	texts     map[string]*strings.Builder
+	starts    map[string]int
+	queries   map[string]struct{}
+	text      int
+	codes     int
+	images    int
+	searches  int
+	citations []aistudio.Citation
+}
+
+// itemID returns the ID for a new output item: prefix plus response ID for the first of its kind, with subsequent items numbered.
+func (o *responsesOutput) itemID(prefix string) string {
+	if !slices.ContainsFunc(o.items, func(item map[string]any) bool { return item["id"] == prefix+o.id }) {
+		return prefix + o.id
+	}
+	return fmt.Sprintf("%s%s_%d", prefix, o.id, len(o.items))
+}
+
+// add processes an event and returns newly added output items: reasoning and text are merged into preceding items of the same kind, otherwise starting a new item; adds a web_search_call item when a new query appears in search results.
+func (o *responsesOutput) add(event aistudio.Event) ([]map[string]any, error) {
+	var added []map[string]any
+	push := func(item map[string]any) {
+		o.items = append(o.items, item)
+		added = append(added, item)
+	}
+	isLast := func(item map[string]any) bool {
+		return item != nil && o.items[len(o.items)-1]["id"] == item["id"]
+	}
+	write := func(item map[string]any, part map[string]any, text string) {
+		builder := o.texts[item["id"].(string)]
+		builder.WriteString(text)
+		part["text"] = builder.String()
+	}
+	switch event.Kind {
+	case aistudio.EventReasoning:
+		if !isLast(o.reasoning) {
+			o.reasoning = map[string]any{"id": o.itemID("rs_"), "type": "reasoning", "status": "completed", "summary": []any{map[string]any{"type": "summary_text", "text": ""}}}
+			o.texts[o.reasoning["id"].(string)] = &strings.Builder{}
+			push(o.reasoning)
+		}
+		write(o.reasoning, o.reasoning["summary"].([]any)[0].(map[string]any), event.Text)
+	case aistudio.EventText:
+		if !isLast(o.message) {
+			o.message = map[string]any{"id": o.itemID("msg_"), "type": "message", "status": "completed", "role": "assistant", "content": []any{map[string]any{"type": "output_text", "text": "", "annotations": []any{}}}}
+			o.texts[o.message["id"].(string)] = &strings.Builder{}
+			o.starts[o.message["id"].(string)] = o.text
+			push(o.message)
+		}
+		write(o.message, o.message["content"].([]any)[0].(map[string]any), event.Text)
+		o.text += len(event.Text)
+	case aistudio.EventToolCall:
+		if event.ToolCall == nil {
+			break
+		}
+		call := *event.ToolCall
+		if len(call.Arguments) == 0 {
+			call.Arguments = json.RawMessage(`{}`)
+		}
+		if call.ThoughtSignature != "" && slices.Contains(o.request.Include, "reasoning.encrypted_content") {
+			if len(o.items) > 0 && o.items[len(o.items)-1]["type"] == "reasoning" && o.items[len(o.items)-1]["encrypted_content"] == nil {
+				o.items[len(o.items)-1]["encrypted_content"] = call.ThoughtSignature
+			} else {
+				push(map[string]any{"id": "rs_" + call.ID, "type": "reasoning", "status": "completed", "summary": []any{}, "encrypted_content": call.ThoughtSignature})
+			}
+		}
+		push(responseFunctionCall(call, o.tools))
+	case aistudio.EventMedia:
+		if event.Media == nil {
+			break
+		}
+		item, err := responseImageGenerationItem(o.id, o.images, *event.Media)
+		if err != nil {
+			return nil, err
+		}
+		o.images++
+		push(item)
+	case aistudio.EventExecutableCode:
+		if event.ExecutableCode == nil {
+			break
+		}
+		o.code = map[string]any{
+			"id": fmt.Sprintf("ci_%s_%d", o.id, o.codes), "type": "code_interpreter_call",
+			"status": "incomplete", "code": event.ExecutableCode.Code, "container_id": "aistudio", "outputs": nil,
+		}
+		o.codes++
+		push(o.code)
+	case aistudio.EventCodeExecutionResult:
+		if event.CodeExecutionResult == nil || o.code == nil {
+			break
+		}
+		result := event.CodeExecutionResult
+		status, logs := "completed", result.Output
+		if result.Outcome != "OUTCOME_OK" {
+			status, logs = "failed", result.Error
+			if logs != "" {
+				logs = "stderr:\n" + logs
+			}
+		}
+		o.code["status"] = status
+		if logs != "" {
+			o.code["outputs"] = []any{map[string]any{"type": "logs", "logs": logs}}
+		}
+		o.code = nil
+	case aistudio.EventCitation:
+		if event.Citation != nil {
+			o.citations = append(o.citations, *event.Citation)
+		}
+	case aistudio.EventGrounding:
+		if event.Grounding == nil {
+			break
+		}
+		o.citations = append(o.citations, groundingCitations(*event.Grounding)...)
+		if !responsesUsesWebSearch(o.request.Tools) {
+			break
+		}
+		var queries []any
+		for _, query := range event.Grounding.WebSearchQueries {
+			if _, exists := o.queries[query]; !exists {
+				o.queries[query] = struct{}{}
+				queries = append(queries, query)
+			}
+		}
+		if len(queries) == 0 {
+			break
+		}
+		action := map[string]any{"type": "search", "query": queries[0], "queries": queries}
+		if slices.Contains(o.request.Include, "web_search_call.action.sources") {
+			action["sources"] = responseWebSearchSources(*event.Grounding)
+		}
+		push(map[string]any{"id": fmt.Sprintf("ws_%s_%d", o.id, o.searches), "type": "web_search_call", "status": "completed", "action": action})
+		o.searches++
+	}
+	return added, nil
+}
+
+// annotate writes url_citation annotations to message item text and returns them: citations with ranges are mapped to character offsets within their respective items, while citations without ranges are written only to the final message item.
+func (o *responsesOutput) annotate(message map[string]any, final bool) []any {
+	part := message["content"].([]any)[0].(map[string]any)
+	text := part["text"].(string)
+	spans := []textSpan{{source: o.starts[message["id"].(string)], length: len(text)}}
+	annotations := []any{}
+	for _, citation := range o.citations {
+		start, end, ok := 0, 0, final && citation.End == 0
+		if citation.End > 0 {
+			start, end, ok = spanCitation(text, spans, citation)
+		}
+		if ok {
+			annotations = append(annotations, map[string]any{
+				"type": "url_citation", "start_index": start, "end_index": end, "title": citation.Title, "url": citation.URL,
+			})
+		}
+	}
+	part["annotations"] = annotations
+	return annotations
+}
+
+// responsesStreamWriter writes normalized events as a Responses stream; when w is nil, only accumulates output items to generate identical output for non-streaming responses.
 type responsesStreamWriter struct {
-	w             http.ResponseWriter
-	sequence      int
-	id            string
-	created       int64
-	request       responsesRequest
-	indexes       map[string]int
-	reasoningOpen bool
-	textOpen      bool
-	mediaCount    int
-	codeCount     int
-	searchCount   int
-	searchQueries map[string]struct{}
-	searchProbe   bool
-	pendingText   []string
-	pendingCode   *responsesPendingCode
+	w        http.ResponseWriter
+	sequence int
+	id       string
+	created  int64
+	request  responsesRequest
+	output   *responsesOutput
+	open     []map[string]any
+	code     map[string]any
+	search   bool
+	held     []aistudio.Event
+	// compaction is the compaction item obtained from pre-generation compression, ordered first in output.
+	compaction map[string]any
 }
 
-type responsesPendingCode struct {
-	id    string
-	index int
-	code  string
+// newResponsesWriter returns a Responses output writer, deferring text output until search results arrive when search is declared.
+func newResponsesWriter(w http.ResponseWriter, id string, created int64, request responsesRequest) *responsesStreamWriter {
+	additional, _ := responsesInputConfig(request.Input)
+	return &responsesStreamWriter{
+		w: w, id: id, created: created, request: request, search: responsesUsesWebSearch(request.Tools),
+		output: &responsesOutput{
+			id: id, request: request, tools: slices.Concat(request.Tools, additional), texts: make(map[string]*strings.Builder),
+			starts: make(map[string]int), queries: make(map[string]struct{}),
+		},
+	}
 }
 
-func (s *server) streamResponses(w http.ResponseWriter, r *http.Request, request responsesRequest, prepared responsesPreparation, id string, created int64, events <-chan aistudio.Event) {
+func (s *server) streamResponses(w http.ResponseWriter, r *http.Request, request responsesRequest, prepared responsesPreparation, id string, created int64, events <-chan aistudio.Event, compaction map[string]any) {
 	if err := streamHeaders(w); err != nil {
 		return
 	}
-	writer := &responsesStreamWriter{
-		w: w, id: id, created: created, request: request,
-		indexes: make(map[string]int), searchProbe: responsesUsesWebSearch(request.Tools),
-	}
+	writer := newResponsesWriter(w, id, created, request)
 	if err := writer.emit("response.created", map[string]any{"response": responseShell(id, created, "in_progress", request)}); err != nil {
 		return
 	}
 	if err := writer.emit("response.in_progress", map[string]any{"response": responseShell(id, created, "in_progress", request)}); err != nil {
 		return
 	}
-	result, err := consumeStreamEvents(r.Context(), events, writer.live, func() error { return writeSSEHeartbeat(w) })
+	_ = s.streamOutput(r.Context(), writer, prepared, events, compaction, func(err error) bool { return shouldWriteRequestError(r, err) })
+}
+
+// streamOutput writes output item events and terminal events, saving the final response; report determines whether to write response.failed on generation error; returns generation or writing errors.
+func (s *server) streamOutput(ctx context.Context, writer *responsesStreamWriter, prepared responsesPreparation, events <-chan aistudio.Event, compaction map[string]any, report func(error) bool) error {
+	if compaction != nil {
+		writer.compaction = compaction
+		if err := writer.emit("response.output_item.added", map[string]any{"output_index": 0, "item": compaction}); err != nil {
+			return err
+		}
+		if err := writer.emit("response.output_item.done", map[string]any{"output_index": 0, "item": compaction}); err != nil {
+			return err
+		}
+	}
+	result, err := consumeStreamEvents(ctx, events, writer.receive, func() error { return writeSSEHeartbeat(writer.w) })
 	if err != nil {
-		if shouldWriteRequestError(r, err) {
-			_ = writer.flushPendingText()
+		if report(err) {
+			_ = writer.release()
 			_ = writer.failed(err)
 		}
-		return
+		return err
 	}
-	response, err := buildResponsesObject(id, created, request, result)
-	if err != nil {
-		_ = writer.failed(err)
-		return
-	}
-	completeErr := writer.complete(result, response)
-	if request.storesResponse() {
-		s.storeResponse(id, request, prepared, result, response)
+	completeErr := writer.complete(true)
+	response := writer.response(result)
+	if writer.request.storesResponse() {
+		s.storeResponse(writer.id, writer.request, prepared, result, response)
 	}
 	if completeErr != nil {
 		_ = writer.failed(completeErr)
-		return
+		return completeErr
 	}
 	if err := writer.terminal(response); err != nil {
 		_ = writer.failed(err)
+		return err
 	}
+	return nil
 }
 
 func (writer *responsesStreamWriter) emit(eventType string, payload map[string]any) error {
 	payload["type"] = eventType
 	payload["sequence_number"] = writer.sequence
 	writer.sequence++
+	if writer.w == nil {
+		return nil
+	}
 	return writeSSE(writer.w, eventType, payload)
 }
 
-func (writer *responsesStreamWriter) live(event aistudio.Event) error {
-	switch event.Kind {
-	case aistudio.EventReasoning:
-		index, err := writer.ensureReasoning()
-		if err != nil {
+// receive writes an event; buffers events starting from the first text when search is declared, writing buffered events after search results with queries or finish events arrive.
+func (writer *responsesStreamWriter) receive(event aistudio.Event) error {
+	if !writer.search {
+		return writer.live(event)
+	}
+	switch {
+	case event.Kind == aistudio.EventFinish || event.Kind == aistudio.EventGrounding && event.Grounding != nil && len(event.Grounding.WebSearchQueries) > 0:
+		if err := writer.live(event); err != nil {
 			return err
 		}
-		return writer.emit("response.reasoning_summary_text.delta", map[string]any{
-			"item_id": "rs_" + writer.id, "output_index": index, "summary_index": 0, "delta": event.Text,
-		})
-	case aistudio.EventText:
-		if writer.searchProbe {
-			writer.pendingText = append(writer.pendingText, event.Text)
-			return nil
-		}
-		return writer.emitText(event.Text)
-	case aistudio.EventToolCall:
-		if event.ToolCall != nil {
-			return writer.emitToolCall(*event.ToolCall)
-		}
-	case aistudio.EventMedia:
-		if event.Media != nil {
-			return writer.emitMedia(*event.Media)
-		}
-	case aistudio.EventExecutableCode:
-		if event.ExecutableCode != nil {
-			return writer.emitExecutableCode(*event.ExecutableCode)
-		}
-	case aistudio.EventCodeExecutionResult:
-		if event.CodeExecutionResult != nil {
-			return writer.emitCodeExecutionResult(*event.CodeExecutionResult)
-		}
-	case aistudio.EventGrounding:
-		if event.Grounding != nil {
-			emitted, err := writer.emitGrounding(*event.Grounding)
-			if err != nil {
-				return err
-			}
-			if writer.searchProbe && emitted {
-				if err := writer.flushPendingText(); err != nil {
-					return err
-				}
-			}
+		return writer.release()
+	case len(writer.held) > 0 || event.Kind == aistudio.EventText:
+		writer.held = append(writer.held, event)
+		return nil
+	}
+	return writer.live(event)
+}
+
+// release ends event buffering and emits held events.
+func (writer *responsesStreamWriter) release() error {
+	held := writer.held
+	writer.search, writer.held = false, nil
+	for _, event := range held {
+		if err := writer.live(event); err != nil {
+			return err
 		}
 	}
 	return nil
 }
 
-func (writer *responsesStreamWriter) emitText(text string) error {
-	index, err := writer.ensureText()
+// index returns the position of an output item in response output.
+func (writer *responsesStreamWriter) index(item map[string]any) int {
+	base := 0
+	if writer.compaction != nil {
+		base = 1
+	}
+	return base + slices.IndexFunc(writer.output.items, func(candidate map[string]any) bool { return candidate["id"] == item["id"] })
+}
+
+// items returns accumulated output items with compaction item at the top.
+func (writer *responsesStreamWriter) items() []any {
+	output := make([]any, 0, 1+len(writer.output.items))
+	if writer.compaction != nil {
+		output = append(output, writer.compaction)
+	}
+	for _, item := range writer.output.items {
+		output = append(output, item)
+	}
+	return output
+}
+
+// live writes an event: finishes still-open items before starting a new output item; reasoning and message items stay open until the next output item or end; code execution items complete when execution results arrive; other items complete immediately.
+func (writer *responsesStreamWriter) live(event aistudio.Event) error {
+	added, err := writer.output.add(event)
 	if err != nil {
 		return err
 	}
-	return writer.emit("response.output_text.delta", map[string]any{
-		"item_id": "msg_" + writer.id, "output_index": index, "content_index": 0, "delta": text, "logprobs": []any{},
-	})
-}
-
-func (writer *responsesStreamWriter) flushPendingText() error {
-	writer.searchProbe = false
-	for _, text := range writer.pendingText {
-		if err := writer.emitText(text); err != nil {
+	for _, item := range added {
+		if err := writer.added(item); err != nil {
 			return err
 		}
 	}
-	writer.pendingText = nil
+	switch event.Kind {
+	case aistudio.EventReasoning:
+		return writer.emit("response.reasoning_summary_text.delta", map[string]any{
+			"item_id": writer.output.reasoning["id"], "output_index": writer.index(writer.output.reasoning), "summary_index": 0, "delta": event.Text,
+		})
+	case aistudio.EventText:
+		return writer.emit("response.output_text.delta", map[string]any{
+			"item_id": writer.output.message["id"], "output_index": writer.index(writer.output.message), "content_index": 0, "delta": event.Text, "logprobs": []any{},
+		})
+	case aistudio.EventCodeExecutionResult:
+		if writer.code == nil || writer.output.code != nil {
+			return nil
+		}
+		code := writer.code
+		writer.code = nil
+		index := writer.index(code)
+		if err := writer.emit("response.code_interpreter_call.completed", map[string]any{"item_id": code["id"], "output_index": index}); err != nil {
+			return err
+		}
+		return writer.emit("response.output_item.done", map[string]any{"output_index": index, "item": code})
+	}
 	return nil
 }
 
-func (writer *responsesStreamWriter) ensureReasoning() (int, error) {
-	id := "rs_" + writer.id
-	if index, ok := writer.indexes[id]; ok {
-		return index, nil
+// added emits added events for new output items after completing still-open items; call items and signature-only reasoning items immediately emit content and done events.
+func (writer *responsesStreamWriter) added(item map[string]any) error {
+	if err := writer.complete(false); err != nil {
+		return err
 	}
-	index := len(writer.indexes)
-	writer.indexes[id] = index
-	item := map[string]any{"id": id, "type": "reasoning", "status": "in_progress", "summary": []any{}}
-	if err := writer.emit("response.output_item.added", map[string]any{"output_index": index, "item": item}); err != nil {
-		return 0, err
-	}
-	if err := writer.emit("response.reasoning_summary_part.added", map[string]any{
-		"item_id": id, "output_index": index, "summary_index": 0,
-		"part": map[string]any{"type": "summary_text", "text": ""},
-	}); err != nil {
-		return 0, err
-	}
-	writer.reasoningOpen = true
-	return index, nil
-}
-
-func (writer *responsesStreamWriter) ensureText() (int, error) {
-	id := "msg_" + writer.id
-	if index, ok := writer.indexes[id]; ok {
-		return index, nil
-	}
-	index := len(writer.indexes)
-	writer.indexes[id] = index
-	item := map[string]any{"id": id, "type": "message", "status": "in_progress", "role": "assistant", "content": []any{}}
-	if err := writer.emit("response.output_item.added", map[string]any{"output_index": index, "item": item}); err != nil {
-		return 0, err
-	}
-	if err := writer.emit("response.content_part.added", map[string]any{
-		"item_id": id, "output_index": index, "content_index": 0,
-		"part": map[string]any{"type": "output_text", "text": "", "annotations": []any{}},
-	}); err != nil {
-		return 0, err
-	}
-	writer.textOpen = true
-	return index, nil
-}
-
-func (writer *responsesStreamWriter) emitToolCall(call aistudio.FunctionCall) error {
-	if call.ThoughtSignature != "" {
-		id := "rs_" + call.ID
-		index := len(writer.indexes)
-		writer.indexes[id] = index
-		item := map[string]any{"id": id, "type": "reasoning", "status": "in_progress", "summary": []any{}}
-		if err := writer.emit("response.output_item.added", map[string]any{"output_index": index, "item": item}); err != nil {
+	index := writer.index(item)
+	switch {
+	case item["type"] == "reasoning" && len(item["summary"].([]any)) > 0:
+		pending := map[string]any{"id": item["id"], "type": "reasoning", "status": "in_progress", "summary": []any{}}
+		if err := writer.emit("response.output_item.added", map[string]any{"output_index": index, "item": pending}); err != nil {
 			return err
 		}
-		if err := writer.emit("response.output_item.done", map[string]any{
-			"output_index": index, "item": responseReasoningSignature(call),
-		}); err != nil {
+		writer.open = append(writer.open, item)
+		return writer.emit("response.reasoning_summary_part.added", map[string]any{
+			"item_id": item["id"], "output_index": index, "summary_index": 0,
+			"part": map[string]any{"type": "summary_text", "text": ""},
+		})
+	case item["type"] == "message":
+		pending := map[string]any{"id": item["id"], "type": "message", "status": "in_progress", "role": "assistant", "content": []any{}}
+		if err := writer.emit("response.output_item.added", map[string]any{"output_index": index, "item": pending}); err != nil {
 			return err
 		}
+		writer.open = append(writer.open, item)
+		return writer.emit("response.content_part.added", map[string]any{
+			"item_id": item["id"], "output_index": index, "content_index": 0,
+			"part": map[string]any{"type": "output_text", "text": "", "annotations": []any{}},
+		})
+	case item["type"] == "reasoning":
+		pending := maps.Clone(item)
+		pending["status"] = "in_progress"
+		if err := writer.emit("response.output_item.added", map[string]any{"output_index": index, "item": pending}); err != nil {
+			return err
+		}
+		return writer.emit("response.output_item.done", map[string]any{"output_index": index, "item": item})
+	case item["type"] == "code_interpreter_call":
+		pending := map[string]any{"id": item["id"], "type": "code_interpreter_call", "status": "in_progress", "code": "", "container_id": "aistudio", "outputs": nil}
+		if err := writer.emit("response.output_item.added", map[string]any{"output_index": index, "item": pending}); err != nil {
+			return err
+		}
+		if err := writer.emit("response.code_interpreter_call.in_progress", map[string]any{"item_id": item["id"], "output_index": index}); err != nil {
+			return err
+		}
+		if code := item["code"].(string); code != "" {
+			if err := writer.emit("response.code_interpreter_call_code.delta", map[string]any{"item_id": item["id"], "output_index": index, "delta": code}); err != nil {
+				return err
+			}
+			if err := writer.emit("response.code_interpreter_call_code.done", map[string]any{"item_id": item["id"], "output_index": index, "code": code}); err != nil {
+				return err
+			}
+		}
+		writer.code = item
+		return writer.emit("response.code_interpreter_call.interpreting", map[string]any{"item_id": item["id"], "output_index": index})
+	case item["type"] == "web_search_call":
+		pending := map[string]any{"id": item["id"], "type": "web_search_call", "status": "in_progress", "action": item["action"]}
+		if err := writer.emit("response.output_item.added", map[string]any{"output_index": index, "item": pending}); err != nil {
+			return err
+		}
+		for _, stage := range []string{"in_progress", "searching", "completed"} {
+			if err := writer.emit("response.web_search_call."+stage, map[string]any{"item_id": item["id"], "output_index": index}); err != nil {
+				return err
+			}
+		}
+		return writer.emit("response.output_item.done", map[string]any{"output_index": index, "item": item})
+	case item["type"] == "image_generation_call":
+		pending := map[string]any{"id": item["id"], "type": "image_generation_call", "status": "in_progress", "result": nil}
+		if err := writer.emit("response.output_item.added", map[string]any{"output_index": index, "item": pending}); err != nil {
+			return err
+		}
+		if err := writer.emit("response.image_generation_call.in_progress", map[string]any{"item_id": item["id"], "output_index": index}); err != nil {
+			return err
+		}
+		if err := writer.emit("response.image_generation_call.completed", map[string]any{"item_id": item["id"], "output_index": index}); err != nil {
+			return err
+		}
+		return writer.emit("response.output_item.done", map[string]any{"output_index": index, "item": item})
 	}
-	completed := responseFunctionCall(call, writer.request.Tools)
-	id := "fc_" + call.ID
-	index := len(writer.indexes)
-	writer.indexes[id] = index
+	return writer.toolCall(item, index)
+}
+
+// toolCall writes added, argument delta, and done events for function call items.
+func (writer *responsesStreamWriter) toolCall(completed map[string]any, index int) error {
+	id := completed["id"]
 	item := maps.Clone(completed)
 	item["status"] = "in_progress"
 	switch completed["type"] {
@@ -1342,14 +1543,13 @@ func (writer *responsesStreamWriter) emitToolCall(call aistudio.FunctionCall) er
 	}
 	switch completed["type"] {
 	case "function_call":
-		arguments := string(call.Arguments)
 		if err := writer.emit("response.function_call_arguments.delta", map[string]any{
-			"item_id": id, "output_index": index, "delta": arguments,
+			"item_id": id, "output_index": index, "delta": completed["arguments"],
 		}); err != nil {
 			return err
 		}
 		if err := writer.emit("response.function_call_arguments.done", map[string]any{
-			"item_id": id, "output_index": index, "arguments": arguments, "name": item["name"],
+			"item_id": id, "output_index": index, "arguments": completed["arguments"], "name": completed["name"],
 		}); err != nil {
 			return err
 		}
@@ -1368,140 +1568,85 @@ func (writer *responsesStreamWriter) emitToolCall(call aistudio.FunctionCall) er
 	return writer.emit("response.output_item.done", map[string]any{"output_index": index, "item": completed})
 }
 
-func (writer *responsesStreamWriter) emitMedia(media aistudio.Media) error {
-	completed, err := responseImageGenerationItem(writer.id, writer.mediaCount, media)
-	if err != nil {
-		return err
-	}
-	writer.mediaCount++
-	id := completed["id"].(string)
-	index := len(writer.indexes)
-	writer.indexes[id] = index
-	inProgress := map[string]any{"id": id, "type": "image_generation_call", "status": "in_progress", "result": nil}
-	if err := writer.emit("response.output_item.added", map[string]any{"output_index": index, "item": inProgress}); err != nil {
-		return err
-	}
-	if err := writer.emit("response.image_generation_call.in_progress", map[string]any{"item_id": id, "output_index": index}); err != nil {
-		return err
-	}
-	if err := writer.emit("response.image_generation_call.completed", map[string]any{"item_id": id, "output_index": index}); err != nil {
-		return err
-	}
-	return writer.emit("response.output_item.done", map[string]any{"output_index": index, "item": completed})
-}
-
-func (writer *responsesStreamWriter) emitExecutableCode(code aistudio.ExecutableCode) error {
-	id := fmt.Sprintf("ci_%s_%d", writer.id, writer.codeCount)
-	writer.codeCount++
-	index := len(writer.indexes)
-	writer.indexes[id] = index
-	writer.pendingCode = &responsesPendingCode{id: id, index: index, code: code.Code}
-	item := map[string]any{
-		"id": id, "type": "code_interpreter_call", "status": "in_progress",
-		"code": "", "container_id": "aistudio", "outputs": nil,
-	}
-	if err := writer.emit("response.output_item.added", map[string]any{"output_index": index, "item": item}); err != nil {
-		return err
-	}
-	if err := writer.emit("response.code_interpreter_call.in_progress", map[string]any{"item_id": id, "output_index": index}); err != nil {
-		return err
-	}
-	if code.Code != "" {
-		if err := writer.emit("response.code_interpreter_call_code.delta", map[string]any{"item_id": id, "output_index": index, "delta": code.Code}); err != nil {
-			return err
-		}
-		if err := writer.emit("response.code_interpreter_call_code.done", map[string]any{"item_id": id, "output_index": index, "code": code.Code}); err != nil {
-			return err
-		}
-	}
-	return writer.emit("response.code_interpreter_call.interpreting", map[string]any{"item_id": id, "output_index": index})
-}
-
-func (writer *responsesStreamWriter) emitCodeExecutionResult(result aistudio.CodeExecutionResult) error {
-	if writer.pendingCode == nil {
-		return fmt.Errorf("code execution result arrived before executable code")
-	}
-	call := writer.pendingCode
-	status := "completed"
-	logs := result.Output
-	if result.Outcome != "OUTCOME_OK" {
-		status = "failed"
-		logs = result.Error
-		if logs != "" {
-			logs = "stderr:\n" + logs
-		}
-	}
-	var outputs any
-	if logs != "" {
-		outputs = []any{map[string]any{"type": "logs", "logs": logs}}
-	}
-	item := map[string]any{
-		"id": call.id, "type": "code_interpreter_call", "status": status,
-		"code": call.code, "container_id": "aistudio", "outputs": outputs,
-	}
-	if err := writer.emit("response.code_interpreter_call.completed", map[string]any{"item_id": call.id, "output_index": call.index}); err != nil {
-		return err
-	}
-	if err := writer.emit("response.output_item.done", map[string]any{"output_index": call.index, "item": item}); err != nil {
-		return err
-	}
-	writer.pendingCode = nil
-	return nil
-}
-
-// complete finalizes open output items and orders response outputs matching stream order
-func (writer *responsesStreamWriter) complete(result generationResult, response map[string]any) error {
-	if writer.reasoningOpen {
-		id := "rs_" + writer.id
-		index := writer.indexes[id]
-		part := map[string]any{"type": "summary_text", "text": result.reasoning.String()}
-		if err := writer.emit("response.reasoning_summary_text.done", map[string]any{
-			"item_id": id, "output_index": index, "summary_index": 0, "text": result.reasoning.String(),
-		}); err != nil {
-			return err
-		}
-		if err := writer.emit("response.reasoning_summary_part.done", map[string]any{
-			"item_id": id, "output_index": index, "summary_index": 0, "part": part,
-		}); err != nil {
-			return err
-		}
-		item := map[string]any{"id": id, "type": "reasoning", "status": "completed", "summary": []any{part}}
-		if err := writer.emit("response.output_item.done", map[string]any{"output_index": index, "item": item}); err != nil {
-			return err
-		}
-	}
-	if err := writer.flushPendingText(); err != nil {
-		return err
-	}
-	if writer.textOpen {
-		id := "msg_" + writer.id
-		index := writer.indexes[id]
-		for annotationIndex, annotation := range responsesCitations(result.citations) {
-			if err := writer.emit("response.output_text.annotation.added", map[string]any{
-				"item_id": id, "output_index": index, "content_index": 0,
-				"annotation_index": annotationIndex, "annotation": annotation,
+// complete finishes reasoning and message items that are still open; when final is true, indicates response end and finishes code execution items without results.
+func (writer *responsesStreamWriter) complete(final bool) error {
+	open := writer.open
+	writer.open = nil
+	for _, item := range open {
+		index := writer.index(item)
+		if item["type"] == "reasoning" {
+			part := item["summary"].([]any)[0]
+			if err := writer.emit("response.reasoning_summary_text.done", map[string]any{
+				"item_id": item["id"], "output_index": index, "summary_index": 0, "text": part.(map[string]any)["text"],
+			}); err != nil {
+				return err
+			}
+			if err := writer.emit("response.reasoning_summary_part.done", map[string]any{
+				"item_id": item["id"], "output_index": index, "summary_index": 0, "part": part,
+			}); err != nil {
+				return err
+			}
+		} else {
+			for position, annotation := range writer.output.annotate(item, final) {
+				if err := writer.emit("response.output_text.annotation.added", map[string]any{
+					"item_id": item["id"], "output_index": index, "content_index": 0, "annotation_index": position, "annotation": annotation,
+				}); err != nil {
+					return err
+				}
+			}
+			part := item["content"].([]any)[0]
+			if err := writer.emit("response.output_text.done", map[string]any{
+				"item_id": item["id"], "output_index": index, "content_index": 0, "text": part.(map[string]any)["text"], "logprobs": []any{},
+			}); err != nil {
+				return err
+			}
+			if err := writer.emit("response.content_part.done", map[string]any{
+				"item_id": item["id"], "output_index": index, "content_index": 0, "part": part,
 			}); err != nil {
 				return err
 			}
 		}
-		part := map[string]any{"type": "output_text", "text": result.text.String(), "annotations": responsesCitations(result.citations)}
-		if err := writer.emit("response.output_text.done", map[string]any{
-			"item_id": id, "output_index": index, "content_index": 0, "text": result.text.String(), "logprobs": []any{},
-		}); err != nil {
-			return err
-		}
-		if err := writer.emit("response.content_part.done", map[string]any{
-			"item_id": id, "output_index": index, "content_index": 0, "part": part,
-		}); err != nil {
-			return err
-		}
-		item := map[string]any{"id": id, "type": "message", "status": "completed", "role": "assistant", "content": []any{part}}
 		if err := writer.emit("response.output_item.done", map[string]any{"output_index": index, "item": item}); err != nil {
 			return err
 		}
 	}
-	orderResponsesOutput(response, writer.indexes)
+	if final && writer.code != nil {
+		code := writer.code
+		writer.code = nil
+		return writer.emit("response.output_item.done", map[string]any{"output_index": writer.index(code), "item": code})
+	}
 	return nil
+}
+
+// response returns the complete response object containing accumulated output items.
+func (writer *responsesStreamWriter) response(result generationResult) map[string]any {
+	status := "completed"
+	incompleteReason := ""
+	switch openAIFinishReason(result.finishReason, false) {
+	case "length":
+		status = "incomplete"
+		incompleteReason = "max_output_tokens"
+	case "content_filter":
+		status = "incomplete"
+		incompleteReason = "content_filter"
+	}
+	response := responseShell(writer.id, writer.created, status, writer.request)
+	response["completed_at"] = time.Now().Unix()
+	if status == "incomplete" {
+		response["incomplete_details"] = map[string]any{"reason": incompleteReason}
+	}
+	response["output"] = writer.items()
+	response["output_text"] = result.text.String()
+	if result.providerModel != "" {
+		response["provider_model"] = result.providerModel
+	}
+	if providerReason := providerFinishReason(result.finishReason); providerReason != "" {
+		response["provider_finish_reason"] = providerReason
+	}
+	if result.usage != nil {
+		response["usage"] = responsesUsage(result.usage)
+	}
+	return response
 }
 
 // terminal emits completion event carrying full response object
@@ -1513,40 +1658,21 @@ func (writer *responsesStreamWriter) terminal(response map[string]any) error {
 	return writer.emit(eventType, map[string]any{"response": response})
 }
 
-func orderResponsesOutput(response map[string]any, indexes map[string]int) {
-	output, ok := response["output"].([]any)
-	if !ok {
-		return
-	}
-	sort.SliceStable(output, func(left int, right int) bool {
-		leftIndex, leftExists := responseOutputIndex(output[left], indexes)
-		rightIndex, rightExists := responseOutputIndex(output[right], indexes)
-		if !leftExists {
-			return false
-		}
-		if !rightExists {
-			return true
-		}
-		return leftIndex < rightIndex
-	})
-	response["output"] = output
-}
-
-func responseOutputIndex(item any, indexes map[string]int) (int, bool) {
-	object, ok := item.(map[string]any)
-	if !ok {
-		return 0, false
-	}
-	id, ok := object["id"].(string)
-	if !ok {
-		return 0, false
-	}
-	index, exists := indexes[id]
-	return index, exists
-}
-
+// failed sends response.failed: output contains emitted output items, and error.code uses Responses error enum.
 func (writer *responsesStreamWriter) failed(err error) error {
 	response := responseShell(writer.id, writer.created, "failed", writer.request)
-	response["error"] = map[string]any{"code": openAIErrorCode(err), "message": err.Error()}
+	response["output"] = writer.items()
+	response["error"] = map[string]any{"code": responsesErrorCode(err), "message": err.Error()}
 	return writer.emit("response.failed", map[string]any{"response": response})
+}
+
+// responsesErrorCode returns the official Responses error enum code for error objects.
+func responsesErrorCode(err error) string {
+	switch statusFromError(err) {
+	case http.StatusTooManyRequests:
+		return "rate_limit_exceeded"
+	case http.StatusBadRequest:
+		return "invalid_prompt"
+	}
+	return "server_error"
 }

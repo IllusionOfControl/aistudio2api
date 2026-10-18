@@ -30,12 +30,14 @@ import {
   Inbox,
   Info,
   KeyRound,
+  Languages,
   ListFilter,
   LoaderCircle,
   LogIn,
   MessageSquare,
   MessagesSquare,
   MonitorUp,
+  Moon,
   Network,
   Play,
   Power,
@@ -46,12 +48,14 @@ import {
   Settings,
   Shield,
   Square,
+  Sun,
   Trash2,
   TriangleAlert,
   Undo2,
   Timer,
   Zap,
   X,
+  Tag,
 } from '@lucide/vue'
 
 // icons maps UI semantic names to Lucide icon components
@@ -63,6 +67,7 @@ export const icons = {
   usage: ChartColumn,
   settings: Settings,
   playground: MessagesSquare,
+  version: Tag,
   chevronDown: ChevronDown,
   chevronRight: ChevronRight,
   close: X,
@@ -109,6 +114,9 @@ export const icons = {
   modeSpeech: AudioLines,
   modeMusic: Music,
   modeVideo: Clapperboard,
+  sun: Sun,
+  moon: Moon,
+  language: Languages,
 } as const
 
 // IconName represents the semantic icon names available in the UI

@@ -229,3 +229,46 @@ This sync integrates all these changes, resolves 24 conflicted files, and transl
    - Static analysis clean (`go vet ./...`, 0 issues).
    - Full test suite passing (`go test ./...`, all 9 packages ok).
    - Compiled binary verification (`go build ./cmd/aistudio2api`).
+---
+
+### Update: Upstream Proxy Pool, Build Coding Assistant, Online Updates & v0.2.13 Synchronization (2026-10-18)
+
+**Task**: Synchronize `sync/upstream-main` with upstream commits from `22b8e07` to `a784c51` (releases v0.2.11, v0.2.12, v0.2.13: proxy pool with automatic failover, Build coding assistant channel with `-build` models and `/_/upload` attachments, online binary update and restart, multi-language Web UI locales, light/dark mode view transitions, Linux Camoufox Xvfb and Windows WebGL/font emulation, stream interruption recovery, and `MODEL_MAPPING`), resolve all merge conflicts while preserving read-only configuration and English-only code invariants, translate all newly introduced comments, logs, and error strings to English, verify backend and frontend, and commit.
+
+**Upstream Additions**:
+1. **Dynamic Proxy Pool (`internal/aistudio/proxy_pool.go`, `internal/app/proxy_pool.go`)**:
+   - Supports multiple comma-separated proxies in `PROXY` forming an automatic proxy pool.
+   - Health probes test connectivity against `https://aistudio.google.com/`, balancing accounts without dedicated proxies across healthy endpoints.
+   - Tracks consecutive network errors (threshold 3), automatically failing over and rebinding accounts under exclusive lease.
+   - Scheduled 5-minute health probe checks all proxies, restoring recovered endpoints to rotation.
+2. **Build Coding Assistant Channel & `-build` Models (`internal/aistudio/assistant.go`, `channel.go`, `models.go`, `transport_http.go`)**:
+   - Derives `<model>-build` catalog entries for models with capability code 48 (e.g. `gemini-3.8-flash-build`).
+   - Routes requests through a dedicated `assistant` channel via MakerSuite `CodeAssistantOffline` and `StreamCodeAssistantOfflineGeneration`, handling inline attachments via `/_/upload` resumable uploads.
+   - Automatically creates and cleans up temporary applets per request (`CreateApplet`, `DeleteApplet`, `CancelCodeAssistantOfflineGeneration`).
+   - Automatically falls back from Build to Playground on parameter errors (`Code 3`), escalating Build channel cooldown.
+3. **In-App Self-Update Mechanism (`internal/app/update.go`, `internal/api/update.go`, `VersionPanel.vue`)**:
+   - `GET /api/update` checks GitHub releases with 1-hour caching.
+   - `POST /api/update` downloads platform-specific archive, validates SHA-256 digest against release record, replaces executable via `minio/selfupdate`, and relaunches with original flags.
+4. **Stream Interruption Recovery & Heartbeats (`internal/aistudio/decoder.go`, `internal/app/runtime.go`, `internal/api/responses_background.go`)**:
+   - Added `StreamInterruptedError` for premature connection drops, allowing account rotation and replay for non-streaming requests.
+   - Heartbeats (`: ping` for SSE, empty lines for Gemini SSE) emitted during stream stalls.
+   - Responses API stream resumption via `starting_after` on `GET /v1/responses/{id}`.
+5. **Multi-Language Web UI & Theme Switcher (`web/src/locales`, `ThemeToggle.vue`, `theme.ts`)**:
+   - Extracted translation catalogs into dedicated locale files (`en.ts`, `zh-CN.ts`, `zh-TW.ts`, `ja.ts`, `ko.ts`, `fr.ts`, `de.ts`).
+   - Circular clip-path transition theme switcher for light and dark modes.
+6. **Linux Camoufox Windows Emulation (`internal/camoufoxnative/fingerprint.go`, `launcher.go`)**:
+   - Embedded official Windows WebGL2 configs (`windows_webgl.json`) and Windows font tables (`windows_fonts.json`).
+   - Automatically configures fontconfig and launches headless Camoufox under dedicated Xvfb displays with software Mesa GLX rendering on Linux hosts without `DISPLAY`.
+7. **Model Name Mapping (`MODEL_MAPPING`)**:
+   - Supports client alias-to-model ID mappings (e.g. `MODEL_MAPPING=claude-haiku-5-5:gemini-3.8-flash`) with thinking suffix inheritance.
+
+**Resolution & Adaptations**:
+1. **Immutable Configuration Invariant Preserved**:
+   - Rejected upstream `.env` mutation logic (`Save()`, `atomicWrite()`, `UpdateRuntimeConfig`), keeping configuration strictly read-only at runtime.
+   - Preserved `SettingsPanel.vue` as a read-only configuration inspector, rejecting editable form inputs and save buttons.
+2. **English-Only Code & Documentation Invariant**:
+   - Translated all newly introduced comments, log lines, panic strings, and error messages to concise technical English across 25+ Go, TypeScript, and Vue files.
+   - Maintained all documentation files in English (`docs/build.md`, `docs/development.md`, `docs/logging.md`, `docs/protocol.md`, `docs/reverse-engineering.md`, `docs/waa.md`, `README.md`).
+3. **Verification Results**:
+   - Frontend: `npm run typecheck` passed (0 errors), `npm run lint` passed (0 warnings), `npm run build` completed successfully.
+   - Backend: `go vet ./...` passed (0 issues), `go test ./...` passed (all 9 packages ok), `go build ./cmd/aistudio2api` compiled cleanly.

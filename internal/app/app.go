@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -32,9 +33,10 @@ type commandOptions struct {
 
 // Run executes the single-binary command entry point.
 func Run(args []string) int {
-	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stderr, nil)))
-
-	err := runCommand(args)
+	logs := &logOutput{dir: filepath.Join("runtime", "logs")}
+	slog.SetDefault(slog.New(slog.NewJSONHandler(logs, nil)))
+	executable, executableErr := os.Executable()
+	restart, err := runCommand(args, logs, executable)
 	if errors.Is(err, flag.ErrHelp) {
 		return 0
 	}
@@ -42,42 +44,61 @@ func Run(args []string) int {
 		slog.Error("AIStudio2API failed to start", "error", err)
 		return 1
 	}
-
+	if restart {
+		if err := errors.Join(executableErr, relaunch(executable, args)); err != nil {
+			slog.Error("AIStudio2API relaunch failed", "error", err)
+			return 1
+		}
+	}
 	return 0
 }
 
-// runCommand dispatches setup or default server workflows.
-func runCommand(args []string) error {
+// runCommand dispatches setup or default server workflows; restart indicates application relaunch is needed after online update.
+func runCommand(args []string, logs *logOutput, executable string) (restart bool, err error) {
 	cfg, err := config.Load(".env")
 	if err != nil {
-		return err
+		return false, err
 	}
-
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	if err := logs.set(cfg.LogFile, cfg.LogMaxTotalMB); err != nil {
+		return false, err
+	}
+	defer logs.set(false, 0)
+	signals, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	ctx, cancel := context.WithCancel(signals)
+	defer cancel()
 
 	if len(args) != 0 && args[0] == "setup" {
-		return setup.Run(ctx, cfg, args[1:])
+		return false, setup.Run(ctx, cfg, args[1:])
 	}
 
 	options, err := parseFlags(args, &cfg)
 	if err != nil {
-		return err
+		return false, err
 	}
 
 	manager, err := newRuntimeManager(ctx, ".env", cfg, options.overrides)
 	if err != nil {
-		return err
+		return false, err
 	}
 	ledger, err := requestdb.Open(filepath.Join("runtime", "requests.db"), func(level, message string) {
 		manager.requests.log("service", level, message)
 	})
 	if err != nil {
-		return errors.Join(fmt.Errorf("open request ledger: %w", err), manager.Close())
+		return false, errors.Join(fmt.Errorf("open request ledger: %w", err), manager.Close())
 	}
 	ledger.SetBodyCapture(cfg.RequestBodyLog)
 	manager.ledger = ledger
-	return errors.Join(runServer(ctx, cfg, options, manager), manager.Close(), ledger.Close())
+	manager.logs = logs
+	var restarting atomic.Bool
+	updater := newSelfUpdater(buildVersion(), executable, manager.egressProxy, func(level, message string) {
+		manager.requests.log("service", level, message)
+	}, func() {
+		restarting.Store(true)
+		cancel()
+	})
+	err = errors.Join(runServer(ctx, cfg, options, manager, updater), manager.Close(), ledger.Close())
+	return restarting.Load(), err
 }
 
 // parseFlags parses CLI flags and overrides the current run configuration.
@@ -129,15 +150,14 @@ func parseFlags(args []string, cfg *config.Config) (commandOptions, error) {
 }
 
 // runServer manages HTTP listening and graceful shutdown.
-func runServer(ctx context.Context, cfg config.Config, options commandOptions, manager *runtimeManager) error {
+func runServer(ctx context.Context, cfg config.Config, options commandOptions, manager *runtimeManager, updater api.UpdateService) error {
 	manager.requests.log("service", "INFO", fmt.Sprintf("Admin listener started | address=%s", cfg.ListenAddr))
-
 	listener, err := net.Listen("tcp", cfg.ListenAddr)
 	if err != nil {
 		return fmt.Errorf("listen on %s: %w", cfg.ListenAddr, err)
 	}
 	apiHandler := api.NewHandler(manager, api.Config{
-		APIKey: cfg.ProxyAPIKey, Admin: manager, Ledger: manager.ledger,
+		APIKey: cfg.ProxyAPIKey, Admin: manager, Ledger: manager.ledger, Updates: updater,
 		AdminAuthEnabled: cfg.AdminAuthEnabled, AdminUsername: cfg.AdminUsername, AdminPassword: cfg.AdminPassword,
 	})
 	server := &http.Server{
@@ -187,7 +207,8 @@ func runServer(ctx context.Context, cfg config.Config, options commandOptions, m
 		defer cancel()
 
 		if err := server.Shutdown(shutdownCtx); err != nil {
-			return fmt.Errorf("shutdown HTTP server: %w", err)
+			server.Close()
+			slog.Warn("Admin listener shutdown timed out, disconnecting remaining connections", "error", err)
 		}
 
 		if err := <-serveError; err != nil && !errors.Is(err, http.ErrServerClosed) {

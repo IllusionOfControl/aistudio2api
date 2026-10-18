@@ -29,6 +29,12 @@ var prices = map[string]price{
 	"gemini-robotics-er-2-streaming-preview": {input: 1, cached: 0.10, output: 5},
 }
 
+// Priced returns whether a model has pricing.
+func Priced(model string) bool {
+	_, ok := prices[model]
+	return ok
+}
+
 // Cost returns estimated USD cost for a request based on model pricing; cached is the cached portion of input tokens, output is the sum of thinking and reply tokens; returns 0 if model has no pricing.
 func Cost(model string, input, cached, output int64) float64 {
 	value := prices[model]

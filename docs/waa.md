@@ -9,11 +9,11 @@ WAA (Web Application Attestation) provides BotGuard proofs for protected AI Stud
 | Value | VM Location | Protected Request Dispatch | Browser Dependency |
 | --- | --- | --- | --- |
 | `camoufox` (default) | Camoufox page with pinned account fingerprint | Native page `fetch` | Locates or downloads Camoufox on startup |
-| `go` | In-process Goja VM within service process | Go HTTP with Firefox 152 network shape | Prepared on-demand only for account login & verification |
+| `go` | In-process Goja VM within service process | Go HTTP with Firefox 152 network shape | Prepared on-demand only for account login |
 
-- Configuration source: `.env`, "WAA Backend" in management settings, or `waa_backend` via `PUT /api/config`; trimmed and lowercased; invalid values fail validation; saved values take effect on next generation service launch.
-- When assembling runtimes under `go`, the service logs `runtime assembly | 2/3 | WAA backend=go | accounts=<count>`, skipping Camoufox discovery, download, launch, and legacy profile cleanup.
-- Account page browser login and account verification employ an on-demand login driver: the driver locates Camoufox on first call, downloads the pinned release for the current platform if missing, and reuses the driver instance thereafter.
+- Configuration source: `.env` or "WAA Backend" in management settings; trimmed and lowercased; invalid values fail validation; saved values take effect on next generation service launch.
+- When assembling runtimes under `go`, the service logs `Runtime assembly | 2/3 | WAA backend=go | accounts=<count>`, skipping Camoufox discovery, download, launch, and legacy profile cleanup.
+- Account page browser login employs an on-demand login driver: the driver locates Camoufox on first call, downloads the pinned release for the current platform if missing, and reuses the driver instance thereafter.
 - Account fingerprints are generated in Go and persisted to `camoufox-fingerprint.json`; both backends consume the identical configuration file.
 - If worker configuration lacks a Camoufox executable path, a pure-Go worker is launched; worker state reports `RuntimeID` as `go-waa` and `PID` as the service process PID.
 - Scheduling, warm pool capacity, runtime leases, retries, and cooldowns operate identically across both backends (see [Development & Contributing](development.md)).
@@ -35,7 +35,13 @@ Both backends expose a unified set of worker capabilities to the request encoder
 | --- | ---: | --- | --- |
 | `GenerateContent` | 5 | All content parts joined by spaces | Worker `SendProtected` |
 | `CreateInteractionStream` | 5 | All transmitted text joined by spaces | Worker `SendProtected` |
-| Build embedding `ProxyUnaryCall` | 3 | `<path> <body>`, with path `:batchEmbedContents` | Worker `SendProtected` |
+| `ProxyStreamedCall`, `ProxyUnaryCall` | 3 | `<path> <body_json>` | Worker `SendProtected` |
+| `CodeAssistantOffline` | 2 | Same as `GenerateContent` | Worker `SendProtected` |
+| Build embedding `ProxyUnaryCall` | 3 | `<path> <body_json>`, with path `:batchEmbedContents` | Worker `SendProtected` |
+| `GenerateVideo` | 8 | Video prompt text | MakerSuite Go HTTP transport |
+| Bidi setup | 6 | `models/<model>` and each function's `name description`, joined by spaces | WebChannel |
+| Bidi text, audio, image, media end | 6 | Empty string | WebChannel |
+| Bidi tool response | 6 | First function response call ID | WebChannel |
 | Build WebChannel messages | 3 | `<path> <JSON>` | WebChannel |
 
 `GenerateContent` part binding values:
@@ -62,6 +68,8 @@ Proof generation for the same account executes serially: `NativeWorker`, pure-Go
 
 - Bootstrap `GenerateContent` terminates prior to network egress, incurring zero token usage; `TEMPORARY_CHAT=true` additionally disables autosave on warm-up tabs.
 - Cancelling worker startup closes BiDi, terminates the Camoufox process tree, and deletes temporary profile directories; pages hanging in unexpected states return startup errors with the current URL.
+- When Camoufox does not respond to `session.new` within 30 seconds after BiDi connection, the worker terminates the process and relaunches Camoufox, re-emitting stage 3 and 4 logs.
+- During AI Studio load, the worker checks connectivity to the account proxy every 2 seconds; if the proxy is unreachable or navigation returns `NS_ERROR_PROXY_*`, startup immediately fails with "proxy unreachable".
 
 The bootstrap model prioritizes `gemini-flash-latest` from the real-time catalog, otherwise selecting eligible models supporting `generateContent`, account tier, and chat capabilities in catalog order. Both backends share identical selection rules. A single account worker provides proofs for all standard generation models on that account, reusing the existing worker when switching operational models.
 
@@ -524,7 +532,7 @@ Before generating proofs and during bootstrap, the runtime executes the prompt i
 })
 ```
 
-The textarea normalizes CRLF and CR to LF; the return value must match the normalized prompt string, otherwise proof generation fails. The first invocation creates the input textarea and Run button under `body`, which are reused subsequently. Requests outside the Build channel write the prompt used by binding; Build channel requests write user text from the request: generation takes contents text, embedding takes the first request text, and Live takes an empty prompt.
+The textarea normalizes CRLF and CR to LF upon writing; the script return value must match the normalized prompt string, otherwise proof generation fails. The first invocation creates the input textarea and Run button under `body`, which are reused subsequently. Requests outside Build and coding assistant channels write the prompt used by binding; Build channel and coding assistant requests write user text from the request: generation takes contents text from parts, embedding takes input text, Live takes text input, realtime music takes weighted prompt text (joined by spaces for multiple segments); messages without text (setup, media, function responses) write an empty string.
 
 ### Event Propagation Semantics
 
@@ -614,8 +622,13 @@ A single worker services all standard generation models on an account. Real loca
 | --- | --- |
 | Proof failure: snapshot exception, desynced prompt, missing `!` prefix, VM refresh failure | Worker transitions to `failed`; rebuilds worker on same account and retries once |
 | Protected request network error | Same as above |
-| `GenerateContent` stream break or truncation | Same as above |
-| Request HTTP 401 | Refreshes cookies via OAuth/DBSC renewal materials; resets worker and retries once |
+| `GenerateContent`, `GenerateVideo`, Bidi return HTTP 404, Code 5 with message containing `Ambiguous request for service ''` | Rebuilds worker on same account and retries once |
+| HTTP 403 or Code 7 | Preserves account and model eligibility, switching to another untried capable account before first upstream event; does not rebuild worker |
+| HTTP 429 | Records minute or daily cooldown (`build:<model>` for Build channel); retries on same account when the other channel is available |
+| Build returns HTTP 400, Code 3 | Retries via Playground on the same account when Playground channel is enabled and request can be fulfilled via Playground; escalates cooldown for `build:<model>` once Playground returns first event |
+| HTTP 401 | Renews on same egress using saved Chrome credentials or importing from local Chrome for same email; rebuilds WAA runtime and retries once. Accounts enter `auth_required` when neither is available or 401 persists after renewal |
+| Worker startup failure | Logs `WAA Worker startup failed`; request can switch accounts |
+| Runtime lease held by another process | Account paused from scheduling; retries initially after 5 seconds with doubled backoff up to 1 minute |
 
 Code 7 represents upstream rejection. It can be account- or model-specific: the same worker can return Code 7 on one model and 200 on another. A single Code 7 does not signify WAA host invalidation.
 

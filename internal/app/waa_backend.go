@@ -12,14 +12,14 @@ import (
 	"github.com/Mag1cFall/AIStudio2API/internal/config"
 )
 
-// prepareWAABackend prepares browser dependencies according to the WAA backend; the Go backend only prepares Camoufox on demand during account login
-func prepareWAABackend(ctx context.Context, cfg config.Config, requests *requestRegistry, accounts int) (string, aistudio.IsolatedLoginDriver, error) {
+// prepareWAABackend prepares browser dependencies according to the WAA backend; the Go backend only prepares Camoufox on demand during account login, using proxy when downloading.
+func prepareWAABackend(ctx context.Context, cfg config.Config, requests *requestRegistry, accounts int, proxy string) (string, aistudio.IsolatedLoginDriver, error) {
 	if cfg.WAABackend == config.WAABackendGo {
 		requests.log("service", "INFO", fmt.Sprintf("Runtime assembly | 2/3 | WAA backend=go | accounts=%d", accounts))
-		return "", &lazyLoginDriver{timeout: cfg.RequestTimeout}, nil
+		return "", &lazyLoginDriver{timeout: cfg.RequestTimeout, proxy: proxy}, nil
 	}
 	requests.log("service", "INFO", fmt.Sprintf("Runtime assembly | 2/3 | Verifying Camoufox | accounts=%d", accounts))
-	camoufoxPath, err := camoufoxnative.FindExecutable(ctx)
+	camoufoxPath, err := camoufoxnative.FindExecutable(ctx, proxy)
 	if err != nil {
 		return "", nil, err
 	}
@@ -53,6 +53,7 @@ func newWAAWorker(ctx context.Context, accountID string, options camoufoxnative.
 // lazyLoginDriver locates Camoufox and creates a login driver upon first login or account verification
 type lazyLoginDriver struct {
 	timeout time.Duration
+	proxy   string
 	mu      sync.Mutex
 	driver  *aistudio.NativeLoginDriver
 }
@@ -63,7 +64,7 @@ func (lazy *lazyLoginDriver) resolve(ctx context.Context) (*aistudio.NativeLogin
 	if lazy.driver != nil {
 		return lazy.driver, nil
 	}
-	camoufoxPath, err := camoufoxnative.FindExecutable(ctx)
+	camoufoxPath, err := camoufoxnative.FindExecutable(ctx, lazy.proxy)
 	if err != nil {
 		return nil, err
 	}
@@ -84,11 +85,3 @@ func (lazy *lazyLoginDriver) Login(ctx context.Context, request aistudio.Isolate
 	return driver.Login(ctx, request)
 }
 
-// Verify verifies account login state using on-demand Camoufox
-func (lazy *lazyLoginDriver) Verify(ctx context.Context, request aistudio.IsolatedLoginRequest, state aistudio.StorageState) (aistudio.LoginVerification, error) {
-	driver, err := lazy.resolve(ctx)
-	if err != nil {
-		return aistudio.LoginVerification{}, err
-	}
-	return driver.Verify(ctx, request, state)
-}

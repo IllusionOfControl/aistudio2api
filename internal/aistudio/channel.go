@@ -15,6 +15,8 @@ const (
 	ChannelPlayground Channel = "playground"
 	// ChannelBuild represents Gemini API calls proxied by official Build app
 	ChannelBuild Channel = "build"
+	// ChannelAssistant represents the Build web coding assistant, exclusively serving -build models
+	ChannelAssistant Channel = "assistant"
 )
 
 // ChannelCooldownScope returns channel cooldown key for scope; Build uses build:<scope>
@@ -60,6 +62,13 @@ func (p *AccountPool) BuildEnabled() bool {
 	return p.channelEnabledLocked(ChannelBuild)
 }
 
+// PlaygroundEnabled returns whether the Playground channel is enabled.
+func (p *AccountPool) PlaygroundEnabled() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.channelEnabledLocked(ChannelPlayground)
+}
+
 // Channel returns upstream channel used by lease
 func (l *AccountLease) Channel() Channel {
 	if l == nil || l.channel == "" {
@@ -74,6 +83,9 @@ func (l *AccountLease) CooldownScope(scope string) string {
 }
 
 func (p *AccountPool) channelEnabledLocked(channel Channel) bool {
+	if channel == ChannelAssistant {
+		return true
+	}
 	if len(p.channels) == 0 {
 		return channel == ChannelPlayground
 	}
@@ -103,8 +115,11 @@ func buildMethodSelection(selection AccountSelection) bool {
 		strings.TrimSpace(selection.Capability) == "" && !selection.PlaygroundOnly
 }
 
-// selectionChannelsLocked returns available channel order for selection, preferred channel first; embeddings use Build only, realtime methods try Playground then Build, other non-generation requests use Playground RPC only.
+// selectionChannelsLocked returns available channel order for selection, preferred channel first; -build models only use Build coding assistant, embeddings use Build only, realtime methods try Playground then Build, other non-generation requests use Playground RPC only.
 func (p *AccountPool) selectionChannelsLocked(selection AccountSelection) []Channel {
+	if p.assistantModelLocked(selection.ModelID) {
+		return []Channel{ChannelAssistant}
+	}
 	if !generationChannelSelection(selection) {
 		if buildMethodSelection(selection) && p.channelEnabledLocked(ChannelBuild) {
 			if selection.Method == "embedContent" {
@@ -161,6 +176,8 @@ func (p *AccountPool) channelSupportsLocked(account *Account, channel Channel, s
 		}
 		return generationChannelSelection(selection) && p.channelEnabledLocked(ChannelBuild) &&
 			p.buildSupportsModelLocked(account, selection.ModelID, selection.anyTier)
+	case ChannelAssistant:
+		return accountSupportsSelection(account, selection)
 	default:
 		return false
 	}
@@ -226,6 +243,31 @@ func (p *AccountPool) channelCandidatesLocked(indices []int, selection AccountSe
 		return lastChannel != "" && rank(candidates[position].channel) > rank(lastChannel)
 	})
 	return append(candidates[start:], candidates[:start]...)
+}
+
+// AssistantModel checks whether a model is a -build model generated via Build coding assistant.
+func (p *AccountPool) AssistantModel(modelID string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.assistantModelLocked(modelID)
+}
+
+func (p *AccountPool) assistantModelLocked(modelID string) bool {
+	modelID = strings.TrimPrefix(strings.TrimSpace(modelID), "models/")
+	if modelID == "" {
+		return false
+	}
+	for _, account := range p.accounts {
+		if account == nil {
+			continue
+		}
+		for _, model := range account.Models {
+			if model.ID == modelID {
+				return model.Capabilities["assistant_route"]
+			}
+		}
+	}
+	return false
 }
 
 // buildSupportsModelLocked determines whether account Build catalog can invoke model via generation request; when anyTier is true, account benefit tier is not checked

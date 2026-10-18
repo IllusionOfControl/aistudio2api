@@ -3,12 +3,17 @@ package aistudio
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
 )
+
+// errSchemaForbidsAll indicates that schema does not accept any values.
+var errSchemaForbidsAll = errors.New("forbids all values")
 
 var schemaTypeCodes = map[string]int64{
 	"string":  1,
@@ -29,7 +34,7 @@ func encodeJSONSchema(raw json.RawMessage) ([]any, error) {
 		return []any{int64(0)}, nil
 	}
 	if bytes.Equal(raw, []byte("false")) {
-		return nil, fmt.Errorf("schema false forbids all values")
+		return nil, fmt.Errorf("schema false %w", errSchemaForbidsAll)
 	}
 	var schema map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &schema); err != nil || schema == nil {
@@ -148,8 +153,14 @@ func encodeJSONSchema(raw json.RawMessage) ([]any, error) {
 			names = append(names, name)
 		}
 		sort.Strings(names)
+		var required []string
+		_ = json.Unmarshal(schema["required"], &required)
 		entries := make([]any, 0, len(names))
 		for _, name := range names {
+			// An optional property of false means this property should not appear.
+			if bytes.Equal(bytes.TrimSpace(properties[name]), []byte("false")) && !slices.Contains(required, name) {
+				continue
+			}
 			property, err := encodeJSONSchema(properties[name])
 			if err != nil {
 				return nil, fmt.Errorf("schema.properties.%s: %w", name, err)
@@ -467,7 +478,7 @@ func cleanSchemaInput(raw json.RawMessage, preserveCombinations bool) (json.RawM
 					break
 				}
 				if name == "allOf" && bytes.Equal(cleaned, []byte("false")) {
-					return nil, fmt.Errorf("schema.allOf forbids all values")
+					return nil, fmt.Errorf("schema.allOf %w", errSchemaForbidsAll)
 				}
 				if (name == "anyOf" || name == "oneOf") && bytes.Equal(cleaned, []byte("false")) || name == "allOf" && bytes.Equal(cleaned, []byte("true")) {
 					continue
@@ -477,7 +488,7 @@ func cleanSchemaInput(raw json.RawMessage, preserveCombinations bool) (json.RawM
 			if unrestricted || name == "allOf" && len(filtered) == 0 {
 				delete(schema, name)
 			} else if len(filtered) == 0 && (name == "anyOf" || name == "oneOf") {
-				return nil, fmt.Errorf("schema.%s forbids all values", name)
+				return nil, fmt.Errorf("schema.%s %w", name, errSchemaForbidsAll)
 			} else {
 				schema[name], _ = json.Marshal(filtered)
 			}
@@ -498,7 +509,7 @@ func normalizeNotSchema(schema map[string]json.RawMessage) error {
 		return nil
 	}
 	if bytes.Equal(raw, []byte("true")) || bytes.Equal(raw, []byte("{}")) {
-		return fmt.Errorf("schema.not forbids all values")
+		return fmt.Errorf("schema.not %w", errSchemaForbidsAll)
 	}
 	var sub map[string]json.RawMessage
 	if json.Unmarshal(raw, &sub) == nil && sub != nil {
@@ -670,13 +681,142 @@ func setWireField(wire []any, index int, value any) []any {
 	return wire
 }
 
-// normalizeFunctionParameters normalizes empty parameter definitions to object
+// normalizeFunctionParameters normalizes empty parameter definitions to object and adds unconstrained type definitions for undefined properties in required.
 func normalizeFunctionParameters(raw json.RawMessage) (json.RawMessage, error) {
 	cleaned, err := cleanSchemaInput(raw, true)
-	if err == nil && (bytes.Equal(cleaned, []byte("{}")) || bytes.Equal(cleaned, []byte("true"))) {
-		cleaned = json.RawMessage(`{"type":"object"}`)
+	if err != nil {
+		return nil, err
 	}
-	return cleaned, err
+	if bytes.Equal(cleaned, []byte("{}")) || bytes.Equal(cleaned, []byte("true")) {
+		return json.RawMessage(`{"type":"object"}`), nil
+	}
+	schema, err := decodeSchemaValue(cleaned)
+	if err != nil {
+		return nil, err
+	}
+	if !defineRequiredProperties(schema) {
+		return cleaned, nil
+	}
+	return json.Marshal(schema)
+}
+
+// decodeSchemaValue decodes schema while preserving raw numeric values.
+func decodeSchemaValue(raw json.RawMessage) (any, error) {
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
+	var value any
+	if err := decoder.Decode(&value); err != nil {
+		return nil, err
+	}
+	return value, nil
+}
+
+// defineRequiredProperties adds unconstrained type definitions for properties listed in required but undefined in properties, returning whether modifications were made.
+func defineRequiredProperties(value any) bool {
+	schema, ok := value.(map[string]any)
+	if !ok {
+		return false
+	}
+	changed := false
+	if required, ok := schema["required"].([]any); ok {
+		properties, _ := schema["properties"].(map[string]any)
+		for _, item := range required {
+			name, ok := item.(string)
+			if !ok {
+				continue
+			}
+			if _, defined := properties[name]; defined {
+				continue
+			}
+			if properties == nil {
+				properties = map[string]any{}
+				schema["properties"] = properties
+			}
+			properties[name] = map[string]any{}
+			changed = true
+		}
+	}
+	for key, child := range schema {
+		switch key {
+		case "properties", "$defs", "definitions":
+			if children, ok := child.(map[string]any); ok {
+				for _, nested := range children {
+					changed = defineRequiredProperties(nested) || changed
+				}
+			}
+		case "items", "additionalProperties", "not":
+			changed = defineRequiredProperties(child) || changed
+		case "anyOf", "oneOf", "allOf", "prefixItems":
+			if children, ok := child.([]any); ok {
+				for _, nested := range children {
+					changed = defineRequiredProperties(nested) || changed
+				}
+			}
+		}
+	}
+	return changed
+}
+
+// inlineSchemaRefs replaces local $ref pointing to root $defs or definitions with the referenced definition; cyclic references retain the original node.
+func inlineSchemaRefs(raw json.RawMessage) (json.RawMessage, error) {
+	value, err := decodeSchemaValue(raw)
+	if err != nil {
+		return nil, err
+	}
+	root, ok := value.(map[string]any)
+	if !ok {
+		return raw, nil
+	}
+	definitions := map[string]any{}
+	for _, key := range []string{"$defs", "definitions"} {
+		if entries, ok := root[key].(map[string]any); ok {
+			for name, definition := range entries {
+				definitions["#/"+key+"/"+name] = definition
+			}
+		}
+	}
+	if len(definitions) == 0 {
+		return raw, nil
+	}
+	resolved := resolveSchemaRefs(root, definitions, nil).(map[string]any)
+	delete(resolved, "$defs")
+	delete(resolved, "definitions")
+	return json.Marshal(resolved)
+}
+
+// resolveSchemaRefs recursively replaces local $ref; the node's own fields take precedence over same-named fields in the referenced definition.
+func resolveSchemaRefs(value any, definitions map[string]any, active []string) any {
+	switch node := value.(type) {
+	case map[string]any:
+		if ref, ok := node["$ref"].(string); ok {
+			if definition, ok := definitions[ref]; ok && !slices.Contains(active, ref) {
+				merged := map[string]any{}
+				if target, ok := resolveSchemaRefs(definition, definitions, append(slices.Clip(active), ref)).(map[string]any); ok {
+					for key, item := range target {
+						merged[key] = item
+					}
+				}
+				for key, item := range node {
+					if key != "$ref" {
+						merged[key] = resolveSchemaRefs(item, definitions, active)
+					}
+				}
+				return merged
+			}
+		}
+		result := make(map[string]any, len(node))
+		for key, item := range node {
+			result[key] = resolveSchemaRefs(item, definitions, active)
+		}
+		return result
+	case []any:
+		result := make([]any, len(node))
+		for index, item := range node {
+			result[index] = resolveSchemaRefs(item, definitions, active)
+		}
+		return result
+	}
+	return value
 }
 
 // responseSchemaNote is the prefix for full JSON Schema appended to structured output root description.
@@ -687,6 +827,9 @@ func encodeResponseSchema(raw json.RawMessage) ([]any, error) {
 	wire, err := encodeJSONSchema(raw)
 	if err == nil {
 		return wire, nil
+	}
+	if errors.Is(err, errSchemaForbidsAll) {
+		return nil, err
 	}
 	var schema any
 	if json.Unmarshal(raw, &schema) != nil {

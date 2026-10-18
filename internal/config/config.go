@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -16,7 +17,7 @@ const (
 	defaultAuthStates         = "auth"
 	defaultListenAddr         = "127.0.0.1:2048"
 	defaultInitTimeout        = 2 * time.Minute
-	defaultRequestTimeout     = 5 * time.Minute
+	defaultRequestTimeout     = 30 * time.Minute
 	defaultWarmWorkerLimit    = 5
 	defaultMaxActiveWorkers   = 10
 	defaultWarmConcurrency    = 5
@@ -38,6 +39,7 @@ var configKeys = [...]string{
 	"PER_ACCOUNT_CONCURRENCY",
 	"ROUTING_STRATEGY",
 	"UPSTREAM_CHANNELS",
+	"MODEL_MAPPING",
 	"TEMPORARY_CHAT",
 	"HEADLESS",
 	"CAMOUFOX_PATH",
@@ -45,11 +47,16 @@ var configKeys = [...]string{
 	"AUTO_START",
 	"WAA_AUTO_START",
 	"REQUEST_BODY_LOG",
+	"LOG_FILE",
+	"LOG_MAX_TOTAL_MB",
 	"ADMIN_AUTH_ENABLED",
 	"ADMIN_USERNAME",
 	"ADMIN_PASSWORD",
 	"BUILD_NATIVE_NONSTREAM",
 }
+
+// LogFileMB is the rotation size of a single log file in megabytes.
+const LogFileMB = 10
 
 // upstreamChannels represents the upstream channels available for generation requests
 var upstreamChannels = []string{"playground", "build"}
@@ -64,6 +71,8 @@ const WAABackendGo = "go"
 type Config struct {
 	AutoStart              bool          `json:"auto_start"`
 	RequestBodyLog         bool          `json:"request_body_log"`
+	LogFile                bool          `json:"log_file"`
+	LogMaxTotalMB          int           `json:"log_max_total_mb"`
 	AdminAuthEnabled       bool          `json:"admin_auth_enabled"`
 	AdminUsername          string        `json:"admin_username"`
 	AdminPassword          string        `json:"-"`
@@ -80,6 +89,7 @@ type Config struct {
 	PerAccountConcurrency  int           `json:"per_account_concurrency"`
 	RoutingStrategy        string        `json:"routing_strategy"`
 	UpstreamChannels       []string      `json:"upstream_channels"`
+	ModelMapping           string        `json:"model_mapping"`
 	TemporaryChat          bool          `json:"temporary_chat"`
 	Headless               bool          `json:"headless"`
 	WAABackend             string        `json:"waa_backend"`
@@ -89,6 +99,8 @@ type Config struct {
 func Default() Config {
 	return Config{
 		AdminUsername:          "admin",
+		LogFile:                true,
+		LogMaxTotalMB:          500,
 		BuildNativeNonstream:   true,
 		AuthStates:             defaultAuthStates,
 		ListenAddr:             defaultListenAddr,
@@ -130,6 +142,18 @@ func Load(path string) (Config, error) {
 		cfg.RequestBodyLog, err = strconv.ParseBool(strings.TrimSpace(value))
 		if err != nil {
 			return Config{}, fmt.Errorf("REQUEST_BODY_LOG must be true or false")
+		}
+	}
+	if value, ok := values["LOG_FILE"]; ok {
+		cfg.LogFile, err = strconv.ParseBool(strings.TrimSpace(value))
+		if err != nil {
+			return Config{}, fmt.Errorf("LOG_FILE must be true or false")
+		}
+	}
+	if value, ok := values["LOG_MAX_TOTAL_MB"]; ok {
+		cfg.LogMaxTotalMB, err = parsePositiveInt("LOG_MAX_TOTAL_MB", value)
+		if err != nil {
+			return Config{}, err
 		}
 	}
 	if value, ok := values["ADMIN_AUTH_ENABLED"]; ok {
@@ -204,6 +228,9 @@ func Load(path string) (Config, error) {
 	if value, ok := values["UPSTREAM_CHANNELS"]; ok {
 		cfg.UpstreamChannels = ParseUpstreamChannels(value)
 	}
+	if value, ok := values["MODEL_MAPPING"]; ok {
+		cfg.ModelMapping = strings.TrimSpace(value)
+	}
 	if value, ok := values["TEMPORARY_CHAT"]; ok {
 		cfg.TemporaryChat, err = strconv.ParseBool(strings.TrimSpace(value))
 		if err != nil {
@@ -247,6 +274,7 @@ func Load(path string) (Config, error) {
 
 
 
+
 // Validate checks if the configuration values are valid for service startup.
 func (c Config) Validate() error {
 	if c.AdminAuthEnabled && (strings.TrimSpace(c.AdminUsername) == "" || strings.TrimSpace(c.AdminPassword) == "") {
@@ -259,9 +287,10 @@ func (c Config) Validate() error {
 	if err := validateListenAddr(c.ListenAddr); err != nil {
 		return err
 	}
-
-	if err := ValidateProxy(c.Proxy); err != nil {
-		return err
+	for _, proxy := range ProxyList(c.Proxy) {
+		if err := ValidateProxy(proxy); err != nil {
+			return err
+		}
 	}
 
 	if c.InitTimeout <= 0 {
@@ -293,10 +322,40 @@ func (c Config) Validate() error {
 	if err := validateUpstreamChannels(c.UpstreamChannels); err != nil {
 		return err
 	}
+	if _, err := ParseModelMapping(c.ModelMapping); err != nil {
+		return err
+	}
 	if c.WAABackend != WAABackendCamoufox && c.WAABackend != WAABackendGo {
 		return fmt.Errorf("WAA_BACKEND must be camoufox or go")
 	}
+	if c.LogMaxTotalMB < 2*LogFileMB {
+		return fmt.Errorf("LOG_MAX_TOTAL_MB cannot be less than %d", 2*LogFileMB)
+	}
 	return nil
+}
+
+// ModelAlias represents a mapping from a client model name to a catalog model ID.
+type ModelAlias struct {
+	Alias string
+	Model string
+}
+
+// ParseModelMapping parses a comma-separated list of alias:modelID pairs. Aliases may contain colons; the last colon separates alias from model ID.
+func ParseModelMapping(value string) ([]ModelAlias, error) {
+	var mapping []ModelAlias
+	for _, item := range strings.Split(value, ",") {
+		item = strings.TrimSpace(item)
+		if item == "" {
+			continue
+		}
+		index := strings.LastIndexByte(item, ':')
+		alias, model := strings.TrimSpace(item[:max(index, 0)]), strings.TrimSpace(item[index+1:])
+		if index < 0 || alias == "" || model == "" {
+			return nil, fmt.Errorf("each MODEL_MAPPING item must be alias:modelID, invalid format: %q", item)
+		}
+		mapping = append(mapping, ModelAlias{Alias: alias, Model: strings.TrimPrefix(model, "models/")})
+	}
+	return mapping, nil
 }
 
 // ParseUpstreamChannels splits a comma-separated channel list into trimmed lowercase names.
@@ -337,6 +396,8 @@ func (c Config) MarshalJSON() ([]byte, error) {
 	type payload struct {
 		AutoStart              bool     `json:"auto_start"`
 		RequestBodyLog         bool     `json:"request_body_log"`
+		LogFile                bool     `json:"log_file"`
+		LogMaxTotalMB          int      `json:"log_max_total_mb"`
 		AdminAuthEnabled       bool     `json:"admin_auth_enabled"`
 		AdminUsername          string   `json:"admin_username"`
 		BuildNativeNonstream   bool     `json:"build_native_nonstream"`
@@ -352,6 +413,7 @@ func (c Config) MarshalJSON() ([]byte, error) {
 		PerAccountConcurrency  int      `json:"per_account_concurrency"`
 		RoutingStrategy        string   `json:"routing_strategy"`
 		UpstreamChannels       []string `json:"upstream_channels"`
+		ModelMapping           string   `json:"model_mapping"`
 		TemporaryChat          bool     `json:"temporary_chat"`
 		Headless               bool     `json:"headless"`
 		WAABackend             string   `json:"waa_backend"`
@@ -360,6 +422,8 @@ func (c Config) MarshalJSON() ([]byte, error) {
 	return json.Marshal(payload{
 		AutoStart:              c.AutoStart,
 		RequestBodyLog:         c.RequestBodyLog,
+		LogFile:                c.LogFile,
+		LogMaxTotalMB:          c.LogMaxTotalMB,
 		AdminAuthEnabled:       c.AdminAuthEnabled,
 		AdminUsername:          c.AdminUsername,
 		BuildNativeNonstream:   c.BuildNativeNonstream,
@@ -375,6 +439,7 @@ func (c Config) MarshalJSON() ([]byte, error) {
 		PerAccountConcurrency:  c.PerAccountConcurrency,
 		RoutingStrategy:        c.RoutingStrategy,
 		UpstreamChannels:       c.UpstreamChannels,
+		ModelMapping:           c.ModelMapping,
 		TemporaryChat:          c.TemporaryChat,
 		Headless:               c.Headless,
 		WAABackend:             c.WAABackend,
@@ -386,6 +451,8 @@ func (c *Config) UnmarshalJSON(data []byte) error {
 	type payload struct {
 		AutoStart              bool     `json:"auto_start"`
 		RequestBodyLog         bool     `json:"request_body_log"`
+		LogFile                bool     `json:"log_file"`
+		LogMaxTotalMB          int      `json:"log_max_total_mb"`
 		AdminAuthEnabled       bool     `json:"admin_auth_enabled"`
 		AdminUsername          string   `json:"admin_username"`
 		AdminPassword          string   `json:"admin_password"`
@@ -402,6 +469,7 @@ func (c *Config) UnmarshalJSON(data []byte) error {
 		PerAccountConcurrency  int      `json:"per_account_concurrency"`
 		RoutingStrategy        string   `json:"routing_strategy"`
 		UpstreamChannels       []string `json:"upstream_channels"`
+		ModelMapping           string   `json:"model_mapping"`
 		TemporaryChat          bool     `json:"temporary_chat"`
 		Headless               bool     `json:"headless"`
 		WAABackend             string   `json:"waa_backend"`
@@ -425,6 +493,8 @@ func (c *Config) UnmarshalJSON(data []byte) error {
 	parsed := Config{
 		AutoStart:              value.AutoStart,
 		RequestBodyLog:         value.RequestBodyLog,
+		LogFile:                value.LogFile,
+		LogMaxTotalMB:          value.LogMaxTotalMB,
 		AdminAuthEnabled:       value.AdminAuthEnabled,
 		AdminUsername:          strings.TrimSpace(value.AdminUsername),
 		AdminPassword:          value.AdminPassword,
@@ -441,6 +511,7 @@ func (c *Config) UnmarshalJSON(data []byte) error {
 		PerAccountConcurrency:  value.PerAccountConcurrency,
 		RoutingStrategy:        value.RoutingStrategy,
 		UpstreamChannels:       value.UpstreamChannels,
+		ModelMapping:           strings.TrimSpace(value.ModelMapping),
 		TemporaryChat:          value.TemporaryChat,
 		Headless:               value.Headless,
 		WAABackend:             strings.ToLower(strings.TrimSpace(value.WAABackend)),
@@ -452,6 +523,17 @@ func (c *Config) UnmarshalJSON(data []byte) error {
 
 	*c = parsed
 	return nil
+}
+
+// ProxyList returns the comma-separated proxy URLs from PROXY.
+func ProxyList(value string) []string {
+	var proxies []string
+	for proxy := range strings.SplitSeq(value, ",") {
+		if proxy = strings.TrimSpace(proxy); proxy != "" && !slices.Contains(proxies, proxy) {
+			proxies = append(proxies, proxy)
+		}
+	}
+	return proxies
 }
 
 // ValidateProxy validates account or global proxy URLs.

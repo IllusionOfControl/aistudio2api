@@ -2,6 +2,7 @@ package api
 
 import (
 	"bytes"
+	"cmp"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -24,6 +25,7 @@ type geminiRequest struct {
 	Tools             []geminiToolGroup      `json:"tools"`
 	ToolConfig        geminiToolConfig       `json:"toolConfig"`
 	SafetySettings    []geminiSafetySetting  `json:"safetySettings"`
+	CachedContent     string                 `json:"cachedContent"`
 	// GenerateContentRequest is the complete generate request carried by countTokens
 	GenerateContentRequest *geminiRequest `json:"generateContentRequest"`
 }
@@ -99,6 +101,7 @@ type geminiPart struct {
 		ID       string          `json:"id"`
 		Name     string          `json:"name"`
 		Response json.RawMessage `json:"response"`
+		Parts    []geminiPart    `json:"parts"`
 	} `json:"functionResponse"`
 	ExecutableCode *struct {
 		Language string `json:"language"`
@@ -148,6 +151,7 @@ type geminiGenerationConfig struct {
 	ResponseMIMEType    string                     `json:"responseMimeType"`
 	ResponseSchema      json.RawMessage            `json:"responseSchema"`
 	ResponseJSONSchema  json.RawMessage            `json:"responseJsonSchema"`
+	ResponseFormat      geminiResponseFormats      `json:"responseFormat"`
 	ResponseModalities  []string                   `json:"responseModalities"`
 	ImageConfig         *geminiImageConfig         `json:"imageConfig"`
 	SpeechConfig        *geminiSpeechConfig        `json:"speechConfig"`
@@ -172,6 +176,63 @@ type geminiTranscriptionConfig struct {
 type geminiImageConfig struct {
 	AspectRatio string `json:"aspectRatio"`
 	ImageSize   string `json:"imageSize"`
+}
+
+// geminiResponseFormat represents an output format in generationConfig.responseFormat.
+type geminiResponseFormat struct {
+	Text *struct {
+		MIMEType string          `json:"mimeType"`
+		Schema   json.RawMessage `json:"schema"`
+	} `json:"text"`
+	Image *geminiImageConfig `json:"image"`
+}
+
+// geminiResponseFormats represents generationConfig.responseFormat, specified as a single object in REST or an array in SDK.
+type geminiResponseFormats []geminiResponseFormat
+
+// UnmarshalJSON reads responseFormat as either a single object or an array.
+func (formats *geminiResponseFormats) UnmarshalJSON(data []byte) error {
+	if trimmed := bytes.TrimSpace(data); len(trimmed) > 0 && trimmed[0] == '{' {
+		var format geminiResponseFormat
+		if err := json.Unmarshal(trimmed, &format); err != nil {
+			return err
+		}
+		*formats = geminiResponseFormats{format}
+		return nil
+	}
+	return json.Unmarshal(data, (*[]geminiResponseFormat)(formats))
+}
+
+// geminiResponseFormatValues maps responseFormat enum names to upstream values.
+var geminiResponseFormatValues = map[string]string{
+	"APPLICATION_JSON":                "application/json",
+	"TEXT_PLAIN":                      "text/plain",
+	"ASPECT_RATIO_ONE_BY_ONE":         "1:1",
+	"ASPECT_RATIO_TWO_BY_THREE":       "2:3",
+	"ASPECT_RATIO_THREE_BY_TWO":       "3:2",
+	"ASPECT_RATIO_THREE_BY_FOUR":      "3:4",
+	"ASPECT_RATIO_FOUR_BY_THREE":      "4:3",
+	"ASPECT_RATIO_FOUR_BY_FIVE":       "4:5",
+	"ASPECT_RATIO_FIVE_BY_FOUR":       "5:4",
+	"ASPECT_RATIO_NINE_BY_SIXTEEN":    "9:16",
+	"ASPECT_RATIO_SIXTEEN_BY_NINE":    "16:9",
+	"ASPECT_RATIO_TWENTY_ONE_BY_NINE": "21:9",
+	"ASPECT_RATIO_ONE_BY_EIGHT":       "1:8",
+	"ASPECT_RATIO_EIGHT_BY_ONE":       "8:1",
+	"ASPECT_RATIO_ONE_BY_FOUR":        "1:4",
+	"ASPECT_RATIO_FOUR_BY_ONE":        "4:1",
+	"IMAGE_SIZE_FIVE_TWELVE":          "512",
+	"IMAGE_SIZE_ONE_K":                "1K",
+	"IMAGE_SIZE_TWO_K":                "2K",
+	"IMAGE_SIZE_FOUR_K":               "4K",
+}
+
+// geminiResponseFormatValue converts responseFormat enum names to upstream values, returning other values unchanged.
+func geminiResponseFormatValue(value string) string {
+	if mapped, ok := geminiResponseFormatValues[value]; ok {
+		return mapped
+	}
+	return value
 }
 
 type geminiVoiceConfig struct {
@@ -219,7 +280,7 @@ func (s *server) handleGeminiModels(w http.ResponseWriter, r *http.Request) {
 	models, err := s.service.Models(r.Context())
 	if err != nil {
 		if shouldWriteRequestError(r, err) {
-			writeGeminiError(w, statusFromError(err), geminiErrorStatus(err), err.Error())
+			writeGeminiRequestError(w, err)
 		}
 		return
 	}
@@ -235,11 +296,11 @@ func (s *server) handleGeminiModel(w http.ResponseWriter, r *http.Request) {
 	models, err := s.service.Models(r.Context())
 	if err != nil {
 		if shouldWriteRequestError(r, err) {
-			writeGeminiError(w, statusFromError(err), geminiErrorStatus(err), err.Error())
+			writeGeminiRequestError(w, err)
 		}
 		return
 	}
-	if model, ok := lookupPublicModel(models, modelID); ok {
+	if model, ok := LookupPublicModel(models, modelID); ok {
 		writeJSON(w, http.StatusOK, geminiModelObject(model))
 		return
 	}
@@ -305,6 +366,10 @@ func (s *server) handleGeminiAction(w http.ResponseWriter, r *http.Request) {
 	if method == "countTokens" && request.GenerateContentRequest != nil {
 		request = *request.GenerateContentRequest
 	}
+	if request.CachedContent != "" {
+		writeGeminiError(w, http.StatusNotFound, "NOT_FOUND", fmt.Sprintf("cachedContent %q was not found: this service does not store cached contents", request.CachedContent))
+		return
+	}
 	generateRequest, err := request.toGenerateRequest(newID("resp"), model)
 	if err != nil {
 		writeGeminiError(w, http.StatusBadRequest, "INVALID_ARGUMENT", err.Error())
@@ -338,7 +403,7 @@ func geminiFilesAPIURI(raw string) bool {
 // geminiOpaqueFields identifies fields containing arbitrary JSON where keys belong to user data
 var geminiOpaqueFields = map[string]bool{
 	"args": true, "response": true, "parameters": true, "parametersJsonSchema": true,
-	"responseSchema": true, "responseJsonSchema": true, "partMetadata": true,
+	"responseSchema": true, "responseJsonSchema": true, "partMetadata": true, "schema": true,
 }
 
 // geminiCamelKeys converts field names to lowerCamelCase per proto3 JSON rules, preserving camelCase when conflicting and retaining raw values for opaque JSON fields
@@ -422,6 +487,7 @@ func (request geminiRequest) toGenerateRequest(id string, model string) (aistudi
 		return aistudio.GenerateRequest{}, err
 	}
 	var system string
+	var systemMedia []aistudio.Part
 	if request.SystemInstruction != nil {
 		parts, _, err := mapGeminiParts(request.SystemInstruction.Parts)
 		if err != nil {
@@ -429,8 +495,11 @@ func (request geminiRequest) toGenerateRequest(id string, model string) (aistudi
 		}
 		var text strings.Builder
 		for _, part := range parts {
-			if part.Text == "" && (part.InlineData != nil || part.File != nil || part.FunctionCall != nil || part.FunctionResult != nil) {
-				return aistudio.GenerateRequest{}, fmt.Errorf("systemInstruction must contain text")
+			if part.FunctionCall != nil || part.FunctionResult != nil {
+				return aistudio.GenerateRequest{}, fmt.Errorf("systemInstruction cannot contain function calls or responses")
+			}
+			if part.Text == "" && (part.InlineData != nil || part.File != nil || part.ExternalMedia != nil) {
+				systemMedia = append(systemMedia, part)
 			}
 			text.WriteString(part.Text)
 		}
@@ -454,6 +523,7 @@ func (request geminiRequest) toGenerateRequest(id string, model string) (aistudi
 		}
 		contents = append(contents, aistudio.Content{Role: role, Parts: parts})
 	}
+	contents = prependSystemMedia(contents, systemMedia)
 	tools, err := mapGeminiTools(request.Tools, request.ToolConfig)
 	if err != nil {
 		return aistudio.GenerateRequest{}, err
@@ -487,9 +557,25 @@ func (request geminiRequest) toGenerateRequest(id string, model string) (aistudi
 	if len(request.GenerationConfig.ResponseJSONSchema) > 0 {
 		config.ResponseSchema = request.GenerationConfig.ResponseJSONSchema
 	}
+	for _, format := range request.GenerationConfig.ResponseFormat {
+		if text := format.Text; text != nil {
+			if text.MIMEType != "" {
+				config.ResponseMIMEType = geminiResponseFormatValue(text.MIMEType)
+			}
+			if len(text.Schema) > 0 {
+				config.ResponseSchema = text.Schema
+			}
+		}
+		if image := format.Image; image != nil {
+			config.ImageConfig = &aistudio.ImageConfig{AspectRatio: geminiResponseFormatValue(image.AspectRatio), ImageSize: geminiResponseFormatValue(image.ImageSize)}
+		}
+	}
 	config.HideThinking = true
 	if request.GenerationConfig.ThinkingConfig != nil {
-		config.ThinkingBudget = request.GenerationConfig.ThinkingConfig.ThinkingBudget
+		// thinkingBudget -1 indicates dynamic thinking, using the model's default thinking configuration.
+		if budget := request.GenerationConfig.ThinkingConfig.ThinkingBudget; budget == nil || *budget != -1 {
+			config.ThinkingBudget = budget
+		}
 		config.ReasoningEffort = request.GenerationConfig.ThinkingConfig.ThinkingLevel
 		config.HideThinking = !request.GenerationConfig.ThinkingConfig.IncludeThoughts
 	}
@@ -710,12 +796,17 @@ func mapGeminiParts(input []geminiPart) ([]aistudio.Part, bool, error) {
 			if err != nil {
 				return nil, false, err
 			}
+			media, _, err := mapGeminiParts(part.FunctionResponse.Parts)
+			if err != nil {
+				return nil, false, fmt.Errorf("functionResponse.parts: %w", err)
+			}
 			parts = append(parts, aistudio.Part{
 				FunctionResult: &aistudio.FunctionResult{
 					ID: part.FunctionResponse.ID, Name: part.FunctionResponse.Name, Content: response,
 				},
 				ThoughtSignature: part.ThoughtSignature,
 			})
+			parts = append(parts, media...)
 			hasResult = true
 		case part.ExecutableCode != nil:
 			parts = append(parts, aistudio.Part{
@@ -882,7 +973,7 @@ func (s *server) handleGeminiCountTokens(w http.ResponseWriter, r *http.Request,
 	})
 	if err != nil {
 		if shouldWriteRequestError(r, err) {
-			writeGeminiError(w, statusFromError(err), geminiErrorStatus(err), err.Error())
+			writeGeminiRequestError(w, err)
 		}
 		return
 	}
@@ -923,10 +1014,11 @@ func writeGeminiFailure(w http.ResponseWriter, r *http.Request, request aistudio
 	response, ok := geminiPromptFeedback(request, err)
 	switch {
 	case !ok:
-		writeGeminiError(w, statusFromError(err), geminiErrorStatus(err), err.Error())
+		writeGeminiRequestError(w, err)
 	case stream:
-		if streamHeaders(w) == nil {
-			_ = writeSSE(w, "", response)
+		if output, err := openGeminiStream(w, r); err == nil {
+			_ = output.write(response)
+			output.close()
 		}
 	default:
 		writeJSON(w, http.StatusOK, response)
@@ -977,19 +1069,10 @@ func buildGeminiResponse(request aistudio.GenerateRequest, results []generationR
 
 func geminiOutputParts(result generationResult) []map[string]any {
 	parts := make([]map[string]any, 0)
-	var pendingSignature string
 
 	appendPart := func(part map[string]any, sig string) {
 		if sig != "" {
 			part["thoughtSignature"] = sig
-		}
-		if pendingSignature != "" {
-			if part["thoughtSignature"] == nil {
-				part["thoughtSignature"] = pendingSignature
-			} else {
-				parts = append(parts, geminiSignaturePart(pendingSignature))
-			}
-			pendingSignature = ""
 		}
 		parts = append(parts, part)
 	}
@@ -1050,21 +1133,12 @@ func geminiOutputParts(result generationResult) []map[string]any {
 			if event.ThoughtSignature == "" {
 				continue
 			}
-			if pendingSignature != "" {
-				parts = append(parts, geminiSignaturePart(pendingSignature))
-				pendingSignature = ""
-			}
 			if len(parts) > 0 && parts[len(parts)-1]["thoughtSignature"] == nil {
 				parts[len(parts)-1]["thoughtSignature"] = event.ThoughtSignature
-			} else if len(parts) > 0 {
-				parts = append(parts, geminiSignaturePart(event.ThoughtSignature))
 			} else {
-				pendingSignature = event.ThoughtSignature
+				parts = append(parts, geminiSignaturePart(event.ThoughtSignature))
 			}
 		}
-	}
-	if pendingSignature != "" {
-		parts = append(parts, geminiSignaturePart(pendingSignature))
 	}
 	return parts
 }
@@ -1287,29 +1361,87 @@ func geminiUsage(usage *aistudio.Usage) map[string]any {
 	return metadata
 }
 
-// streamGemini emits candidate delta chunks in arrival order, with the final chunk carrying finish reasons, sources, and aggregate usage across all candidates
-func (s *server) streamGemini(w http.ResponseWriter, r *http.Request, request aistudio.GenerateRequest, candidates *chatChoices) {
-	if err := streamHeaders(w); err != nil {
+// geminiStream writes streamGenerateContent response chunks: SSE when alt=sse, or JSON array written object-by-object like official REST otherwise.
+type geminiStream struct {
+	w       http.ResponseWriter
+	sse     bool
+	mu      sync.Mutex
+	written bool
+}
+
+// openGeminiStream writes streaming response headers based on alt parameter.
+func openGeminiStream(w http.ResponseWriter, r *http.Request) (*geminiStream, error) {
+	stream := &geminiStream{w: w, sse: r.URL.Query().Get("alt") == "sse"}
+	if stream.sse {
+		return stream, streamHeaders(w)
+	}
+	w.Header().Set("Content-Type", "application/json; charset=UTF-8")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.WriteHeader(http.StatusOK)
+	return stream, http.NewResponseController(w).Flush()
+}
+
+// write writes a response chunk.
+func (stream *geminiStream) write(value map[string]any) error {
+	stream.mu.Lock()
+	defer stream.mu.Unlock()
+	if stream.sse {
+		return writeSSE(stream.w, "", value)
+	}
+	data, err := json.Marshal(value)
+	if err != nil {
+		return err
+	}
+	prefix := "["
+	if stream.written {
+		prefix = "\r\n,\r\n"
+	}
+	stream.written = true
+	if _, err := io.WriteString(stream.w, prefix+string(data)); err != nil {
+		return err
+	}
+	return http.NewResponseController(stream.w).Flush()
+}
+
+// heartbeat writes an empty line when the SSE stream is silent, and does nothing for JSON arrays.
+func (stream *geminiStream) heartbeat() error {
+	if !stream.sse {
+		return nil
+	}
+	stream.mu.Lock()
+	defer stream.mu.Unlock()
+	return writeGeminiHeartbeat(stream.w)
+}
+
+// close ends the JSON array.
+func (stream *geminiStream) close() {
+	if stream.sse {
 		return
 	}
-	var writing sync.Mutex
-	write := func(value map[string]any) error {
-		writing.Lock()
-		defer writing.Unlock()
-		return writeSSE(w, "", value)
+	stream.mu.Lock()
+	defer stream.mu.Unlock()
+	tail := "\r\n]"
+	if !stream.written {
+		tail = "[]"
 	}
-	heartbeat := func() error {
-		writing.Lock()
-		defer writing.Unlock()
-		return writeSSEHeartbeat(w)
+	_, _ = io.WriteString(stream.w, tail)
+}
+
+// streamGemini emits candidate delta chunks in arrival order, with the final chunk carrying finish reasons, sources, and aggregate usage across all candidates
+func (s *server) streamGemini(w http.ResponseWriter, r *http.Request, request aistudio.GenerateRequest, candidates *chatChoices) {
+	stream, err := openGeminiStream(w, r)
+	if err != nil {
+		return
 	}
+	defer stream.close()
+	write, heartbeat := stream.write, stream.heartbeat
 	results, err := candidates.run(func(index int, events <-chan aistudio.Event) (generationResult, error) {
 		return consumeStreamEvents(candidates.ctx, events, func(event aistudio.Event) error {
 			candidate := geminiStreamCandidate(event, index)
 			if candidate == nil {
 				return nil
 			}
-			return write(map[string]any{"responseId": request.ID, "modelVersion": request.Model, "candidates": []any{candidate}})
+			return write(map[string]any{"responseId": request.ID, "modelVersion": cmp.Or(event.ProviderModel, request.Model), "candidates": []any{candidate}})
 		}, heartbeat)
 	})
 	if err != nil {

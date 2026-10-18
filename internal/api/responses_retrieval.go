@@ -37,17 +37,17 @@ func (s *server) handleResponsesInputTokens(w http.ResponseWriter, r *http.Reque
 	})
 	if err != nil {
 		if shouldWriteRequestError(r, err) {
-			writeOpenAIError(w, statusFromError(err), openAIErrorCode(err), err.Error())
+			writeOpenAIRequestError(w, err)
 		}
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"object": "response.input_tokens", "input_tokens": count.InputTokens})
 }
 
-// handleResponseGet returns stored response object
+// handleResponseGet returns stored response object; when stream=true, resumes background streaming response events starting after starting_after
 func (s *server) handleResponseGet(w http.ResponseWriter, r *http.Request) {
 	if stream, _ := strconv.ParseBool(r.URL.Query().Get("stream")); stream {
-		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "stored responses are complete; retrieve them without stream=true")
+		s.resumeResponseStream(w, r)
 		return
 	}
 	response, _, ok := s.responseStates.Response(r.PathValue("response"))
@@ -58,9 +58,41 @@ func (s *server) handleResponseGet(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, response)
 }
 
+// resumeResponseStream replays events after starting_after from event record and follows to completion; only responses created with background and stream have event records.
+func (s *server) resumeResponseStream(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("response")
+	stream, ok := s.responseStates.Stream(id)
+	if !ok {
+		if _, _, exists := s.responseStates.Response(id); exists {
+			writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "Only responses created with background=true and stream=true can be streamed.")
+			return
+		}
+		writeResponseNotFound(w, id)
+		return
+	}
+	after := -1
+	if value := r.URL.Query().Get("starting_after"); value != "" {
+		parsed, err := strconv.Atoi(value)
+		if err != nil || parsed < 0 {
+			writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "starting_after must be a non-negative integer")
+			return
+		}
+		after = parsed
+	}
+	if streamHeaders(w) != nil {
+		return
+	}
+	_ = stream.follow(r.Context(), w, after)
+}
+
 // handleResponseDelete deletes stored response object
 func (s *server) handleResponseDelete(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("response")
+	if value, running := s.background.Load(id); running {
+		run := value.(backgroundRun)
+		run.cancel()
+		<-run.done
+	}
 	if !s.responseStates.Delete(id, false) {
 		writeResponseNotFound(w, id)
 		return
@@ -68,8 +100,13 @@ func (s *server) handleResponseDelete(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"id": id, "object": "response", "deleted": true})
 }
 
-// handleResponseCancel returns final response object for completed background responses
+// handleResponseCancel cancels in-progress background responses and returns the saved cancelled object, returns the final object for finished background responses, and returns an error for other responses.
 func (s *server) handleResponseCancel(w http.ResponseWriter, r *http.Request) {
+	if value, running := s.background.Load(r.PathValue("response")); running {
+		run := value.(backgroundRun)
+		run.cancel()
+		<-run.done
+	}
 	response, background, ok := s.responseStates.Response(r.PathValue("response"))
 	if !ok {
 		writeResponseNotFound(w, r.PathValue("response"))

@@ -3,6 +3,7 @@ import type {
   Account,
   AccountDraft,
   AccountLoginInput,
+  AccountRefresh,
   AdminEvent,
   ChromeImportInput,
   ChromeImportProfile,
@@ -18,6 +19,7 @@ import type {
   RequestSummary,
   ServiceConfig,
   ServiceStatus,
+  UpdateStatus,
   UsageRecordPage,
   UsageReport,
 } from '@/types'
@@ -65,23 +67,32 @@ function checkSessionResponse(path: string, response: Response): void {
 
 export class ApiError extends Error {
   readonly status: number
+  readonly code: string
 
-  constructor(message: string, status: number) {
+  constructor(message: string, status: number, code = '') {
     super(message)
     this.name = 'ApiError'
     this.status = status
+    this.code = code
   }
 }
 
-// responseErrorMessage extracts error message shared across public protocols
-async function responseErrorMessage(response: Response): Promise<string> {
+// responseError extracts error code and message shared across public protocols and admin APIs
+async function responseError(response: Response): Promise<ApiError> {
   const body = await response.text()
-  if (body === '') return response.statusText
-  if (!response.headers.get('content-type')?.includes('application/json')) return body
+  if (body === '') return new ApiError(response.statusText, response.status)
+  if (!response.headers.get('content-type')?.includes('application/json')) {
+    return new ApiError(body, response.status)
+  }
 
   const value: unknown = JSON.parse(body)
   const message = pathValue(value, ['error', 'message'])
-  return typeof message === 'string' ? message : body
+  const code = pathValue(value, ['error', 'code'])
+  return new ApiError(
+    typeof message === 'string' ? message : body,
+    response.status,
+    typeof code === 'string' ? code : '',
+  )
 }
 
 // requestJSON executes an admin JSON request preserving server error semantics
@@ -94,7 +105,7 @@ async function requestJSON<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, { ...init, headers })
   checkSessionResponse(path, response)
   if (!response.ok) {
-    throw new ApiError(await responseErrorMessage(response), response.status)
+    throw await responseError(response)
   }
 
   return (await response.json()) as T
@@ -110,7 +121,7 @@ async function requestCommand(path: string, init: RequestInit): Promise<void> {
   const response = await fetch(path, { ...init, headers })
   checkSessionResponse(path, response)
   if (!response.ok) {
-    throw new ApiError(await responseErrorMessage(response), response.status)
+    throw await responseError(response)
   }
 }
 
@@ -145,6 +156,9 @@ export const api = {
     }),
   logout: () => requestCommand('/api/auth/logout', { method: 'POST' }),
   status: () => requestJSON<ServiceStatus>('/api/status'),
+  updateStatus: (refresh = false) =>
+    requestJSON<UpdateStatus>(refresh ? '/api/update?refresh=1' : '/api/update'),
+  applyUpdate: () => requestJSON<UpdateStatus>('/api/update', { method: 'POST' }),
   accounts: async () => (await requestJSON<AccountsResponse>('/api/accounts')).accounts,
   models: async () => (await requestJSON<ModelsResponse>('/api/models')).models,
   cooldowns: async () => (await requestJSON<CooldownsResponse>('/api/cooldowns')).cooldowns,
@@ -181,8 +195,10 @@ export const api = {
     requestCommand(`/api/accounts/${encodeURIComponent(id)}`, { method: 'DELETE', keepalive }),
   loginAccount: (id: string) =>
     requestCommand(`/api/accounts/${encodeURIComponent(id)}/login`, { method: 'POST' }),
-  verifyAccount: (id: string) =>
-    requestCommand(`/api/accounts/${encodeURIComponent(id)}/verify`, { method: 'POST' }),
+  refreshAccount: (id: string) =>
+    requestJSON<AccountRefresh>(`/api/accounts/${encodeURIComponent(id)}/refresh`, {
+      method: 'POST',
+    }),
   startService: () => requestJSON<ServiceStatus>('/api/control/start', { method: 'POST' }),
   stopService: () => requestJSON<ServiceStatus>('/api/control/stop', { method: 'POST' }),
   clearLogs: () => requestCommand('/api/logs', { method: 'DELETE' }),
@@ -333,7 +349,8 @@ export function playgroundPath(
   if (input.protocol === 'openai-videos') return '/v1/videos'
   const model = input.model === '' ? '{model}' : encodeURIComponent(input.model)
   if (input.mode === 'video') return `/v1beta/models/${model}:predictLongRunning`
-  const method = input.mode === 'text' && input.stream ? 'streamGenerateContent' : 'generateContent'
+  const method =
+    input.mode === 'text' && input.stream ? 'streamGenerateContent?alt=sse' : 'generateContent'
   return `/v1beta/models/${model}:${method}`
 }
 
@@ -705,7 +722,7 @@ async function completeVideo(
     await waitForVideoPoll(signal)
     const poll = await fetch(`/v1/videos/${encodeURIComponent(state.id)}`, { headers, signal })
     if (!poll.ok) {
-      throw new ApiError(await responseErrorMessage(poll), poll.status)
+      throw await responseError(poll)
     }
     value = await poll.json()
     state = videoState(value)
@@ -729,7 +746,7 @@ async function completeGeminiVideo(
     await waitForVideoPoll(signal)
     const poll = await fetch(`/v1beta/${name}`, { headers, signal })
     if (!poll.ok) {
-      throw new ApiError(await responseErrorMessage(poll), poll.status)
+      throw await responseError(poll)
     }
     value = await poll.json()
   }
@@ -756,7 +773,7 @@ async function downloadVideo(
 ): Promise<{ status: number; chunk: PlaygroundChunk; raw: string }> {
   const content = await fetch(url, { headers, signal })
   if (!content.ok) {
-    throw new ApiError(await responseErrorMessage(content), content.status)
+    throw await responseError(content)
   }
   const blob = await content.blob()
   return {
@@ -1016,7 +1033,7 @@ export async function runPlayground(
   })
 
   if (!response.ok) {
-    throw new ApiError(await responseErrorMessage(response), response.status)
+    throw await responseError(response)
   }
 
   if (input.protocol === 'openai-videos') {

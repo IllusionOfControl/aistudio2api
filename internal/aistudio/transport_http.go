@@ -4,12 +4,14 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -163,6 +165,100 @@ func NewProxyHTTPClient(proxyURL string) (*http.Client, error) {
 		return nil, err
 	}
 	return &http.Client{Transport: roundTripper}, nil
+}
+
+// UploadAssistantFile uploads an attachment as an account using the /_/upload resumable protocol of the web chat panel and returns the upload path.
+func (t *MakerSuiteHTTPTransport) UploadAssistantFile(ctx context.Context, accountID string, blob Blob) (string, error) {
+	lease, owned, err := resolveAccountLease(ctx, t.pool, AccountSelection{AccountID: accountID})
+	if err != nil {
+		return "", err
+	}
+	if owned {
+		defer lease.Release()
+	}
+	account := lease.Account()
+	public, err := t.headers.ProtocolHeaders(ctx, account.ID)
+	if err != nil {
+		return "", fmt.Errorf("read account dynamic public headers: %w", err)
+	}
+	client, err := t.clientForProxy(account.EffectiveProxy(t.globalProxy))
+	if err != nil {
+		return "", err
+	}
+	digest := sha256.Sum256(blob.Data)
+	hash := "sha256=" + base64.StdEncoding.EncodeToString(digest[:])
+	send := func(address string, header http.Header, body []byte) (http.Header, []byte, error) {
+		state, err := lease.ReloadStorageState()
+		if err != nil {
+			return nil, nil, fmt.Errorf("read account storage state: %w", err)
+		}
+		cookie, err := state.CookieHeader(address, t.now())
+		if err != nil {
+			return nil, nil, err
+		}
+		header.Set("User-Agent", public.Get("User-Agent"))
+		header.Set("Accept", "*/*")
+		header.Set("Origin", aiStudioOrigin)
+		header.Set("Referer", aiStudioOrigin+"/")
+		header.Set("Sec-Fetch-Dest", "empty")
+		header.Set("Sec-Fetch-Mode", "cors")
+		header.Set("Sec-Fetch-Site", "same-origin")
+		if language := account.AcceptLanguage(); language != "" {
+			header.Set("Accept-Language", language)
+		}
+		header.Set("Cookie", cookie)
+		request, err := http.NewRequestWithContext(ctx, http.MethodPost, address, bytes.NewReader(body))
+		if err != nil {
+			return nil, nil, fmt.Errorf("create assistant file upload request: %w", err)
+		}
+		request.Header = header
+		response, err := client.Do(request)
+		if err != nil {
+			return nil, nil, fmt.Errorf("execute assistant file upload: %w", err)
+		}
+		defer response.Body.Close()
+		if setCookies := response.Header.Values("Set-Cookie"); len(setCookies) > 0 {
+			if err := lease.MergeSetCookieHeaders(setCookies, address, t.now()); err != nil {
+				return nil, nil, fmt.Errorf("merge assistant file upload response cookies: %w", err)
+			}
+		}
+		raw, err := io.ReadAll(response.Body)
+		if err != nil {
+			return nil, nil, fmt.Errorf("read assistant file upload response: %w", err)
+		}
+		if response.StatusCode != http.StatusOK {
+			return nil, nil, DecodeRPCError(assistantUploadMethod, response.StatusCode, raw)
+		}
+		return response.Header, raw, nil
+	}
+	header, _, err := send(aiStudioOrigin+"/_/upload", http.Header{
+		"X-Goog-Upload-Header-Content-Length": {strconv.Itoa(len(blob.Data))},
+		"X-Goog-Upload-Header-Content-Type":   {blob.MIME},
+		"X-Goog-Hash":                         {hash},
+		"X-Goog-Upload-Protocol":              {"resumable"},
+		"X-Goog-Upload-Command":               {"start"},
+	}, nil)
+	if err != nil {
+		return "", err
+	}
+	address := header.Get("X-Goog-Upload-URL")
+	if address == "" {
+		return "", fmt.Errorf("assistant file upload response missing X-Goog-Upload-URL")
+	}
+	_, raw, err := send(address, http.Header{
+		"Content-Type":          {blob.MIME},
+		"X-Goog-Hash":           {hash},
+		"X-Goog-Upload-Command": {"upload, finalize"},
+		"X-Goog-Upload-Offset":  {"0"},
+	}, blob.Data)
+	if err != nil {
+		return "", err
+	}
+	path := strings.TrimSpace(string(raw))
+	if path == "" {
+		return "", fmt.Errorf("assistant file upload response missing upload path")
+	}
+	return path, nil
 }
 
 // Do sends standard MakerSuite RPC and keeps the lease held by the response body

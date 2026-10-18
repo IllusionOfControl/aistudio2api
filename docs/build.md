@@ -1,6 +1,6 @@
 # Build Channel
 
-AI Studio's Build application invokes MakerSuite proxy RPCs via the official host page to access the Gemini API, utilizing a quota pool calculated independently from Playground. AIStudio2API treats Build as a generation channel equivalent to Playground: the same account holds two distinct quota pools, and generation requests are scheduled across combinations of accounts and channels. This document defines proxy RPC wire formats, request headers and WAA, model catalogs and eligibility, scheduling and cooldowns, field-by-field mapping of Gemini API JSON, response decoding, error and quota handling, as well as channel configuration and observability. For WAA proof generation, see [WAA Implementation](waa.md); for Playground `GenerateContent`, see [Protocol Specification](protocol.md).
+AI Studio's Build application invokes MakerSuite proxy RPCs via the official host page to access the Gemini API, utilizing a quota pool calculated independently from Playground. AIStudio2API treats Build as a generation channel equivalent to Playground: the same account holds two distinct quota pools, and generation requests are scheduled across combinations of accounts and channels. This document defines proxy RPC wire formats, request headers and WAA, model catalogs and eligibility, scheduling and cooldowns, field-by-field mapping of Gemini API JSON, response decoding, error and quota handling, channel configuration and display, as well as the coding assistant channel invoked via `-build` models. For WAA proof generation, see [WAA Implementation](waa.md); for Playground `GenerateContent`, see [Protocol Specification](protocol.md).
 
 ## 1. Official Mechanics & Channel Configuration
 
@@ -32,7 +32,7 @@ The service connects generation, embedding, and model catalogs over `ProxyStream
 
 `BUILD_NATIVE_NONSTREAM=true` is the default: non-streaming requests across Gemini, Chat, Responses, Anthropic, Interactions, image, and speech endpoints prioritize the Build channel on each account, executing `ProxyUnaryCall` with `:generateContent`. If the channel is disabled or the account Build channel is cooling down or does not support the model, requests fall back to Playground streaming.
 
-Playground `GenerateContent` responses consist of repeated streaming frames converted into canonical non-streaming responses after complete accumulation. Upstream call logs record actual channel, `native` / `stream` mode, and RPC; when non-streaming requests fall back to streaming, a WARN log records "fallback streaming" and the reason. When Build explicitly returns that unary calls are unsupported, it falls back to `ProxyStreamedCall` on that channel; parameter errors return the original error.
+Playground `GenerateContent` responses consist of repeated streaming frames converted into canonical non-streaming responses after complete accumulation. Upstream call logs record actual channel, `native` / `stream` mode, and RPC; when non-streaming requests use streaming, a WARN log records "fallback streaming" and the reason. When Build explicitly returns that unary calls are unsupported, it attempts `ProxyStreamedCall` on that channel; parameter errors are handled according to the "Errors, Quotas, and Capability Boundaries" section.
 
 Channel visibility across the service:
 
@@ -170,6 +170,10 @@ Candidate scheduling units are combinations of account and channel, ordered by a
 
 - Concurrency slots, workers, and WAA are shared per account; both channels consume the same pool of request slots.
 - Cooldown is tracked per channel: `<model>` for Playground, `build:<model>` for Build; Live media input scope is `bidi-media:<model>`, and `build:bidi-media:<model>` when routed through Build; global `*` cooldown applies to both channels.
+- An account is only considered cooling down for a model when all its supported channels are cooling down.
+- When one channel returns a quota error, cooldown is recorded for that channel; if the other channel is available on the same account, the request is retried on that channel without counting as an attempted account.
+- When all candidate combinations are cooling down, requests whose earliest recovery time is within 1 minute queue and wait, while later requests return HTTP 429 `rate_limit_exceeded` with the recovery time in the message and `Retry-After` set to seconds until earliest recovery.
+- Successful generation records `verified` on the channel's scope (`<model>` or `build:<model>`).
 
 ### Attachments & File References
 
@@ -322,7 +326,8 @@ In `ProxyStreamedCall` trailing status, code 0 denotes success; other codes map 
 | 16 | 401 |
 | Other | 502 |
 
-- HTTP 429 parses metadata or error message to identify minute vs daily quotas: minute limits cool down until window reset, daily limits cool down until next quota reset day; model-specific limits record `build:<model>`, while global limits record account `*`.
+- HTTP 429 parses metadata or error message to identify minute vs daily quotas: minute limits cool down until window reset, daily limits cool down until next quota reset day; model-specific limits record `build:<model>`, while global limits record account `*`; when all listed limits are `limit: 0`, the cooldown type is "no quota".
+- When HTTP 400 with Code 3 occurs on a request that can be completed via Playground and the Playground channel is enabled, the request is retried via Playground on the same account (structured outputs requiring Build adapt to Playground format); when only Build is enabled, Build's error is returned. Once Playground returns its first event, Build channel cooldown for `build:<model>` escalates through 1, 5, 15, 30, and 60 minutes, resetting to 1 minute after a successful request; if Playground also rejects, Playground's error is returned.
 - Trailing stream errors follow mapped HTTP statuses; errors (401, 403, 404, 429, 5xx) occurring before the first upstream semantic event trigger account rotation, channel rotation, and cooldowns, while later errors terminate with in-stream errors.
 - HTTP 403 Code 7 preserves account and model eligibility, switching requests to another account.
 - Non-existent models return 404 Code 5; Computer Use-only models return 400 Code 3 on text-only requests and are excluded from Build.
@@ -338,10 +343,23 @@ In `ProxyStreamedCall` trailing status, code 0 denotes success; other codes map 
 | --- | --- |
 | `internal/config/config.go` | `UPSTREAM_CHANNELS` parsing and validation |
 | `internal/app/channels.go` | Configuration to scheduler pool channel mapping |
-| `internal/aistudio/channel.go` | Multi-channel selection, Build model qualification, and catalog merging |
-| `internal/aistudio/build.go` | Wire payload assembly, JSON escaping, and response parsing for Build proxy RPC |
-| `internal/aistudio/build_bidi.go` | Build WebChannel protocol client for realtime generation |
-| `internal/aistudio/client.go` | RPC dispatch routing: `ProxyStreamedCall` vs `ProxyUnaryCall` |
+| `internal/aistudio/channel.go` | Channel definitions, cooldown scopes, qualifications, combination ordering, and public catalog `channels`; `-build` models use `assistant` channel only |
+| `internal/aistudio/accounts.go` | Candidate classification, leased channel, all-cooling errors |
+| `internal/aistudio/build.go` | Request encoding, proxy wire, binding, response and stream tail decoding, Build catalog |
+| `internal/aistudio/generate.go` | Channel dispatch, shared preprocessing, stop sequences, and usage |
+| `internal/aistudio/service.go` | Protected sending, Build and coding assistant binding and proof fields |
+| `internal/aistudio/upload.go` | Inline attachment retention for Build and coding assistant channels |
+| `internal/aistudio/assistant.go` | Coding assistant catalog derivation, attachment rewriting, `CodeAssistantOffline` encoding, RPC sequencing, applet cleanup, and task stream decoding |
+| `internal/aistudio/transport_http.go` | Coding assistant attachment uploads |
+| `internal/aistudio/models.go` | Capability code 48 and `-build` entry derivation |
+| `internal/aistudio/build_embed.go` | Embedding encoding, batching, sending, decoding, and account rotation |
+| `internal/aistudio/build_bidi.go` | Build Live and Realtime Music proxy wrapper, client frame encoding, and backchannel decoding |
+| `internal/aistudio/webchannel.go` | WebChannel session address selection by leased channel, proof fields, frame encoding and decoding |
+| `internal/app/embeddings.go` | Embedding candidates, channel logs, and input tokens |
+| `internal/api/embeddings.go`, `internal/api/live.go` | OpenAI and Gemini embedding endpoints, Realtime Music client frames |
+| `internal/app/runtime.go` | Retries, cooldown recording, same-account channel failover, file reference cloning |
+| `internal/app/admin.go`, `internal/api` | Channel fields in cooldowns, requests, logs, and model catalogs |
+| `web/src` | Channel selection in settings and channel badges across dashboard panels |
 
 ### Adding Capabilities to Build
 
@@ -364,3 +382,204 @@ When adding a Build proxy method or routing an existing capability through Build
 | Header Matching | Upstream accepts requests without HTTP 400 parameter errors |
 
 When debugging proxy payloads, capture the final Gemini API JSON, outer array, and decoded google.rpc status. HTTP 200 merely indicates proxy RPC arrival; operational success requires receiving expected content, valid usage, and a single terminal state.
+
+## 8. Coding Assistant Channel
+
+The chat panel on the official Build page is served by a coding assistant. The assistant carries server-side system prompts and counts toward Build chat quotas: free requests for free accounts and subscription quotas for Google AI subscribers, calculated separately from Playground and the Build application proxy. The service treats it as a third channel `assistant`, invoked via the `-build` model name suffix.
+
+All RPCs in this section reside in MakerSuite Service at `https://alkalimakersuite-pa.clients6.google.com/$rpc/google.internal.alkali.applications.makersuite.v1.MakerSuiteService/<RPC>` using HTTP `POST` and `application/json+protobuf` sparse arrays: protobuf field N corresponds to JSON index N-1, with unset intermediate fields written as `null`.
+
+### Catalog & Scheduling
+
+Models whose ListModels primary capability code (field 65) contains 48 correspond to models listed in the Build settings panel "Select model to use in Chat" dropdown. Once catalog parsing finishes, each such model derives a secondary entry appended to that account's catalog in original order; no entry is derived if the catalog already contains an identical ID.
+
+| Field | Derived Entry |
+| --- | --- |
+| ID | `<base_model_id>-build` |
+| Name | `<base_model_name> (Build)` |
+| methods | `generateContent` and `countTokens` from base model methods |
+| capabilities | `assistant_route`, plus `chat_model`, `thinking`, `thinking_level` from base model |
+| Capability options | Empty |
+| Default parameters | Output limit and selectable thinking level from base model, thinking enabled, default level high (3) |
+| Remaining fields | Inherited from base model, including description, token limits, and AccessModes |
+
+```text
+ListModels: gemini-3.8-flash (primary capability code includes 48)
+Catalog append: gemini-3.8-flash-build  "Gemini 3.8 Flash (Build)"  methods [countTokens, generateContent]
+```
+
+- Candidate channels for `-build` models are restricted to `assistant`; this channel is always enabled, while `UPSTREAM_CHANNELS` and `BUILD_NATIVE_NONSTREAM` only affect other models.
+- An account can fulfill requests when its catalog contains the `-build` entry and its benefit tier satisfies the base model's AccessModes; candidate ordering, warm worker preference, and `round-robin`/`fill-first` policies match other models.
+- The cooldown scope is the `-build` model ID itself (e.g. `gemini-3.8-flash-build`), tracked separately from the base model's Playground `<model>` and Build `build:<model>`; quota errors, account failover, and queueing follow the scheduling and cooldown rules.
+- Model `channels`, request `channel`, and cooldown `channel` report as `assistant`, displayed as "Build Chat" in the admin dashboard.
+- Model names can include thinking suffixes placed after `-build`, for example `gemini-3.8-flash-build(low)`.
+- Token counting requests map the model to its base model ID and invoke Playground `CountTokens`.
+
+### Request Mapping
+
+| Canonical Request | `CodeAssistantOffline` |
+| --- | --- |
+| contents | field 1 |
+| system | field 9 custom instructions |
+| Reasoning effort / budget | field 19 thinking level |
+
+- Upstream requests only carry conversation turns, system prompts, and thinking level; generation parameters, structured output, and safety settings use the assistant's server-side configuration.
+- Inline attachments are uploaded via the official chat panel upload endpoint, referenced in turns as Part field 18 `[mime, upload_path, filename, size_bytes]` with filename `attachment-<N>` (1-indexed); see "Attachment Upload".
+- `-build` entries have no function or Google tool capabilities: tool declarations are discarded before sending, and function calls/results in history are converted to text per the [Protocol Specification](protocol.md).
+- Stop sequences are matched and truncated locally.
+- Thinking levels map to high `3`, medium `2`, low `1`, minimal `4`; defaults to high when unspecified. `reasoning_effort`, `thinkingLevel`, and Anthropic `output_config.effort` values `xhigh`/`max` map to high, `none` to minimal; thinking budgets `<=0`, `<=1024`, `<=8192`, and larger map to minimal, low, medium, and high respectively. If the model does not support the mapped level, the closest available level is selected.
+
+### RPC Sequence
+
+```text
+/_/upload (once per inline attachment)          → Upload path
+CreateApplet                                    → Applet ID
+CodeAssistantOffline (WAA proof)                → Generation ID
+StreamCodeAssistantOfflineGeneration            → Step snapshot stream, read until upstream close
+After stream close (in background):
+  CancelCodeAssistantOfflineGeneration          (when generation ID was acquired and stream did not complete cleanly)
+  DeleteApplet
+```
+
+- Request headers match Playground text `GenerateContent`; the benefit tier header `X-AIStudio-G1-Tier` is only sent with `CodeAssistantOffline` (Pro: `TIER1`, Ultra: `TIER2`, Plus: `TIER0`, omitted for Free).
+- `CodeAssistantOffline` is sent by the account's WAA worker; the other four RPCs and attachment uploads use the account's MakerSuite Go HTTP transport, sharing the same cookies, user agent, and egress.
+- Each request creates a new applet and deletes it upon completion; upstream carries previous turns on an applet into subsequent generations, so applets serve exactly one request.
+- Non-streaming requests also read the generation stream and return after accumulating; upstream call logs record `stream` mode, RPC `CodeAssistantOffline`, and reason "Build coding assistant uses server-side stream, returned after accumulation".
+
+#### Attachment Upload
+
+Attachments are uploaded via AI Studio's resumable upload endpoint using two `POST` requests with account cookies, user agent, `Accept-Language`, `Origin`/`Referer` set to `https://aistudio.google.com`, `Sec-Fetch-Site: same-origin`, omitting `Authorization` and `X-Goog-Api-Key`. `X-Goog-Hash` contains standard Base64 SHA-256 of the attachment: `sha256=<BASE64>`.
+
+| Step | URL | Headers | Body | Response |
+| --- | --- | --- | --- | --- |
+| start | `https://aistudio.google.com/_/upload` | `X-Goog-Upload-Protocol: resumable`, `X-Goog-Upload-Command: start`, `X-Goog-Upload-Header-Content-Length`, `X-Goog-Upload-Header-Content-Type`, `X-Goog-Hash` | Empty | 200, `X-Goog-Upload-URL` contains upload target |
+| upload | `X-Goog-Upload-URL` | `Content-Type`, `X-Goog-Hash`, `X-Goog-Upload-Command: upload, finalize`, `X-Goog-Upload-Offset: 0` | File bytes | 200, `X-Goog-Upload-Status: final`, body contains upload path |
+
+```text
+/blobstore/prod/makersuite/uploads/<SHA256_HEX>
+```
+
+Non-200 responses follow standard error translation. Upstream rewrites the upload path to an internal storage path in user turn echo events.
+
+#### CreateApplet
+
+```json
+[null,["Untitled","Generated by Gemini.",null,null,"default"],null,null,1]
+```
+
+| Field | Content |
+| ---: | --- |
+| 2 | Applet metadata `[title, description, initial_prompt, null, template]` |
+| 5 | `1` |
+
+The official web page writes the user's initial prompt to metadata field 3 and page API key to field 6, prompting upstream to generate title and description; the proxy sends `null` for field 3 and terminates at field 5. Response:
+
+```json
+["<APPLET_ID>",["<APPLET_ID>",["1792242943",522276000],["1792242943",522276000],["Untitled","Generated by Gemini.",null,null,"default",null,null,1,[1],null,[1]],1,[1,1,1]]]
+```
+
+The proxy reads the applet ID at index 0, returning protocol error "missing applet ID" if absent or empty.
+
+#### CodeAssistantOffline
+
+```json
+[[[[[null,"What is 6*7?"]],"user"]],"<WAA_PROOF>",null,null,null,1,null,"models/gemini-3.8-flash","<SYSTEM>",null,null,"<APPLET_ID>",null,[2,null,2],null,1,null,null,[1,null,null,3],null,null,null,null,null,null,null,null,null,"<UUID>"]
+```
+
+| Field | Content |
+| ---: | --- |
+| 1 | Conversation turns matching Playground `GenerateContent`: `[[Part...], role]` where role is `user` or `model` |
+| 2 | WAA proof |
+| 6 | `1` |
+| 8 | `models/<base_model_id>` |
+| 9 | System prompt; `null` when empty |
+| 12 | Applet ID |
+| 14 | `[2,null,2]` |
+| 16 | `1` |
+| 19 | Thinking configuration `[1,null,null,<thinking level>]` |
+| 29 | Fresh uppercase UUID v4 generated per request |
+
+WAA binding matches Playground `GenerateContent`: parts sequentially take text, standard Base64 of inline data, or Drive file ID, joined by single spaces; proof is written to field 2. For Camoufox backend, the page input field takes text from parts joined by spaces. See [WAA Implementation](waa.md).
+
+Response:
+
+```json
+["<GENERATION_ID>","<APPLET_ID>"]
+```
+
+The proxy reads the generation ID at index 0, returning protocol error "missing generation ID" if absent or empty.
+
+#### StreamCodeAssistantOfflineGeneration
+
+```json
+["<GENERATION_ID>",null,null,"<APPLET_ID>"]
+```
+
+The response is a streaming payload detailed in the next section.
+
+#### Cleanup
+
+```json
+["<GENERATION_ID>","<APPLET_ID>"]
+["<APPLET_ID>"]
+```
+
+The first line is the body for `CancelCodeAssistantOfflineGeneration`; the second line is for `DeleteApplet`. `DeleteApplet` returns `[]` on success, after which the applet returns 404.
+
+- Cleanup triggers when the task stream closes, including clean termination, client disconnect, or stop sequence truncation; also triggers on any failure after `CreateApplet`.
+- Cleanup runs exactly once per request in the background with an independent 1-minute timeout, sequentially executing Cancel then Delete.
+- Failures log a WARN "Build coding assistant cleanup failed" with fields `account`, `method`, `applet`, and `error`.
+
+### Task Stream
+
+The root array field 1 contains messages, optionally followed by google.rpc status `[code, message, details?]`. Below is a complete Q&A stream: message 1 echoes the user turn, message 2 delivers the completed model turn:
+
+```json
+[[
+  [null,null,[[[[[null,"What is the capital of France?"]],"user"]],null,null,null,null,null,["1792220560",486323906],["1792220562",547770000],null,null,["<APPLET_ID>",["1792220558",913217000]],0,1,"models/gemini-4-argon",null,null,"<GENERATION_ID>"]],"<APPLET_ID>"],
+  [null,null,[[[[[null,"Paris"]],"model"]],null,null,null,null,null,["1792220560",486643491],["1792220571",188407749],null,null,["<APPLET_ID>",["1792220571",308506000]],1,1,"models/gemini-4-argon",null,["19942","45"],"<GENERATION_ID>"]],"<APPLET_ID>"]
+]]
+```
+
+Messages have the structure `[null, null, [step...], applet_id]`. Each message contains current snapshots of several steps and may contain both user echo and model turns. Step fields:
+
+| Field | Content |
+| ---: | --- |
+| 1 | Turn list `[[[Part...], role]]` |
+| 3 | Applet file modifications |
+| 7, 8 | Timestamp `["<seconds>", <nanoseconds>]` |
+| 10 | Tool execution, e.g. app compilation |
+| 11 | `[applet_id, timestamp]` |
+| 12 | Step index, user turn is 0 |
+| 6 | Failure cause `[message, details]` |
+| 13 | Status: `1` completed, `2` in progress, `4` failed |
+| 14 | `models/<model_id>` |
+| 16 | Usage `[uncached_input, output, cached_input]` as decimal strings, omitted fields default to 0 |
+| 17 | Generation ID |
+
+Part field 2 is text; field 13 is `1` or `true` for reasoning. Steps that only modify files or execute tools contain no model turns.
+
+Decoding rules:
+
+1. Decode each message element immediately upon arrival; skip when message field 3 is `null`.
+2. Extract step index and status, returning protocol error with path if missing or wrong type; if field 6 is non-empty, return upstream error "generation step failed: <message>"; for completed steps (status `1`) with usage, record usage by step index (last report wins).
+3. Skip turns whose role is not `model`. Model turn parts are indexed by `(step_index, part_index)`, sequentially numbered across turns in the same step.
+4. Part text is a cumulative snapshot: emit newly added text when it prefixes previous snapshot; skip when identical; return protocol error "step text is not a continuation of previous snapshot" if not a continuation.
+5. Reasoning part deltas emit as `reasoning`, others as `text`; when `text` originates from a different step than the prior text and is the first delta of that part, prepend `\n\n`.
+6. When a step with status `1` contains model turns, mark reply as completed.
+7. Read trailing status after message list ends; code 0 indicates success, other codes map to HTTP status per error tables.
+8. When stream closes with completed reply: emit aggregate usage first if available, then terminate with `stop`; if reply never completed, return protocol error "stream closed before model reply completed".
+
+Usage aggregation: input tokens sum uncached input and cache hits across steps; cached tokens sum cache hits; output tokens sum output across steps; total tokens equals input plus output.
+
+After the final step completes, upstream closes the stream approximately 1 to 14 seconds later; finish events emit after stream close.
+
+### Error Handling
+
+| Scenario | Resolution |
+| --- | --- |
+| Attachment upload, `CreateApplet`, `CodeAssistantOffline`, or task stream returns non-200 | Decoded and mapped per error tables; enters account rotation and cooldown with scope set to `-build` model ID |
+| Trailing stream status non-0 | Same as above; terminates with in-stream error if after first semantic event |
+| Step field 6 non-empty | HTTP 502 with message "generation step failed: <upstream_message>", handled as 5xx |
+| Missing applet ID, generation ID, or stream malformed | Protocol error, HTTP 502 |
+| Stream closed without completed reply | Protocol error, HTTP 502 |

@@ -6,8 +6,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/Mag1cFall/AIStudio2API/internal/aistudio"
 )
@@ -230,6 +232,101 @@ func providerFinishReason(reason string) string {
 	return ""
 }
 
+// addSystemReminder appends mid-conversation system messages as system-reminder tags to the preceding user turn, or returns a reminder to merge into the next user turn if previous turn was not user.
+func addSystemReminder(contents []aistudio.Content, pending []aistudio.Part, text string) []aistudio.Part {
+	reminder := aistudio.Part{Text: "<system-reminder>\n" + text + "\n</system-reminder>"}
+	if last := len(contents) - 1; last >= 0 && contents[last].Role == aistudio.RoleUser {
+		contents[last].Parts = append(contents[last].Parts, reminder)
+		return pending
+	}
+	return append(pending, reminder)
+}
+
+// appendWithReminders appends a message, placing pending reminders after function results in the next user message.
+func appendWithReminders(contents []aistudio.Content, content aistudio.Content, reminders []aistudio.Part) ([]aistudio.Content, []aistudio.Part) {
+	if content.Role == aistudio.RoleUser && len(reminders) > 0 {
+		results := 0
+		for index, part := range content.Parts {
+			if part.FunctionResult != nil {
+				results = index + 1
+			}
+		}
+		content.Parts = slices.Concat(content.Parts[:results], reminders, content.Parts[results:])
+		reminders = nil
+	}
+	return append(contents, content), reminders
+}
+
+// prependSystemMedia places media from system instructions at the beginning of the first user turn, creating a user turn if none exists.
+func prependSystemMedia(contents []aistudio.Content, media []aistudio.Part) []aistudio.Content {
+	if len(media) == 0 {
+		return contents
+	}
+	index := slices.IndexFunc(contents, func(content aistudio.Content) bool { return content.Role == aistudio.RoleUser })
+	if index < 0 {
+		return append([]aistudio.Content{{Role: aistudio.RoleUser, Parts: media}}, contents...)
+	}
+	contents[index].Parts = append(slices.Clone(media), contents[index].Parts...)
+	return contents
+}
+
+// functionResultMediaTypes defines block types in tool result content blocks sent as media.
+var functionResultMediaTypes = map[string]bool{
+	"image": true, "document": true, "audio": true, "video": true, "file": true,
+	"image_url": true, "input_image": true, "input_file": true, "input_audio": true, "video_url": true, "input_video": true,
+}
+
+// functionResultParts converts tool results into function response content and succeeding media parts: text blocks in content block arrays are joined by newlines into result text, media blocks are parsed into parts, and other blocks merge as JSON text; results are placed under error key when isError is true.
+func functionResultParts(raw json.RawMessage, isError bool, parse func(json.RawMessage) ([]aistudio.Part, error)) (json.RawMessage, []aistudio.Part, error) {
+	key := "result"
+	if isError {
+		key = "error"
+	}
+	var blocks []json.RawMessage
+	if json.Unmarshal(raw, &blocks) == nil && len(blocks) > 0 {
+		var texts []string
+		var media []aistudio.Part
+		contentBlocks := true
+		for _, block := range blocks {
+			var head struct {
+				Type string  `json:"type"`
+				Text *string `json:"text"`
+			}
+			if json.Unmarshal(block, &head) != nil || head.Type == "" {
+				contentBlocks = false
+				break
+			}
+			switch {
+			case head.Text != nil:
+				texts = append(texts, *head.Text)
+			case functionResultMediaTypes[head.Type]:
+				parts, err := parse(json.RawMessage("[" + string(block) + "]"))
+				if err != nil {
+					return nil, nil, err
+				}
+				media = append(media, parts...)
+			default:
+				texts = append(texts, string(block))
+			}
+		}
+		if contentBlocks {
+			content, _ := json.Marshal(map[string]string{key: strings.Join(texts, "\n")})
+			return content, media, nil
+		}
+	}
+	if isError {
+		if len(raw) == 0 {
+			raw = json.RawMessage("null")
+		}
+		if !json.Valid(raw) {
+			return nil, nil, fmt.Errorf("function result must be JSON")
+		}
+		return json.RawMessage(`{"error":` + strings.TrimSpace(string(raw)) + `}`), nil, nil
+	}
+	content, err := normalizeFunctionResultContent(raw)
+	return content, nil, err
+}
+
 func normalizeFunctionResultContent(raw json.RawMessage) (json.RawMessage, error) {
 	if len(raw) == 0 {
 		raw = json.RawMessage("null")
@@ -285,6 +382,24 @@ func groundingCitations(metadata aistudio.GroundingMetadata) []aistudio.Citation
 		}
 	}
 	return citations
+}
+
+// textSpan represents the position of a continuous text span from upstream text within output text: source and output are byte offsets in upstream text and output text respectively.
+type textSpan struct {
+	source int
+	output int
+	length int
+}
+
+// spanCitation converts full-text byte citation ranges into character indices in output text, returning false if range does not fall within any text span.
+func spanCitation(output string, spans []textSpan, citation aistudio.Citation) (int, int, bool) {
+	for _, span := range spans {
+		start, end := citation.Start-span.source, citation.End-span.source
+		if start >= 0 && start <= end && end <= span.length {
+			return utf8.RuneCountInString(output[:span.output+start]), utf8.RuneCountInString(output[:span.output+end]), true
+		}
+	}
+	return 0, 0, false
 }
 
 func renderCodeExecution(event aistudio.Event) string {

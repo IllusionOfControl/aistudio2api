@@ -2,16 +2,19 @@
 import { computed, reactive, ref } from 'vue'
 import { api } from '@/api'
 import { useI18n, type TranslationKey } from '@/i18n'
+import { maskedProxy } from '@/proxy'
 import type {
   Account,
   AccountDraft,
+  AccountRefresh,
   AccountState,
   ChromeImportProfile,
   PairingToken,
 } from '@/types'
+import DetailDialog from './DetailDialog.vue'
 import UiIcon from './UiIcon.vue'
 
-defineProps<{
+const props = defineProps<{
   accounts: Account[]
   loading: boolean
   error: string
@@ -31,6 +34,8 @@ const showBrowserLogin = ref(false)
 const showChromeImport = ref(false)
 const editingAccountID = ref('')
 const pendingAction = ref('')
+const refreshing = reactive(new Set<string>())
+const refreshingAll = ref(false)
 const chromeProfiles = ref<ChromeImportProfile[]>([])
 const pairing = ref<PairingToken | null>(null)
 const copiedPairing = ref('')
@@ -77,9 +82,17 @@ const stateKeys: Record<AccountState, TranslationKey> = {
   disabled: 'state.disabled',
 }
 
-// maskedProxy masks passwords in proxy URLs while edit form retains full address
-function maskedProxy(value: string): string {
-  return value.replace(/^([a-z][a-z0-9+.-]*:\/\/[^:@/]*):[^@/]*@/i, '$1:•••@')
+// messageAccount is the account whose full state message is shown in the modal
+const messageAccount = ref<Account | null>(null)
+
+// accountSummary combines account tier, egress, locale, and timezone into a single line
+function accountSummary(account: Account): string {
+  return [
+    account.benefit_tier === 'Unknown' ? t('accounts.tierUnknown') : account.benefit_tier,
+    account.egress ? maskedProxy(account.egress) : t('accounts.direct'),
+    account.locale,
+    account.timezone,
+  ].join(' · ')
 }
 
 // actionError sends account mutation errors to global notification
@@ -233,34 +246,83 @@ async function toggleAccount(account: Account): Promise<void> {
   }
 }
 
-// runAccountAction executes login or session verification
-async function runAccountAction(account: Account, action: 'login' | 'verify'): Promise<void> {
-  pendingAction.value = `${action}:${account.id}`
+// loginAccount launches browser to log in to the account again
+async function loginAccount(account: Account): Promise<void> {
+  pendingAction.value = `login:${account.id}`
   try {
-    if (action === 'login') {
-      await api.loginAccount(account.id)
-    } else {
-      await api.verifyAccount(account.id)
-    }
+    await api.loginAccount(account.id)
     emit('refresh')
-    emit(
-      'notice',
-      t(action === 'login' ? 'accounts.loginComplete' : 'accounts.verified'),
-      'success',
-    )
+    emit('notice', t('accounts.loginComplete'), 'success')
   } catch (error) {
     actionError(error)
   } finally {
     pendingAction.value = ''
   }
 }
+
+// refreshNotice returns refresh result notice detailing changes in tier and model count
+function refreshNotice(result: AccountRefresh): string {
+  const change = (before: string, after: string) =>
+    before === after ? after : `${before} → ${after}`
+  const tier = (value: string) => (value === 'Unknown' ? t('accounts.tierUnknown') : value)
+  return t('accounts.refreshed')
+    .replace('{name}', result.account.label)
+    .replace('{tier}', change(tier(result.previous_tier), tier(result.tier)))
+    .replace('{models}', change(String(result.previous_models), String(result.models)))
+}
+
+// refreshAccount immediately reads account benefits and model catalog, disabling only this account's button during execution
+async function refreshAccount(account: Account): Promise<void> {
+  refreshing.add(account.id)
+  try {
+    const result = await api.refreshAccount(account.id)
+    emit('refresh')
+    emit('notice', refreshNotice(result), 'success')
+  } catch (error) {
+    actionError(error)
+  } finally {
+    refreshing.delete(account.id)
+  }
+}
+
+// refreshAllAccounts concurrently refreshes all enabled accounts, reporting success and failure counts on completion
+async function refreshAllAccounts(): Promise<void> {
+  const targets = props.accounts.filter((account) => account.enabled && !refreshing.has(account.id))
+  refreshingAll.value = true
+  targets.forEach((account) => refreshing.add(account.id))
+  const results = await Promise.allSettled(targets.map((account) => api.refreshAccount(account.id)))
+  targets.forEach((account) => refreshing.delete(account.id))
+  refreshingAll.value = false
+  emit('refresh')
+  const failed = results.filter((result) => result.status === 'rejected').length
+  emit(
+    'notice',
+    t('accounts.refreshedAll')
+      .replace('{count}', String(targets.length - failed))
+      .replace('{failed}', String(failed)),
+    failed === 0 ? 'success' : 'error',
+  )
+}
 </script>
 
 <template>
-  <section class="mx-auto w-full max-w-4xl flex-1 overflow-auto p-4 md:p-8">
-    <div class="mb-6 flex flex-wrap items-center justify-between gap-3 border-b border-line pb-2">
-      <h2 class="text-2xl font-bold text-white">{{ t('section.accounts.title') }}</h2>
+  <section class="flex min-h-0 flex-1 flex-col overflow-auto md:overflow-hidden">
+    <header class="flex flex-wrap items-center gap-3 border-b border-line px-4 py-4 md:px-8">
+      <div class="min-w-0 flex-1">
+        <h2 class="text-xl font-semibold text-white">{{ t('section.accounts.title') }}</h2>
+        <p class="mt-1 text-sm text-gray-500">{{ t('section.accounts.description') }}</p>
+      </div>
       <div class="flex flex-wrap justify-end gap-2">
+        <button
+          class="flex items-center gap-2 rounded border border-line bg-raised px-4 py-2 text-sm font-medium text-gray-200 transition hover:bg-line disabled:opacity-50"
+          type="button"
+          :disabled="refreshingAll"
+          :aria-busy="refreshingAll"
+          @click="refreshAllAccounts"
+        >
+          <UiIcon name="refresh" :size="15" />
+          {{ t('accounts.refreshAll') }}
+        </button>
         <button
           class="flex items-center gap-2 rounded border border-line bg-raised px-4 py-2 text-sm font-medium text-gray-200 transition hover:bg-line disabled:opacity-50"
           type="button"
@@ -291,32 +353,34 @@ async function runAccountAction(account: Account, action: 'login' | 'verify'): P
           {{ t('accounts.browserLogin') }}
         </button>
       </div>
-    </div>
-
-    <div v-if="error" class="rounded border border-red-500/40 bg-red-500/10 p-4 text-red-300">
-      {{ error }}
-    </div>
-    <div v-else-if="loading" class="py-12 text-center text-gray-500">
-      {{ t('common.loading') }}
-    </div>
-    <div
-      v-else-if="accounts.length === 0"
-      class="rounded border border-line bg-panel py-10 text-center text-gray-500"
-    >
-      <p class="mb-2">{{ t('accounts.empty') }}</p>
-      <p class="text-xs">{{ t('accounts.emptyHint') }}</p>
-    </div>
-    <div v-else class="space-y-3">
-      <article
-        v-for="account in accounts"
-        :key="account.id"
-        class="rounded-lg border border-line bg-panel p-4"
-        :class="{ 'opacity-60': !account.enabled }"
+    </header>
+    <div class="mx-auto flex min-h-0 w-full max-w-6xl flex-1 flex-col p-4 md:p-8">
+      <div v-if="error" class="rounded border border-red-500/40 bg-red-500/10 p-4 text-red-300">
+        {{ error }}
+      </div>
+      <div v-else-if="loading" class="py-12 text-center text-gray-500">
+        {{ t('common.loading') }}
+      </div>
+      <div
+        v-else-if="accounts.length === 0"
+        class="rounded border border-line bg-panel py-10 text-center text-gray-500"
       >
-        <div class="mb-2 flex items-center justify-between gap-4">
-          <div class="flex min-w-0 items-center gap-3">
+        <p class="mb-2">{{ t('accounts.empty') }}</p>
+        <p class="text-xs">{{ t('accounts.emptyHint') }}</p>
+      </div>
+      <div
+        v-else
+        class="min-h-0 flex-1 overflow-y-auto rounded-lg border border-line bg-panel max-md:max-h-[70vh]"
+      >
+        <div
+          v-for="account in accounts"
+          :key="account.id"
+          class="flex flex-wrap items-center gap-x-4 gap-y-2 border-b border-line/60 px-4 py-2.5"
+          :class="{ 'opacity-60': !account.enabled }"
+        >
+          <div class="flex min-w-0 flex-1 basis-72 items-center gap-3">
             <div
-              class="h-3 w-3 shrink-0 rounded-full"
+              class="h-2.5 w-2.5 shrink-0 rounded-full"
               :class="{
                 'bg-green-500': account.state === 'ready',
                 'bg-blue-500': account.state === 'busy',
@@ -326,67 +390,50 @@ async function runAccountAction(account: Account, action: 'login' | 'verify'): P
               }"
             ></div>
             <div class="min-w-0">
-              <strong
+              <span
                 v-tooltip.overflow="account.label"
-                class="block truncate font-mono text-white"
-                >{{ account.label }}</strong
+                class="block truncate font-mono text-sm text-white"
+                >{{ account.label }}</span
+              >
+              <span
+                v-tooltip.overflow="accountSummary(account)"
+                class="block truncate text-xs text-gray-500"
+                >{{ accountSummary(account) }}</span
               >
             </div>
           </div>
-          <div class="shrink-0 text-xs text-gray-500">
-            {{ t('accounts.models') }}:
-            {{ account.models.length === 0 ? '—' : account.models.length }}
-          </div>
-        </div>
-
-        <div
-          class="grid grid-cols-1 gap-2 border-t border-line pt-3 text-xs sm:grid-cols-2 md:grid-cols-4"
-        >
-          <div>
-            <span class="text-gray-500">{{ t('accounts.proxy') }}</span>
-            <div
-              v-tooltip.overflow="account.proxy ? maskedProxy(account.proxy) : ''"
-              class="truncate text-gray-300"
-            >
-              {{ account.proxy ? maskedProxy(account.proxy) : t('accounts.direct') }}
-            </div>
-          </div>
-          <div>
-            <span class="text-gray-500">{{ t('accounts.locale') }}</span>
-            <div class="text-gray-300">{{ account.locale }}</div>
-          </div>
-          <div>
-            <span class="text-gray-500">{{ t('accounts.timezone') }}</span>
-            <div class="text-gray-300">{{ account.timezone }}</div>
-          </div>
-          <div>
-            <span class="text-gray-500">{{ t('accounts.benefitTier') }}</span>
-            <div class="text-gray-300">{{ account.benefit_tier }}</div>
-          </div>
-        </div>
-
-        <p v-if="account.message" class="mt-3 break-words text-xs text-red-400">
-          {{ account.message }}
-        </p>
-
-        <div class="mt-3 flex items-center justify-between gap-3 border-t border-line pt-3">
-          <span
-            class="text-xs font-medium uppercase"
-            :class="{
-              'text-green-400': account.state === 'ready',
-              'text-blue-400': account.state === 'busy',
-              'text-yellow-400': account.state === 'cooldown',
-              'text-red-400': account.state === 'auth_required' || account.state === 'unavailable',
-              'text-gray-500': account.state === 'disabled',
-            }"
+          <span class="w-16 shrink-0 text-xs text-gray-500"
+            >{{ t('accounts.models') }}
+            {{ account.models.length === 0 ? '—' : account.models.length }}</span
           >
-            {{ t(stateKeys[account.state]) }}
-          </span>
-          <div class="flex flex-wrap justify-end gap-2">
+          <div class="flex w-36 shrink-0 items-center gap-2">
+            <span
+              class="text-xs font-medium uppercase"
+              :class="{
+                'text-green-400': account.state === 'ready',
+                'text-blue-400': account.state === 'busy',
+                'text-yellow-400': account.state === 'cooldown',
+                'text-red-400':
+                  account.state === 'auth_required' || account.state === 'unavailable',
+                'text-gray-500': account.state === 'disabled',
+              }"
+            >
+              {{ t(stateKeys[account.state]) }}
+            </span>
+            <button
+              v-if="account.message"
+              type="button"
+              class="rounded border border-red-900/50 bg-red-900/20 px-1.5 py-0.5 text-[11px] text-red-300 transition hover:bg-red-900/40"
+              @click="messageAccount = account"
+            >
+              {{ t('accounts.reason') }}
+            </button>
+          </div>
+          <div class="flex shrink-0 flex-wrap justify-end gap-2">
             <button
               class="rounded border border-line bg-raised px-3 py-1 text-xs text-gray-300 transition hover:bg-line disabled:opacity-50"
               type="button"
-              :disabled="pendingAction !== ''"
+              :disabled="pendingAction !== '' || refreshing.has(account.id)"
               @click="beginEdit(account)"
             >
               {{ t('common.edit') }}
@@ -394,7 +441,7 @@ async function runAccountAction(account: Account, action: 'login' | 'verify'): P
             <button
               class="rounded border border-line bg-raised px-3 py-1 text-xs text-gray-300 transition hover:bg-line disabled:opacity-50"
               type="button"
-              :disabled="pendingAction !== ''"
+              :disabled="pendingAction !== '' || refreshing.has(account.id)"
               :aria-busy="pendingAction === `toggle:${account.id}`"
               @click="toggleAccount(account)"
             >
@@ -404,367 +451,389 @@ async function runAccountAction(account: Account, action: 'login' | 'verify'): P
               v-if="account.state === 'auth_required'"
               class="rounded bg-green-600 px-3 py-1 text-xs text-white transition hover:bg-green-500 disabled:opacity-50"
               type="button"
-              :disabled="pendingAction !== '' || !account.enabled"
+              :disabled="pendingAction !== '' || refreshing.has(account.id) || !account.enabled"
               :aria-busy="pendingAction === `login:${account.id}`"
-              @click="runAccountAction(account, 'login')"
+              @click="loginAccount(account)"
             >
               {{ t('common.relogin') }}
             </button>
             <button
               class="rounded border border-line bg-raised px-3 py-1 text-xs text-gray-300 transition hover:bg-line disabled:opacity-50"
               type="button"
-              :disabled="pendingAction !== '' || !account.enabled"
-              :aria-busy="pendingAction === `verify:${account.id}`"
-              @click="runAccountAction(account, 'verify')"
+              :disabled="
+                refreshing.has(account.id) ||
+                pendingAction === `login:${account.id}` ||
+                !account.enabled
+              "
+              :aria-busy="refreshing.has(account.id)"
+              @click="refreshAccount(account)"
             >
-              {{ t('common.verify') }}
+              {{ t('accounts.refresh') }}
             </button>
             <button
               class="rounded border border-red-900/50 bg-red-900/30 px-3 py-1 text-xs text-red-400 transition hover:bg-red-900/50 disabled:opacity-50"
               type="button"
-              :disabled="pendingAction !== ''"
+              :disabled="pendingAction !== '' || refreshing.has(account.id)"
               @click="emit('delete', account)"
             >
               {{ t('common.delete') }}
             </button>
           </div>
         </div>
-      </article>
-    </div>
-
-    <Teleport to="body">
-      <div v-if="showEditor" class="modal-overlay" @click.self="closeEditor">
-        <form
-          class="mx-4 w-full max-w-md rounded-lg border border-line bg-panel p-6 shadow-xl"
-          @submit.prevent="saveAccount"
-        >
-          <div class="mb-4 flex items-center justify-between">
-            <h3 class="text-lg font-bold text-white">{{ t('accounts.editTitle') }}</h3>
-            <button
-              class="rounded p-1 text-gray-500 hover:bg-line hover:text-white"
-              type="button"
-              :aria-label="t('common.close')"
-              @click="closeEditor"
-            >
-              <UiIcon name="close" :size="16" />
-            </button>
-          </div>
-          <p v-tooltip.overflow="draft.label" class="mb-4 truncate font-mono text-sm text-gray-300">
-            {{ draft.label }}
-          </p>
-          <div class="space-y-4">
-            <label class="flex items-center justify-between">
-              <span class="text-sm font-medium text-gray-400">{{ t('common.enable') }}</span>
-              <input v-model="draft.enabled" class="h-4 w-4 accent-blue-600" type="checkbox" />
-            </label>
-            <label class="block">
-              <span class="mb-1 block text-sm font-medium text-gray-400">{{
-                t('accounts.proxy')
-              }}</span>
-              <input
-                v-model.trim="draft.proxy"
-                class="w-full rounded border border-line bg-canvas px-3 py-2 text-white transition focus:border-blue-500 focus:outline-none"
-                placeholder="socks5://127.0.0.1:1080"
-              />
-            </label>
-            <div class="grid grid-cols-1 gap-4 sm:grid-cols-2">
-              <label class="block">
-                <span class="mb-1 block text-sm font-medium text-gray-400">{{
-                  t('accounts.locale')
-                }}</span>
-                <input
-                  v-model.trim="draft.locale"
-                  class="w-full rounded border border-line bg-canvas px-3 py-2 text-white transition focus:border-blue-500 focus:outline-none"
-                  required
-                />
-              </label>
-              <label class="block">
-                <span class="mb-1 block text-sm font-medium text-gray-400">{{
-                  t('accounts.timezone')
-                }}</span>
-                <input
-                  v-model.trim="draft.timezone"
-                  class="w-full rounded border border-line bg-canvas px-3 py-2 text-white transition focus:border-blue-500 focus:outline-none"
-                  required
-                />
-              </label>
-            </div>
-          </div>
-          <div class="mt-6 flex gap-2">
-            <button
-              class="flex-1 rounded bg-raised py-2 text-sm text-gray-300 transition hover:bg-line"
-              type="button"
-              @click="closeEditor"
-            >
-              {{ t('common.cancel') }}
-            </button>
-            <button
-              class="flex-1 rounded bg-blue-600 py-2 text-sm text-white transition hover:bg-blue-500 disabled:opacity-50"
-              type="submit"
-              :disabled="pendingAction !== ''"
-              :aria-busy="pendingAction.startsWith('edit:')"
-            >
-              {{ t('common.save') }}
-            </button>
-          </div>
-        </form>
       </div>
 
-      <div v-if="showBrowserLogin" class="modal-overlay" @click.self="closeBrowserLogin">
-        <form
-          class="mx-4 w-full max-w-md rounded-lg border border-line bg-panel p-6 shadow-xl"
-          @submit.prevent="beginBrowserLogin"
-        >
-          <div class="mb-4 flex items-center justify-between">
-            <h3 class="text-lg font-bold text-white">{{ t('accounts.browserLogin') }}</h3>
-            <button
-              class="rounded p-1 text-gray-500 hover:bg-line hover:text-white disabled:opacity-50"
-              type="button"
-              :disabled="pendingAction === 'browser-login'"
-              :aria-label="t('common.close')"
-              @click="closeBrowserLogin"
-            >
-              <UiIcon name="close" :size="16" />
-            </button>
-          </div>
-          <div class="space-y-4">
-            <label class="block">
-              <span class="mb-1 block text-sm font-medium text-gray-400">{{
-                t('accounts.proxy')
-              }}</span>
-              <input
-                v-model.trim="accountEnvironment.proxy"
-                class="w-full rounded border border-line bg-canvas px-3 py-2 text-white transition focus:border-blue-500 focus:outline-none"
-                placeholder="socks5://127.0.0.1:1080"
-              />
-            </label>
-            <div class="grid grid-cols-1 gap-4 sm:grid-cols-2">
-              <label class="block">
-                <span class="mb-1 block text-sm font-medium text-gray-400">{{
-                  t('accounts.locale')
-                }}</span>
-                <input
-                  v-model.trim="accountEnvironment.locale"
-                  class="w-full rounded border border-line bg-canvas px-3 py-2 text-white transition focus:border-blue-500 focus:outline-none"
-                  required
-                />
-              </label>
-              <label class="block">
-                <span class="mb-1 block text-sm font-medium text-gray-400">{{
-                  t('accounts.timezone')
-                }}</span>
-                <input
-                  v-model.trim="accountEnvironment.timezone"
-                  class="w-full rounded border border-line bg-canvas px-3 py-2 text-white transition focus:border-blue-500 focus:outline-none"
-                  required
-                />
-              </label>
-            </div>
-          </div>
-          <div class="mt-6 flex gap-2">
-            <button
-              class="flex-1 rounded bg-raised py-2 text-sm text-gray-300 transition hover:bg-line disabled:opacity-50"
-              type="button"
-              :disabled="pendingAction === 'browser-login'"
-              @click="closeBrowserLogin"
-            >
-              {{ t('common.cancel') }}
-            </button>
-            <button
-              class="flex-1 rounded bg-blue-600 py-2 text-sm text-white transition hover:bg-blue-500 disabled:opacity-50"
-              type="submit"
-              :disabled="pendingAction !== ''"
-              :aria-busy="pendingAction === 'browser-login'"
-            >
-              {{ t('accounts.browserLogin') }}
-            </button>
-          </div>
-        </form>
-      </div>
+      <DetailDialog
+        :open="messageAccount !== null"
+        :title="messageAccount?.label ?? ''"
+        :description="messageAccount ? t(stateKeys[messageAccount.state]) : ''"
+        :copy-text="messageAccount?.message"
+        @close="messageAccount = null"
+      >
+        <pre
+          v-if="messageAccount"
+          class="rounded-md border border-line bg-canvas p-3 font-mono text-xs leading-5 whitespace-pre-wrap [overflow-wrap:anywhere] text-red-300"
+          >{{ messageAccount.message }}</pre>
+      </DetailDialog>
 
-      <div v-if="showChromeImport" class="modal-overlay" @click.self="closeChromeImport">
-        <form
-          class="mx-4 w-full max-w-lg rounded-lg border border-line bg-panel p-6 shadow-xl"
-          @submit.prevent="importChromeAccounts"
-        >
-          <div class="mb-4 flex items-center justify-between">
-            <h3 class="text-lg font-bold text-white">{{ t('accounts.chromeTitle') }}</h3>
-            <button
-              class="rounded p-1 text-gray-500 hover:bg-line hover:text-white disabled:opacity-50"
-              type="button"
-              :disabled="pendingAction === 'chrome-import'"
-              :aria-label="t('common.close')"
-              @click="closeChromeImport"
-            >
-              <UiIcon name="close" :size="16" />
-            </button>
-          </div>
-          <div class="mb-4 space-y-4">
-            <label class="block">
-              <span class="mb-1 block text-sm font-medium text-gray-400">{{
-                t('accounts.proxy')
-              }}</span>
-              <input
-                v-model.trim="accountEnvironment.proxy"
-                class="w-full rounded border border-line bg-canvas px-3 py-2 text-white transition focus:border-blue-500 focus:outline-none"
-                placeholder="socks5://127.0.0.1:1080"
-              />
-            </label>
-            <div class="grid grid-cols-1 gap-4 sm:grid-cols-2">
-              <label class="block">
-                <span class="mb-1 block text-sm font-medium text-gray-400">{{
-                  t('accounts.locale')
-                }}</span>
-                <input
-                  v-model.trim="accountEnvironment.locale"
-                  class="w-full rounded border border-line bg-canvas px-3 py-2 text-white transition focus:border-blue-500 focus:outline-none"
-                  required
-                />
-              </label>
-              <label class="block">
-                <span class="mb-1 block text-sm font-medium text-gray-400">{{
-                  t('accounts.timezone')
-                }}</span>
-                <input
-                  v-model.trim="accountEnvironment.timezone"
-                  class="w-full rounded border border-line bg-canvas px-3 py-2 text-white transition focus:border-blue-500 focus:outline-none"
-                  required
-                />
-              </label>
-            </div>
-          </div>
-          <div v-if="chromeProfiles.length === 0" class="py-8 text-center text-sm text-gray-500">
-            {{ t('accounts.chromeEmpty') }}
-          </div>
-          <div v-else class="mb-2 flex justify-end">
-            <button
-              class="text-xs text-blue-400 transition hover:text-blue-300"
-              type="button"
-              @click="toggleAllChromeProfiles"
-            >
-              {{ allChromeProfilesSelected ? t('accounts.deselectAll') : t('accounts.selectAll') }}
-            </button>
-          </div>
-          <div v-if="chromeProfiles.length > 0" class="max-h-[50vh] space-y-2 overflow-auto">
-            <label
-              v-for="profile in chromeProfiles"
-              :key="profile.id"
-              class="flex cursor-pointer items-start gap-3 rounded border border-line bg-canvas p-3 transition hover:border-gray-600"
-            >
-              <input
-                v-model="selectedChromeProfiles"
-                class="mt-1 h-4 w-4 shrink-0 accent-blue-600"
-                type="checkbox"
-                :value="profile.id"
-              />
-              <span class="min-w-0 flex-1">
-                <strong
-                  v-tooltip.overflow="profile.email"
-                  class="block truncate text-sm text-white"
-                  >{{ profile.email }}</strong
-                >
-                <span
-                  v-tooltip.overflow="profile.display_name"
-                  class="block truncate text-xs text-gray-400"
-                  >{{ profile.display_name }}</span
-                >
-                <span
-                  v-tooltip.overflow="profile.profile"
-                  class="block truncate font-mono text-xs text-gray-500"
-                  >{{ profile.profile }}</span
-                >
-              </span>
-            </label>
-          </div>
-          <div class="mt-6 flex gap-2">
-            <button
-              class="flex-1 rounded bg-raised py-2 text-sm text-gray-300 transition hover:bg-line disabled:opacity-50"
-              type="button"
-              :disabled="pendingAction === 'chrome-import'"
-              @click="closeChromeImport"
-            >
-              {{ t('common.cancel') }}
-            </button>
-            <button
-              class="flex-1 rounded bg-blue-600 py-2 text-sm text-white transition hover:bg-blue-500 disabled:opacity-50"
-              type="submit"
-              :disabled="pendingAction !== '' || selectedChromeProfiles.length === 0"
-              :aria-busy="pendingAction === 'chrome-import'"
-            >
-              {{ t('accounts.importSelected') }}
-            </button>
-          </div>
-        </form>
-      </div>
-      <div v-if="pairing" class="modal-overlay" @click.self="pairing = null">
-        <div
-          class="mx-4 w-full max-w-lg rounded-lg border border-line bg-panel p-6 shadow-xl"
-          role="dialog"
-          aria-modal="true"
-          aria-labelledby="pairing-title"
-        >
-          <div class="mb-3 flex items-center justify-between">
-            <h3 id="pairing-title" class="text-lg font-bold text-white">
-              {{ t('accounts.remoteAdd') }}
-            </h3>
-            <button
-              class="rounded p-1 text-gray-500 hover:bg-line hover:text-white"
-              type="button"
-              :aria-label="t('common.close')"
-              @click="pairing = null"
-            >
-              <UiIcon name="close" :size="16" />
-            </button>
-          </div>
-          <p class="mb-4 text-sm leading-6 text-gray-400">{{ t('accounts.remoteHelp') }}</p>
-          <p
-            v-if="pairingInsecure"
-            class="mb-4 flex gap-2 rounded border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs leading-5 text-amber-200"
+      <Teleport to="body">
+        <div v-if="showEditor" class="modal-overlay" @click.self="closeEditor">
+          <form
+            class="mx-4 w-full max-w-md rounded-lg border border-line bg-panel p-6 shadow-xl"
+            @submit.prevent="saveAccount"
           >
-            <UiIcon name="warning" :size="14" class="mt-0.5 shrink-0" />
-            {{ t('accounts.remoteHttps') }}
-          </p>
-          <div
-            v-for="item in [
-              {
-                kind: 'command' as const,
-                label: t('accounts.remoteCommand'),
-                text: pairingCommand,
-              },
-              { kind: 'token' as const, label: t('accounts.remoteToken'), text: pairing.token },
-            ]"
-            :key="item.kind"
-            class="mb-3"
-          >
-            <span class="mb-1 block text-xs font-medium text-gray-500">{{ item.label }}</span>
-            <div
-              class="flex items-center gap-2 rounded border border-line bg-canvas py-1.5 pr-1.5 pl-3"
-            >
-              <code
-                class="min-w-0 flex-1 overflow-x-auto font-mono text-sm whitespace-nowrap text-gray-200 select-all"
-                >{{ item.text }}</code
-              >
+            <div class="mb-4 flex items-center justify-between">
+              <h3 class="text-lg font-bold text-white">{{ t('accounts.editTitle') }}</h3>
               <button
-                v-if="clipboardAvailable"
-                class="flex shrink-0 items-center gap-1 rounded px-2 py-1 text-xs text-gray-400 transition hover:bg-raised hover:text-white"
+                class="rounded p-1 text-gray-500 hover:bg-line hover:text-white"
                 type="button"
-                @click="copyPairing(item.kind, item.text)"
+                :aria-label="t('common.close')"
+                @click="closeEditor"
               >
-                <UiIcon :name="copiedPairing === item.kind ? 'check' : 'copy'" :size="13" />
-                {{ copiedPairing === item.kind ? t('common.copied') : t('common.copy') }}
+                <UiIcon name="close" :size="16" />
               </button>
             </div>
-          </div>
-          <p class="text-xs text-gray-500">
-            {{
-              t('accounts.remoteExpires').replace(
-                '{time}',
-                new Date(pairing.expires_at).toLocaleTimeString(locale, { hour12: false }),
-              )
-            }}
-          </p>
+            <p
+              v-tooltip.overflow="draft.label"
+              class="mb-4 truncate font-mono text-sm text-gray-300"
+            >
+              {{ draft.label }}
+            </p>
+            <div class="space-y-4">
+              <label class="flex items-center justify-between">
+                <span class="text-sm font-medium text-gray-400">{{ t('common.enable') }}</span>
+                <input v-model="draft.enabled" class="h-4 w-4 accent-blue-600" type="checkbox" />
+              </label>
+              <label class="block">
+                <span class="mb-1 block text-sm font-medium text-gray-400">{{
+                  t('accounts.proxy')
+                }}</span>
+                <input
+                  v-model.trim="draft.proxy"
+                  class="w-full rounded border border-line bg-canvas px-3 py-2 text-white transition focus:border-blue-500 focus:outline-none"
+                  placeholder="socks5://127.0.0.1:1080"
+                />
+              </label>
+              <div class="grid grid-cols-1 gap-4 sm:grid-cols-2">
+                <label class="block">
+                  <span class="mb-1 block text-sm font-medium text-gray-400">{{
+                    t('accounts.locale')
+                  }}</span>
+                  <input
+                    v-model.trim="draft.locale"
+                    class="w-full rounded border border-line bg-canvas px-3 py-2 text-white transition focus:border-blue-500 focus:outline-none"
+                    required
+                  />
+                </label>
+                <label class="block">
+                  <span class="mb-1 block text-sm font-medium text-gray-400">{{
+                    t('accounts.timezone')
+                  }}</span>
+                  <input
+                    v-model.trim="draft.timezone"
+                    class="w-full rounded border border-line bg-canvas px-3 py-2 text-white transition focus:border-blue-500 focus:outline-none"
+                    required
+                  />
+                </label>
+              </div>
+            </div>
+            <div class="mt-6 flex gap-2">
+              <button
+                class="flex-1 rounded bg-raised py-2 text-sm text-gray-300 transition hover:bg-line"
+                type="button"
+                @click="closeEditor"
+              >
+                {{ t('common.cancel') }}
+              </button>
+              <button
+                class="flex-1 rounded bg-blue-600 py-2 text-sm text-white transition hover:bg-blue-500 disabled:opacity-50"
+                type="submit"
+                :disabled="pendingAction !== ''"
+                :aria-busy="pendingAction.startsWith('edit:')"
+              >
+                {{ t('common.save') }}
+              </button>
+            </div>
+          </form>
         </div>
-      </div>
-    </Teleport>
+
+        <div v-if="showBrowserLogin" class="modal-overlay" @click.self="closeBrowserLogin">
+          <form
+            class="mx-4 w-full max-w-md rounded-lg border border-line bg-panel p-6 shadow-xl"
+            @submit.prevent="beginBrowserLogin"
+          >
+            <div class="mb-4 flex items-center justify-between">
+              <h3 class="text-lg font-bold text-white">{{ t('accounts.browserLogin') }}</h3>
+              <button
+                class="rounded p-1 text-gray-500 hover:bg-line hover:text-white disabled:opacity-50"
+                type="button"
+                :disabled="pendingAction === 'browser-login'"
+                :aria-label="t('common.close')"
+                @click="closeBrowserLogin"
+              >
+                <UiIcon name="close" :size="16" />
+              </button>
+            </div>
+            <div class="space-y-4">
+              <label class="block">
+                <span class="mb-1 block text-sm font-medium text-gray-400">{{
+                  t('accounts.proxy')
+                }}</span>
+                <input
+                  v-model.trim="accountEnvironment.proxy"
+                  class="w-full rounded border border-line bg-canvas px-3 py-2 text-white transition focus:border-blue-500 focus:outline-none"
+                  placeholder="socks5://127.0.0.1:1080"
+                />
+              </label>
+              <div class="grid grid-cols-1 gap-4 sm:grid-cols-2">
+                <label class="block">
+                  <span class="mb-1 block text-sm font-medium text-gray-400">{{
+                    t('accounts.locale')
+                  }}</span>
+                  <input
+                    v-model.trim="accountEnvironment.locale"
+                    class="w-full rounded border border-line bg-canvas px-3 py-2 text-white transition focus:border-blue-500 focus:outline-none"
+                    required
+                  />
+                </label>
+                <label class="block">
+                  <span class="mb-1 block text-sm font-medium text-gray-400">{{
+                    t('accounts.timezone')
+                  }}</span>
+                  <input
+                    v-model.trim="accountEnvironment.timezone"
+                    class="w-full rounded border border-line bg-canvas px-3 py-2 text-white transition focus:border-blue-500 focus:outline-none"
+                    required
+                  />
+                </label>
+              </div>
+            </div>
+            <div class="mt-6 flex gap-2">
+              <button
+                class="flex-1 rounded bg-raised py-2 text-sm text-gray-300 transition hover:bg-line disabled:opacity-50"
+                type="button"
+                :disabled="pendingAction === 'browser-login'"
+                @click="closeBrowserLogin"
+              >
+                {{ t('common.cancel') }}
+              </button>
+              <button
+                class="flex-1 rounded bg-blue-600 py-2 text-sm text-white transition hover:bg-blue-500 disabled:opacity-50"
+                type="submit"
+                :disabled="pendingAction !== ''"
+                :aria-busy="pendingAction === 'browser-login'"
+              >
+                {{ t('accounts.browserLogin') }}
+              </button>
+            </div>
+          </form>
+        </div>
+
+        <div v-if="showChromeImport" class="modal-overlay" @click.self="closeChromeImport">
+          <form
+            class="mx-4 w-full max-w-lg rounded-lg border border-line bg-panel p-6 shadow-xl"
+            @submit.prevent="importChromeAccounts"
+          >
+            <div class="mb-4 flex items-center justify-between">
+              <h3 class="text-lg font-bold text-white">{{ t('accounts.chromeTitle') }}</h3>
+              <button
+                class="rounded p-1 text-gray-500 hover:bg-line hover:text-white disabled:opacity-50"
+                type="button"
+                :disabled="pendingAction === 'chrome-import'"
+                :aria-label="t('common.close')"
+                @click="closeChromeImport"
+              >
+                <UiIcon name="close" :size="16" />
+              </button>
+            </div>
+            <div class="mb-4 space-y-4">
+              <label class="block">
+                <span class="mb-1 block text-sm font-medium text-gray-400">{{
+                  t('accounts.proxy')
+                }}</span>
+                <input
+                  v-model.trim="accountEnvironment.proxy"
+                  class="w-full rounded border border-line bg-canvas px-3 py-2 text-white transition focus:border-blue-500 focus:outline-none"
+                  placeholder="socks5://127.0.0.1:1080"
+                />
+              </label>
+              <div class="grid grid-cols-1 gap-4 sm:grid-cols-2">
+                <label class="block">
+                  <span class="mb-1 block text-sm font-medium text-gray-400">{{
+                    t('accounts.locale')
+                  }}</span>
+                  <input
+                    v-model.trim="accountEnvironment.locale"
+                    class="w-full rounded border border-line bg-canvas px-3 py-2 text-white transition focus:border-blue-500 focus:outline-none"
+                    required
+                  />
+                </label>
+                <label class="block">
+                  <span class="mb-1 block text-sm font-medium text-gray-400">{{
+                    t('accounts.timezone')
+                  }}</span>
+                  <input
+                    v-model.trim="accountEnvironment.timezone"
+                    class="w-full rounded border border-line bg-canvas px-3 py-2 text-white transition focus:border-blue-500 focus:outline-none"
+                    required
+                  />
+                </label>
+              </div>
+            </div>
+            <div v-if="chromeProfiles.length === 0" class="py-8 text-center text-sm text-gray-500">
+              {{ t('accounts.chromeEmpty') }}
+            </div>
+            <div v-else class="mb-2 flex justify-end">
+              <button
+                class="text-xs text-blue-400 transition hover:text-blue-300"
+                type="button"
+                @click="toggleAllChromeProfiles"
+              >
+                {{
+                  allChromeProfilesSelected ? t('accounts.deselectAll') : t('accounts.selectAll')
+                }}
+              </button>
+            </div>
+            <div v-if="chromeProfiles.length > 0" class="max-h-[50vh] space-y-2 overflow-auto">
+              <label
+                v-for="profile in chromeProfiles"
+                :key="profile.id"
+                class="flex cursor-pointer items-start gap-3 rounded border border-line bg-canvas p-3 transition hover:border-gray-600"
+              >
+                <input
+                  v-model="selectedChromeProfiles"
+                  class="mt-1 h-4 w-4 shrink-0 accent-blue-600"
+                  type="checkbox"
+                  :value="profile.id"
+                />
+                <span class="min-w-0 flex-1">
+                  <strong
+                    v-tooltip.overflow="profile.email"
+                    class="block truncate text-sm text-white"
+                    >{{ profile.email }}</strong
+                  >
+                  <span
+                    v-tooltip.overflow="profile.display_name"
+                    class="block truncate text-xs text-gray-400"
+                    >{{ profile.display_name }}</span
+                  >
+                  <span
+                    v-tooltip.overflow="profile.profile"
+                    class="block truncate font-mono text-xs text-gray-500"
+                    >{{ profile.profile }}</span
+                  >
+                </span>
+              </label>
+            </div>
+            <div class="mt-6 flex gap-2">
+              <button
+                class="flex-1 rounded bg-raised py-2 text-sm text-gray-300 transition hover:bg-line disabled:opacity-50"
+                type="button"
+                :disabled="pendingAction === 'chrome-import'"
+                @click="closeChromeImport"
+              >
+                {{ t('common.cancel') }}
+              </button>
+              <button
+                class="flex-1 rounded bg-blue-600 py-2 text-sm text-white transition hover:bg-blue-500 disabled:opacity-50"
+                type="submit"
+                :disabled="pendingAction !== '' || selectedChromeProfiles.length === 0"
+                :aria-busy="pendingAction === 'chrome-import'"
+              >
+                {{ t('accounts.importSelected') }}
+              </button>
+            </div>
+          </form>
+        </div>
+        <div v-if="pairing" class="modal-overlay" @click.self="pairing = null">
+          <div
+            class="mx-4 w-full max-w-lg rounded-lg border border-line bg-panel p-6 shadow-xl"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="pairing-title"
+          >
+            <div class="mb-3 flex items-center justify-between">
+              <h3 id="pairing-title" class="text-lg font-bold text-white">
+                {{ t('accounts.remoteAdd') }}
+              </h3>
+              <button
+                class="rounded p-1 text-gray-500 hover:bg-line hover:text-white"
+                type="button"
+                :aria-label="t('common.close')"
+                @click="pairing = null"
+              >
+                <UiIcon name="close" :size="16" />
+              </button>
+            </div>
+            <p class="mb-4 text-sm leading-6 text-gray-400">{{ t('accounts.remoteHelp') }}</p>
+            <p
+              v-if="pairingInsecure"
+              class="mb-4 flex gap-2 rounded border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs leading-5 text-amber-200"
+            >
+              <UiIcon name="warning" :size="14" class="mt-0.5 shrink-0" />
+              {{ t('accounts.remoteHttps') }}
+            </p>
+            <div
+              v-for="item in [
+                {
+                  kind: 'command' as const,
+                  label: t('accounts.remoteCommand'),
+                  text: pairingCommand,
+                },
+                { kind: 'token' as const, label: t('accounts.remoteToken'), text: pairing.token },
+              ]"
+              :key="item.kind"
+              class="mb-3"
+            >
+              <span class="mb-1 block text-xs font-medium text-gray-500">{{ item.label }}</span>
+              <div
+                class="flex items-center gap-2 rounded border border-line bg-canvas py-1.5 pr-1.5 pl-3"
+              >
+                <code
+                  class="min-w-0 flex-1 overflow-x-auto font-mono text-sm whitespace-nowrap text-gray-200 select-all"
+                  >{{ item.text }}</code
+                >
+                <button
+                  v-if="clipboardAvailable"
+                  class="flex shrink-0 items-center gap-1 rounded px-2 py-1 text-xs text-gray-400 transition hover:bg-raised hover:text-white"
+                  type="button"
+                  @click="copyPairing(item.kind, item.text)"
+                >
+                  <UiIcon :name="copiedPairing === item.kind ? 'check' : 'copy'" :size="13" />
+                  {{ copiedPairing === item.kind ? t('common.copied') : t('common.copy') }}
+                </button>
+              </div>
+            </div>
+            <p class="text-xs text-gray-500">
+              {{
+                t('accounts.remoteExpires').replace(
+                  '{time}',
+                  new Date(pairing.expires_at).toLocaleTimeString(locale, { hour12: false }),
+                )
+              }}
+            </p>
+          </div>
+        </div>
+      </Teleport>
+    </div>
   </section>
 </template>

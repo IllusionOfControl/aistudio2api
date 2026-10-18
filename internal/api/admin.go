@@ -21,7 +21,7 @@ type AdminService interface {
 	UpdateAccount(context.Context, string, AccountInput) (AdminAccount, error)
 	DeleteAccount(context.Context, string) error
 	LoginAccount(context.Context, string) (AdminAccount, error)
-	VerifyAccount(context.Context, string) (AdminAccount, error)
+	RefreshAccount(context.Context, string) (AdminAccountRefresh, error)
 	StartService(context.Context) (AdminStatus, error)
 	StopService(context.Context) (AdminStatus, error)
 	ClearLogs(context.Context) error
@@ -140,11 +140,30 @@ type AdminAccount struct {
 	Enabled     bool     `json:"enabled"`
 	State       string   `json:"state"`
 	Proxy       string   `json:"proxy"`
+	Egress      string   `json:"egress"`
 	Locale      string   `json:"locale"`
 	Timezone    string   `json:"timezone"`
 	Models      []string `json:"models"`
 	BenefitTier string   `json:"benefit_tier"`
 	Message     string   `json:"message"`
+}
+
+// AdminProxy represents the availability and bound account count of a proxy in the proxy pool.
+type AdminProxy struct {
+	Proxy     string     `json:"proxy"`
+	Available bool       `json:"available"`
+	Accounts  int        `json:"accounts"`
+	CheckedAt *time.Time `json:"checked_at,omitempty"`
+	Error     string     `json:"error,omitempty"`
+}
+
+// AdminAccountRefresh represents an account after manual refresh with tier and model counts before and after refresh.
+type AdminAccountRefresh struct {
+	Account        AdminAccount `json:"account"`
+	PreviousTier   string       `json:"previous_tier"`
+	Tier           string       `json:"tier"`
+	PreviousModels int          `json:"previous_models"`
+	Models         int          `json:"models"`
 }
 
 // AccountInput represents an existing account configuration.
@@ -182,33 +201,38 @@ type ChromeImportInput struct {
 
 // RuntimeConfig represents global runtime configuration.
 type RuntimeConfig struct {
-	AutoStart                 bool     `json:"auto_start"`
-	RequestBodyLog            bool     `json:"request_body_log"`
-	AdminAuthEnabled          bool     `json:"admin_auth_enabled"`
-	AdminUsername             string   `json:"admin_username"`
-	AdminPassword             *string  `json:"admin_password,omitempty"`
-	AdminPasswordSet          bool     `json:"admin_password_set"`
-	SavedAdminPassword        string   `json:"-"`
-	BuildNativeNonstream      bool     `json:"build_native_nonstream"`
-	AuthStates                string   `json:"auth_states"`
-	ListenAddr                string   `json:"listen_addr"`
-	APIKey                    string   `json:"proxy_api_key"`
-	ActiveListenAddr          string   `json:"active_listen_addr"`
-	ActiveAPIKey              string   `json:"active_proxy_api_key"`
-	ManagementRestartRequired bool     `json:"management_restart_required"`
-	ServiceRestartRequired    bool     `json:"service_restart_required"`
-	Proxy                     string   `json:"proxy"`
-	InitTimeout               string   `json:"init_timeout"`
-	RequestTimeout            string   `json:"request_timeout"`
-	WarmWorkerLimit           int      `json:"warm_worker_limit"`
-	MaxActiveWorkers          int      `json:"max_active_workers"`
-	WarmStartupConcurrency    int      `json:"warm_startup_concurrency"`
-	PerAccountConcurrency     int      `json:"per_account_concurrency"`
-	RoutingStrategy           string   `json:"routing_strategy"`
-	UpstreamChannels          []string `json:"upstream_channels"`
-	TemporaryChat             bool     `json:"temporary_chat"`
-	Headless                  bool     `json:"headless"`
-	WAABackend                string   `json:"waa_backend"`
+	AutoStart                 bool         `json:"auto_start"`
+	RequestBodyLog            bool         `json:"request_body_log"`
+	AdminAuthEnabled          bool         `json:"admin_auth_enabled"`
+	AdminUsername             string       `json:"admin_username"`
+	AdminPassword             *string      `json:"admin_password,omitempty"`
+	AdminPasswordSet          bool         `json:"admin_password_set"`
+	SavedAdminPassword        string       `json:"-"`
+	BuildNativeNonstream      bool         `json:"build_native_nonstream"`
+	LogFile                   bool         `json:"log_file"`
+	LogMaxTotalMB             int          `json:"log_max_total_mb"`
+	AuthStates                string       `json:"auth_states"`
+	ListenAddr                string       `json:"listen_addr"`
+	APIKey                    string       `json:"proxy_api_key"`
+	ActiveListenAddr          string       `json:"active_listen_addr"`
+	ActiveAPIKey              string       `json:"active_proxy_api_key"`
+	ManagementRestartRequired bool         `json:"management_restart_required"`
+	ServiceRestartRequired    bool         `json:"service_restart_required"`
+	Proxy                     string       `json:"proxy"`
+	ActiveProxy               string       `json:"active_proxy"`
+	ProxyPool                 []AdminProxy `json:"proxy_pool"`
+	InitTimeout               string       `json:"init_timeout"`
+	RequestTimeout            string       `json:"request_timeout"`
+	WarmWorkerLimit           int          `json:"warm_worker_limit"`
+	MaxActiveWorkers          int          `json:"max_active_workers"`
+	WarmStartupConcurrency    int          `json:"warm_startup_concurrency"`
+	PerAccountConcurrency     int          `json:"per_account_concurrency"`
+	RoutingStrategy           string       `json:"routing_strategy"`
+	UpstreamChannels          []string     `json:"upstream_channels"`
+	ModelMapping              string       `json:"model_mapping"`
+	TemporaryChat             bool         `json:"temporary_chat"`
+	Headless                  bool         `json:"headless"`
+	WAABackend                string       `json:"waa_backend"`
 }
 
 // AdminCooldown represents account model cooldown.
@@ -247,7 +271,7 @@ func (s *server) registerAdmin(mux *http.ServeMux) {
 	mux.HandleFunc("PUT /api/accounts/{id}", s.handleUpdateAccount)
 	mux.HandleFunc("DELETE /api/accounts/{id}", s.handleDeleteAccount)
 	mux.HandleFunc("POST /api/accounts/{id}/login", s.handleLoginAccount)
-	mux.HandleFunc("POST /api/accounts/{id}/verify", s.handleVerifyAccount)
+	mux.HandleFunc("POST /api/accounts/{id}/refresh", s.handleRefreshAccount)
 	mux.HandleFunc("POST /api/control/start", s.handleStartService)
 	mux.HandleFunc("POST /api/control/stop", s.handleStopService)
 	mux.HandleFunc("DELETE /api/logs", s.handleClearLogs)
@@ -366,13 +390,13 @@ func (s *server) handleLoginAccount(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]AdminAccount{"account": account})
 }
 
-func (s *server) handleVerifyAccount(w http.ResponseWriter, r *http.Request) {
-	account, err := s.config.Admin.VerifyAccount(r.Context(), r.PathValue("id"))
+func (s *server) handleRefreshAccount(w http.ResponseWriter, r *http.Request) {
+	refresh, err := s.config.Admin.RefreshAccount(r.Context(), r.PathValue("id"))
 	if err != nil {
 		writeAdminUpstreamError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]AdminAccount{"account": account})
+	writeJSON(w, http.StatusOK, refresh)
 }
 
 func (s *server) handleStartService(w http.ResponseWriter, r *http.Request) {

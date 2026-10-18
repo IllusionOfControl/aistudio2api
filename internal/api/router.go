@@ -3,6 +3,7 @@ package api
 import (
 	"fmt"
 	"net/http"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -17,6 +18,7 @@ type Config struct {
 	AdminUsername    string
 	AdminPassword    string
 	Ledger           RequestLedger
+	Updates          UpdateService
 }
 
 type server struct {
@@ -26,6 +28,8 @@ type server struct {
 	uploads           *geminiUploads
 	thoughtSignatures *thoughtSignatureStore
 	pairing           *pairingTokens
+	// background stores in-progress Responses background responses by response ID
+	background sync.Map
 }
 
 var idSequence atomic.Uint64
@@ -92,6 +96,9 @@ func NewHandler(service aistudio.Service, config Config) http.Handler {
 	}
 	if config.Ledger != nil {
 		s.registerLedger(control)
+	}
+	if config.Updates != nil {
+		s.registerUpdates(control)
 	}
 
 	root := http.NewServeMux()
